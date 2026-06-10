@@ -1,0 +1,28 @@
+# t2-source-watch configuration for B0329+54 transit monitoring.
+#
+# DM window brackets B0329's DM of 26.76 pc/cm3 with room for the coarse
+# low-DM trial grid; SNR floor of 11 sits just above the hella threshold
+# where yesterday's transit showed pulses reaching SNR ~13.
+
+source_name: B0329+54
+
+hella_cands_dir: /mnt/nvme4/data/casm/hella_cands
+listen_host: 0.0.0.0
+ports: [12345, 12346, 12347, 12348, 12349, 12350, 12351, 12352]
+
+dm_min: 25.0
+dm_max: 29.0
+snr_min: 11.0
+beam_veto: []
+
+schedule_csv: /mnt/nvme5/casm_pipeline/schedules/b0329_schedule.csv
+schedule_pad_s: 120
+
+trigger:
+  enabled: true
+  pre_s: 2.0
+  post_s: 2.0
+  min_spacing_s: 120
+  daily_max: 15
+
+log_csv: /mnt/nvme5/casm_pipeline/logs/t2_source_watch.csv

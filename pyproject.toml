@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "casm-t2"
+version = "0.1.0"
+description = "CASM T2: real-time candidate ingest, filtering and dump triggering"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pyyaml",
+]
+
+[project.scripts]
+t2-source-watch = "casm_t2.apps.source_watch:main"
+t2-transit-schedule = "casm_t2.apps.transit_schedule:main"
+t2-dump = "casm_t2.dump_client:main"
+
+[tool.setuptools.packages.find]
+include = ["casm_t2*"]
