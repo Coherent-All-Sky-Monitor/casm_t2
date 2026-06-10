@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+from collections import deque
 import json
 import logging
 import os
@@ -142,6 +143,14 @@ class SourceWatch:
         self.snr_min = cfg["snr_min"]
         self.veto = set(cfg.get("beam_veto", []))
         self.enabled = cfg["trigger"].get("enabled", True)
+        ctx = cfg.get("context", {})
+        self.ctx_window_s = ctx.get("window_s", 4.0)
+        self.ctx_delay_s = ctx.get("delay_s", 8.0)
+        self.ctx_max_members = ctx.get("max_members", 3000)
+        # Rolling buffer of every candidate seen on any port, kept long
+        # enough to reconstruct the beam/DM neighbourhood of a trigger.
+        self.context: deque[tuple[float, int, float, float, int]] = deque(maxlen=400_000)
+        self._card_tasks: set[asyncio.Task] = set()
         self.log_path = Path(cfg["log_csv"])
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         if not self.log_path.exists():
@@ -199,6 +208,10 @@ class SourceWatch:
         tsamp = batch.tsamp_s or timing.TSAMP_S
         now = datetime.now(timezone.utc)
 
+        epoch = utc_start.timestamp()
+        for c in batch.cands:
+            self.context.append((epoch + c.samp * tsamp, c.beam, c.dm, c.snr, c.width))
+
         hits = []
         for c in batch.cands:
             if not (self.dm_min <= c.dm <= self.dm_max) or c.snr < self.snr_min:
@@ -250,7 +263,31 @@ class SourceWatch:
         action = "triggered" if reply == "OK" else "trigger_refused"
         self._log(now, event_utc, c, action, reply)
         if reply == "OK":
+            # The dump is already requested; hold the trigger card back a few
+            # seconds so context candidates from the other jobs' gulps (which
+            # may lag this one) make it into the card before T3 reads it.
+            task = asyncio.create_task(self._delayed_card(c, event_utc, start, stop, loc))
+            self._card_tasks.add(task)
+            task.add_done_callback(self._card_tasks.discard)
+
+    async def _delayed_card(self, c: wire.Candidate, event_utc: datetime,
+                            start: datetime, stop: datetime,
+                            loc: beams.StreamLocation) -> None:
+        await asyncio.sleep(self.ctx_delay_s)
+        try:
             await self._write_trigger_card(c, event_utc, start, stop, loc)
+        except Exception:
+            logger.exception("trigger card write failed for beam %d", c.beam)
+
+    def _collect_context(self, event_epoch: float) -> list[list]:
+        """T1 candidates near the event, as [dt_s, beam, dm, snr, width] rows."""
+        window = self.ctx_window_s
+        sel = [m for m in self.context if abs(m[0] - event_epoch) <= window]
+        sel.sort(key=lambda m: -m[3])
+        del sel[self.ctx_max_members:]
+        sel.sort(key=lambda m: m[0])
+        return [[round(t - event_epoch, 4), b, round(dm, 3), round(snr, 2), w]
+                for t, b, dm, snr, w in sel]
 
     async def _write_trigger_card(self, c: wire.Candidate, event_utc: datetime,
                                   start: datetime, stop: datetime,
@@ -271,6 +308,10 @@ class SourceWatch:
             "dump_utc_start": timing.format_dada_utc(start),
             "dump_utc_stop": timing.format_dada_utc(stop),
             "dump_dir": loc.dump_dir,
+            "context": {
+                "window_s": self.ctx_window_s,
+                "members": self._collect_context(event_utc.timestamp()),
+            },
         }
         body = json.dumps(card, indent=2)
         fname = f"{candname}.json"

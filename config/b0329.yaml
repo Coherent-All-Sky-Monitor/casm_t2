@@ -26,3 +26,8 @@ trigger:
   daily_max: 15
 
 log_csv: /mnt/nvme5/casm_pipeline/logs/t2_source_watch.csv
+
+context:
+  window_s: 4.0
+  delay_s: 8.0
+  max_members: 3000
