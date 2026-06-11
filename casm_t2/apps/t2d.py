@@ -163,7 +163,9 @@ def main() -> None:
     p.add_argument("--beam-veto", default="2", help="comma-separated beams")
     p.add_argument("--dm-floor", type=float, default=20.0,
                    help="would-trigger requires peak DM at or above this")
-    p.add_argument("--store-min-snr", type=float, default=9.0)
+    p.add_argument("--store-min-snr", type=float, default=TIER_C_SNR,
+                   help="store only clusters at or above this peak SNR; the"
+                        " default keeps tiered T2 events only, not the T1 noise floor")
     args = p.parse_args()
 
     logging.basicConfig(level=logging.INFO,
