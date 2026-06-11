@@ -1,0 +1,13 @@
+[Unit]
+Description=CASM scheduled live injections (gate ledger)
+After=network-online.target
+
+[Service]
+ExecStart=/home/casm/software/dev/casm_venvs/casm_offline_env/bin/t2-inject /home/casm/software/dev/casm_t2/config/t2d.yaml
+Restart=always
+RestartSec=60
+StandardOutput=append:/mnt/nvme5/casm_pipeline/logs/t2_inject.log
+StandardError=inherit
+
+[Install]
+WantedBy=default.target

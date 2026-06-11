@@ -15,6 +15,8 @@ dependencies = [
 
 [project.scripts]
 t2d = "casm_t2.apps.t2d:main"
+t2-inject = "casm_t2.apps.inject_daemon:main"
+t2-inject-report = "casm_t2.apps.inject_report:main"
 t2-replay = "casm_t2.apps.replay:main"
 t2-source-watch = "casm_t2.apps.source_watch:main"
 t2-transit-schedule = "casm_t2.apps.transit_schedule:main"

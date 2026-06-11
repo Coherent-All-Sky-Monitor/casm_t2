@@ -56,3 +56,14 @@ context:                # T1 neighbourhood embedded in trigger cards
   window_s: 4.0
   delay_s: 8.0
   max_members: 3000
+
+# t2-inject: scheduled live injections (corr1 streams only for now).
+# Ledger rows are written before the FIFO write; t2d tags matching clusters
+# 'injection' and never dumps them. Gates reconcile ~3 min after each shot.
+injection:
+  cadence_min: 30
+  streams: [0, 1, 2, 3]
+  dm_range: [100.0, 1000.0]
+  amp_range: [25.0, 45.0]
+  sigma_ms_range: [1.0, 10.0]
+  scratch_dir: /mnt/nvme5/casm_pipeline/injections
