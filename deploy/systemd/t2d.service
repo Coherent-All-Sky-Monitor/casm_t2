@@ -1,9 +1,9 @@
 [Unit]
-Description=CASM T2 clustering daemon
+Description=CASM T2 clustering + trigger daemon
 After=network-online.target
 
 [Service]
-ExecStart=/home/casm/software/dev/casm_venvs/casm_offline_env/bin/t2d
+ExecStart=/home/casm/software/dev/casm_venvs/casm_offline_env/bin/t2d /home/casm/software/dev/casm_t2/config/t2d.yaml
 Restart=always
 RestartSec=5
 StandardOutput=append:/mnt/nvme5/casm_pipeline/logs/t2d.out

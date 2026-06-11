@@ -71,6 +71,27 @@ async def request_dump_async(host: str, port: int, utc_start: datetime, utc_stop
     return reply
 
 
+async def request_voltage_dump_async(utc_start: datetime, utc_stop: datetime,
+                                     timeout: float = DEFAULT_TIMEOUT_S) -> dict[str, str]:
+    """Request a voltage dump of the window from every antenna-stream daemon.
+
+    All six endpoints (three per node) are commanded concurrently; the
+    result maps "host:port" to the daemon reply or the error string. A
+    partial dump is still useful, so per-endpoint failures do not raise.
+    """
+    from .beams import VOLTAGE_ENDPOINTS
+
+    async def one(host: str, port: int) -> tuple[str, str]:
+        try:
+            reply = await request_dump_async(host, port, utc_start, utc_stop, timeout)
+        except (OSError, asyncio.TimeoutError) as exc:
+            reply = f"ERROR {exc}"
+        return f"{host}:{port}", reply
+
+    results = await asyncio.gather(*(one(h, p) for h, p in VOLTAGE_ENDPOINTS))
+    return dict(results)
+
+
 def main() -> None:
     """Manual dump trigger, mainly for smoke tests.
 

@@ -23,6 +23,18 @@ STREAM_HOSTS = {
     4: "casm-corr2", 5: "casm-corr2", 6: "casm-corr2", 7: "casm-corr2",
 }
 
+# Voltage dumps live on the ANTENNA-side processing chain (medusa_antenna.cfg):
+# its own casm_cand_dump daemons on the raw voltage ring, 3 streams per node,
+# control port 27000 + stream. Every antenna sees every source, so a voltage
+# trigger fans out to ALL of these endpoints.
+VOLTAGE_CONTROL_BASE_PORT = 27000
+VOLTAGE_DUMP_DIR = "/mnt/nvme4/data/casm/cand_dumps"
+
+VOLTAGE_ENDPOINTS = [
+    ("casm-corr1", 27000), ("casm-corr1", 27001), ("casm-corr1", 27002),
+    ("casm-corr2", 27003), ("casm-corr2", 27004), ("casm-corr2", 27005),
+]
+
 
 @dataclass(frozen=True, slots=True)
 class StreamLocation:

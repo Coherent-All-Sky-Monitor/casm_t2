@@ -1,67 +1,165 @@
-"""T2 clustering daemon (shadow mode).
+"""T2 daemon: ingest, cluster, classify, trigger, record.
 
-Listens for the hella candidate stream — in shadow deployment on the tee
-ports that t2-source-watch forwards to, so the live trigger path is
-untouched — coalesces the eight jobs' batches per gulp, clusters each gulp
-with DBSCAN, applies the filter chain, and records every cluster and
-would-trigger decision in the T2 SQLite database. No dumps are requested
-in shadow mode; the point is to accumulate the evidence (cluster rates,
-RFI cut behaviour, recovery of known-source pulses) needed to promote the
-clustered path to live triggering.
+The always-on heart of T2. Owns the eight TCP ports hella publishes to,
+coalesces the jobs' batches per gulp, clusters each gulp with DBSCAN, and
+runs every cluster through the decision chain:
 
-Filter chain per cluster: beam-extent RFI cut -> beam veto -> SNR tiers
-(A/B/C). A 'would_trigger' tag marks clusters that live triggering would
-have dumped: tier A or B, not RFI-wide, not vetoed.
+    injection match -> beam veto -> wide-beam RFI cut -> known-source match
+    -> SNR tier -> trigger budgets + disk guard -> dump + trigger card
+
+Everything is recorded in the SQLite event DB: tiered clusters (with their
+YYMMDDxxxx event names), per-gulp funnel statistics, and a full audit row
+for every trigger decision including refusals and their reasons.
+
+Dumps are deliberately scarce (disks are nearly full): per-kind token
+buckets cap intensity and voltage dumps per day, and any trigger whose
+target filesystem is low on space is refused outright. Injections are
+matched against the ledger and never trigger anything.
+
+All tunables live in one YAML config (config/t2d.yaml). `--shadow` runs the
+full chain without sending dump commands or writing trigger cards.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
+import json
 import logging
+import os
+import socket
+import tempfile
 import time
-from collections import defaultdict
-from datetime import datetime, timezone
+from collections import defaultdict, deque
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-from casm_t2 import cluster, db, timing, wire
+import yaml
+
+from casm_t2 import beams, cluster, db, events, known_source, policy, timing, wire
+from casm_t2.dump_client import request_dump_async, request_voltage_dump_async
 
 logger = logging.getLogger("t2d")
 
-TIER_A_SNR = 30.0
-TIER_B_SNR = 15.0
-TIER_C_SNR = 12.0
+LOCAL_HOSTNAME = socket.gethostname().split(".")[0]
+
+
+class DiskMonitor:
+    """Cached free-space checks for the dump filesystems on both nodes.
+
+    The local node is checked synchronously via statvfs; remote nodes are
+    polled over ssh on a timer. Unknown state fails CLOSED — a dump is
+    refused rather than risked onto a possibly-full disk.
+    """
+
+    def __init__(self, floor_gb: float, remote_hosts: set[str], probe_path: str):
+        self.floor_gb = floor_gb
+        self.probe_path = probe_path
+        self.remote_free: dict[str, tuple[float, float]] = {}  # host -> (mono_ts, GB)
+        self._hosts = remote_hosts
+
+    async def poll_remotes(self) -> None:
+        while True:
+            for host in self._hosts:
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "ssh", host, f"df --output=avail -B1 {self.probe_path} | tail -1",
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+                    out, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
+                    self.remote_free[host] = (time.monotonic(), int(out.strip()) / 1e9)
+                except (OSError, ValueError, asyncio.TimeoutError) as exc:
+                    logger.warning("disk poll of %s failed: %s", host, exc)
+            await asyncio.sleep(120)
+
+    def refusal(self, host: str, path: str) -> str | None:
+        if host == LOCAL_HOSTNAME:
+            return policy.disk_refusal(path, self.floor_gb)
+        ts_free = self.remote_free.get(host)
+        if ts_free is None or time.monotonic() - ts_free[0] > 600:
+            return "disk_unknown_remote"
+        if ts_free[1] < self.floor_gb:
+            return f"disk_low:{ts_free[1]:.0f}GB<{self.floor_gb:.0f}GB"
+        return None
 
 
 class T2Daemon:
-    def __init__(self, args: argparse.Namespace):
-        self.args = args
+    def __init__(self, cfg: dict, shadow: bool):
+        self.cfg = cfg
+        self.shadow = shadow
+        cc = cfg.get("cluster", {})
         self.params = cluster.ClusterParams(
-            eps=args.eps, min_samples=args.min_samples,
-            samp_scale=args.samp_scale, dm_idx_scale=args.dm_idx_scale,
-            width_scale=args.width_scale, beam_scale=args.beam_scale)
-        self.veto = {int(b) for b in args.beam_veto.split(",") if b.strip()}
-        self.conn = db.connect(args.db)
-        # (utc_start, gulp) -> accumulating candidate list; flushed
-        # coalesce_s after the first job's batch for that gulp arrives.
+            eps=cc.get("eps", 1.0), min_samples=cc.get("min_samples", 5),
+            samp_scale=cc.get("samp_scale", 64.0),
+            dm_idx_scale=cc.get("dm_idx_scale", 32.0),
+            width_scale=cc.get("width_scale", 2.0),
+            beam_scale=cc.get("beam_scale", 4.0))
+
+        tiers = cfg.get("tiers", {})
+        self.tier_a = tiers.get("A", 30.0)
+        self.tier_b = tiers.get("B", 15.0)
+        self.tier_c = tiers.get("C", 12.0)
+        self.store_min_snr = cfg.get("store_min_snr", self.tier_c)
+
+        filt = cfg.get("filters", {})
+        self.veto = set(filt.get("beam_veto", []))
+        self.max_nbeam = filt.get("max_nbeam", 32)
+        self.dm_floor = filt.get("dm_floor", 20.0)
+
+        trig = cfg.get("trigger", {})
+        icfg = trig.get("intensity", {})
+        vcfg = trig.get("voltage", {})
+        self.budget_int = policy.TriggerBudget(icfg.get("min_spacing_s", 120),
+                                               icfg.get("daily_max", 20))
+        self.budget_vol = policy.TriggerBudget(vcfg.get("min_spacing_s", 600),
+                                               vcfg.get("daily_max", 2))
+        self.voltage_enabled = bool(vcfg.get("enabled", False))
+        self.voltage_tier = vcfg.get("tier", "A")
+        self.pre_s = trig.get("pre_s", 2.0)
+        self.post_s = trig.get("post_s", 2.0)
+        self.disk = DiskMonitor(trig.get("disk_floor_gb", 200.0),
+                                set(beams.STREAM_HOSTS.values()) - {LOCAL_HOSTNAME},
+                                beams.CAND_BEAM_DUMP_DIR)
+
+        self.sources = known_source.load_sources(cfg.get("known_sources", []))
+        # known-source triggers may sit below tier C; each block carries its
+        # own snr_min (default 11).
+        self.source_snr_min = {b["name"]: b.get("snr_min", 11.0)
+                               for b in cfg.get("known_sources", [])}
+
+        ctx = cfg.get("context", {})
+        self.ctx_window_s = ctx.get("window_s", 4.0)
+        self.ctx_delay_s = ctx.get("delay_s", 8.0)
+        self.ctx_max_members = ctx.get("max_members", 3000)
+        self.context: deque[tuple[float, int, float, float, int]] = deque(maxlen=400_000)
+
+        self.conn = db.connect(cfg.get("db", db.DEFAULT_PATH))
         self.pending: dict[tuple, list[wire.Candidate]] = defaultdict(list)
         self.pending_jobs: dict[tuple, int] = {}
-        self.flushers: set[asyncio.Task] = set()
-        self.n_batches = self.n_cands = self.n_clusters = self.n_would = 0
+        self.tasks: set[asyncio.Task] = set()
+        self.n_batches = self.n_cands = self.n_clusters = self.n_triggers = 0
+        # injection ledger cache, refreshed per gulp from the DB
+        self._inj_cache: list[tuple[float, int, float]] = []  # (epoch, beam, dm)
+        self._inj_cache_ts = 0.0
 
     # ------------------------------------------------------------- ingest
 
     async def serve(self) -> None:
+        host = self.cfg.get("listen_host", "0.0.0.0")
+        ports = self.cfg.get("ports", list(range(12345, 12353)))
         servers = []
-        for i in range(self.args.nports):
-            port = self.args.listen_base + i
-            servers.append(await asyncio.start_server(self._handle, self.args.listen_host, port))
-            logger.info("listening on %s:%d", self.args.listen_host, port)
+        for job, port in enumerate(ports):
+            handler = functools.partial(self._handle, job=job)
+            servers.append(await asyncio.start_server(handler, host, port))
+            logger.info("listening on %s:%d", host, port)
         async with asyncio.TaskGroup() as tg:
             tg.create_task(self._heartbeat())
+            tg.create_task(self.disk.poll_remotes())
             for s in servers:
                 tg.create_task(s.serve_forever())
 
-    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+                      job: int = 0) -> None:
         try:
             payload = await asyncio.wait_for(reader.read(-1), timeout=30)
         except (asyncio.TimeoutError, ConnectionError) as exc:
@@ -74,17 +172,25 @@ class T2Daemon:
         self.n_cands += len(batch.cands)
         if not batch.cands:
             return
+        if batch.utc_start is not None:
+            epoch = timing.parse_dada_utc(batch.utc_start).timestamp()
+            tsamp = batch.tsamp_s or timing.TSAMP_S
+            for c in batch.cands:
+                self.context.append((epoch + c.samp * tsamp, c.beam, c.dm, c.snr, c.width))
         key = (batch.utc_start, batch.gulp)
         first = key not in self.pending
         self.pending[key].extend(batch.cands)
         self.pending_jobs[key] = self.pending_jobs.get(key, 0) + 1
         if first:
-            task = asyncio.create_task(self._flush_later(key))
-            self.flushers.add(task)
-            task.add_done_callback(self.flushers.discard)
+            self._spawn(self._flush_later(key))
+
+    def _spawn(self, coro) -> None:
+        task = asyncio.create_task(coro)
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
 
     async def _flush_later(self, key: tuple) -> None:
-        await asyncio.sleep(self.args.coalesce_s)
+        await asyncio.sleep(self.cfg.get("coalesce_s", 2.0))
         cands = self.pending.pop(key, [])
         n_jobs = self.pending_jobs.pop(key, 0)
         if not cands:
@@ -93,96 +199,262 @@ class T2Daemon:
         clusters = await asyncio.to_thread(cluster.cluster_candidates, cands, self.params)
         dt = time.monotonic() - t0
         try:
-            self._record(key, clusters, n_jobs, len(cands), dt * 1e3)
+            await self._process(key, clusters, n_jobs, len(cands), dt * 1e3)
         except Exception:
-            logger.exception("recording gulp %s failed", key)
-        if dt > 2.0:
-            logger.warning("slow gulp %s: %d cands -> %d clusters in %.1f s",
-                           key, len(cands), len(clusters), dt)
+            logger.exception("processing gulp %s failed", key)
 
     # ----------------------------------------------------------- decisions
 
-    def _classify(self, cl: cluster.Cluster) -> tuple[str, list[str]]:
+    def _refresh_injections(self) -> None:
+        if time.monotonic() - self._inj_cache_ts < 30:
+            return
+        self._inj_cache_ts = time.monotonic()
+        since = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat(
+            timespec="milliseconds")
+        self._inj_cache = [
+            (datetime.fromisoformat(r[0]).timestamp(), int(r[1]), float(r[2]))
+            for r in self.conn.execute(
+                "SELECT inject_utc, beam, dm FROM injections WHERE inject_utc >= ?",
+                (since,))]
+
+    def _injection_match(self, cl: cluster.Cluster, event_epoch: float) -> bool:
+        for inj_epoch, inj_beam, inj_dm in self._inj_cache:
+            if (abs(event_epoch - inj_epoch) <= 60
+                    and cl.beam_lo - 2 <= inj_beam <= cl.beam_hi + 2
+                    and cl.dm_lo - max(0.1 * inj_dm, 5) <= inj_dm
+                    and inj_dm <= cl.dm_hi + max(0.1 * inj_dm, 5)):
+                return True
+        return False
+
+    def _classify(self, cl: cluster.Cluster, event_utc: datetime | None) -> tuple[str, list[str]]:
         tags = []
-        if cl.n_beams > self.args.max_nbeam:
-            tags.append("rfi_wide")
+        if event_utc is not None and self._injection_match(cl, event_utc.timestamp()):
+            tags.append("injection")
         if cl.peak.beam in self.veto:
             tags.append("veto")
+        if cl.n_beams > self.max_nbeam:
+            tags.append("rfi_wide")
+        if event_utc is not None:
+            for src in self.sources:
+                if src.matches(cl, event_utc):
+                    tags.append(f"src:{src.name}")
+                    break
         snr = cl.peak.snr
-        tier = ("A" if snr >= TIER_A_SNR else
-                "B" if snr >= TIER_B_SNR else
-                "C" if snr >= TIER_C_SNR else "-")
-        if tier in ("A", "B") and not tags and cl.peak.dm >= self.args.dm_floor:
-            tags.append("would_trigger")
-            self.n_would += 1
+        tier = ("A" if snr >= self.tier_a else
+                "B" if snr >= self.tier_b else
+                "C" if snr >= self.tier_c else "-")
         return tier, tags
 
-    def _record(self, key: tuple, clusters: list[cluster.Cluster], n_jobs: int,
-                n_cands: int, clustering_ms: float) -> None:
+    def _wants_trigger(self, cl: cluster.Cluster, tier: str, tags: list[str]) -> str | None:
+        """Why this cluster deserves a dump, or None."""
+        if any(t in ("injection", "veto", "rfi_wide") for t in tags):
+            return None
+        src = next((t[4:] for t in tags if t.startswith("src:")), None)
+        if src is not None and cl.peak.snr >= self.source_snr_min.get(src, 11.0):
+            return f"known_source:{src}"
+        if tier in ("A", "B") and cl.peak.dm >= self.dm_floor:
+            return f"tier_{tier}"
+        return None
+
+    async def _process(self, key: tuple, clusters: list[cluster.Cluster],
+                       n_jobs: int, n_cands: int, clustering_ms: float) -> None:
         utc_start_s, gulp = key
         utc_start = timing.parse_dada_utc(utc_start_s) if utc_start_s else None
-        n_would_before = self.n_would
-        rows = []
+        self._refresh_injections()
+
+        rows, to_trigger = [], []
         for cl in clusters:
-            if cl.peak.snr < self.args.store_min_snr:
+            event_utc = (timing.samp_to_utc(cl.peak.samp, utc_start)
+                         if utc_start else None)
+            tier, tags = self._classify(cl, event_utc)
+            reason = self._wants_trigger(cl, tier, tags)
+            store = (tier != "-" or reason is not None or "injection" in tags)
+            if not store:
                 continue
-            tier, tags = self._classify(cl)
-            event_utc = (timing.samp_to_utc(cl.peak.samp, utc_start).isoformat(
-                timespec="milliseconds") if utc_start else "")
-            rows.append((cl, utc_start_s or "", gulp, event_utc, tier, ",".join(tags)))
-            if "would_trigger" in tags:
-                logger.info("WOULD TRIGGER: snr=%.1f dm=%.2f beam=%d width=%d "
-                            "nmemb=%d nbeam=%d event=%s",
-                            cl.peak.snr, cl.peak.dm, cl.peak.beam, cl.peak.width,
-                            cl.n_members, cl.n_beams, event_utc)
-        if rows:
-            db.insert_clusters(self.conn, rows)
-            self.n_clusters += len(rows)
-        # Per-gulp funnel accounting: T1 trials in, clusters, stored, would-trigger.
+            name = events.new_event_name(self.conn, event_utc or datetime.now(timezone.utc))
+            ev_iso = event_utc.isoformat(timespec="milliseconds") if event_utc else ""
+            rows.append((cl, utc_start_s or "", gulp, ev_iso, tier, ",".join(tags), name))
+            if reason is not None and event_utc is not None:
+                to_trigger.append((cl, name, event_utc, tier, reason))
+
+        ids = db.insert_clusters(self.conn, rows) if rows else []
+        id_by_name = {row[6]: cid for row, cid in zip(rows, ids)}
+        self.n_clusters += len(rows)
+
         gulp_utc = (timing.samp_to_utc(min(c.samp_lo for c in clusters), utc_start)
                     .isoformat(timespec="milliseconds") if clusters and utc_start else "")
         db.insert_gulp_stats(self.conn, utc_start_s or "", gulp, gulp_utc, n_jobs,
-                             n_cands, len(clusters), len(rows),
-                             self.n_would - n_would_before, clustering_ms)
+                             n_cands, len(clusters), len(rows), len(to_trigger),
+                             clustering_ms)
+
+        # One dump per gulp: the same physical event can fragment into a few
+        # clusters; fire only the strongest and audit the rest, so duplicates
+        # never burn the daily budget.
+        to_trigger.sort(key=lambda t: -t[0].peak.snr)
+        for i, (cl, name, event_utc, tier, reason) in enumerate(to_trigger):
+            if i == 0:
+                await self._trigger(cl, name, event_utc, tier, reason,
+                                    id_by_name.get(name))
+            else:
+                db.insert_trigger(self.conn, id_by_name.get(name), name,
+                                  beams.stream_for_beam(cl.peak.beam),
+                                  "suppressed", f"{reason};gulp_dup")
+
+    # ----------------------------------------------------------- triggering
+
+    async def _trigger(self, cl: cluster.Cluster, name: str, event_utc: datetime,
+                       tier: str, reason: str, cluster_id: int | None) -> None:
+        c = cl.peak
+        stream = beams.stream_for_beam(c.beam)
+        loc = beams.stream_location(stream)
+        start = event_utc - timedelta(seconds=self.pre_s)
+        stop = event_utc + timedelta(
+            seconds=timing.dispersion_sweep_s(c.dm) + c.width * timing.TSAMP_S + self.post_s)
+        now = datetime.now(timezone.utc)
+        start_s, stop_s = timing.format_dada_utc(start), timing.format_dada_utc(stop)
+
+        logger.info("trigger candidate %s (%s): snr=%.1f dm=%.2f beam=%d nbeam=%d",
+                    name, reason, c.snr, c.dm, c.beam, cl.n_beams)
+
+        if self.shadow:
+            db.insert_trigger(self.conn, cluster_id, name, stream, "shadow", reason,
+                              dump_utc_start=start_s, dump_utc_stop=stop_s)
+            return
+
+        refusal = (self.budget_int.check(now)
+                   or self.disk.refusal(loc.host, loc.dump_dir))
+        if refusal:
+            logger.warning("intensity trigger %s refused: %s", name, refusal)
+            db.insert_trigger(self.conn, cluster_id, name, stream, "refused",
+                              f"{reason};{refusal}")
+        else:
+            try:
+                reply = await request_dump_async(loc.host, loc.control_port, start, stop)
+            except (OSError, asyncio.TimeoutError) as exc:
+                db.insert_trigger(self.conn, cluster_id, name, stream, "failed",
+                                  f"{reason};{exc}")
+            else:
+                action = "triggered" if reply == "OK" else "refused_daemon"
+                db.insert_trigger(self.conn, cluster_id, name, stream, action,
+                                  f"{reason};{reply}", dump_utc_start=start_s,
+                                  dump_utc_stop=stop_s)
+                if reply == "OK":
+                    self.budget_int.record(now)
+                    self._spawn(self._delayed_card(cl, name, event_utc,
+                                                   start_s, stop_s, loc, reason))
+
+        if self.voltage_enabled and tier <= self.voltage_tier:
+            v_refusal = self.budget_vol.check(now)
+            if v_refusal:
+                db.insert_trigger(self.conn, cluster_id, name, -1, "refused",
+                                  f"{reason};voltage_{v_refusal}", kind="voltage")
+            else:
+                replies = await request_voltage_dump_async(start, stop)
+                ok = sum(1 for r in replies.values() if r == "OK")
+                if ok:
+                    self.budget_vol.record(now)
+                db.insert_trigger(self.conn, cluster_id, name, -1,
+                                  "triggered" if ok == len(replies) else "partial",
+                                  f"{reason};{json.dumps(replies)}", kind="voltage",
+                                  dump_utc_start=start_s, dump_utc_stop=stop_s)
+
+    # ---------------------------------------------------------- trigger card
+
+    def _collect_context(self, event_epoch: float) -> list[list]:
+        sel = [m for m in self.context if abs(m[0] - event_epoch) <= self.ctx_window_s]
+        sel.sort(key=lambda m: -m[3])
+        del sel[self.ctx_max_members:]
+        sel.sort(key=lambda m: m[0])
+        return [[round(t - event_epoch, 4), b, round(dm, 3), round(snr, 2), w]
+                for t, b, dm, snr, w in sel]
+
+    async def _delayed_card(self, cl: cluster.Cluster, name: str, event_utc: datetime,
+                            start_s: str, stop_s: str, loc: beams.StreamLocation,
+                            reason: str) -> None:
+        # Hold the card back so context candidates from lagging jobs arrive.
+        await asyncio.sleep(self.ctx_delay_s)
+        c = cl.peak
+        card = {
+            "candname": name,
+            "source": reason.split(":", 1)[1] if reason.startswith("known_source") else "blind",
+            "event_utc": event_utc.isoformat(timespec="milliseconds"),
+            "beam": c.beam,
+            "local_beam": beams.local_beam(c.beam),
+            "stream": loc.stream,
+            "snr": c.snr,
+            "dm": c.dm,
+            "width": c.width,
+            "samp": c.samp,
+            "n_members": cl.n_members,
+            "n_beams": cl.n_beams,
+            "trigger_reason": reason,
+            "dump_utc_start": start_s,
+            "dump_utc_stop": stop_s,
+            "dump_dir": loc.dump_dir,
+            "context": {
+                "window_s": self.ctx_window_s,
+                "members": self._collect_context(event_utc.timestamp()),
+            },
+        }
+        body = json.dumps(card, indent=2)
+        fname = f"{name}.json"
+        try:
+            if loc.host == LOCAL_HOSTNAME:
+                Path(loc.spool_dir).mkdir(parents=True, exist_ok=True)
+                fd, tmp = tempfile.mkstemp(dir=loc.spool_dir, suffix=".tmp")
+                with os.fdopen(fd, "w") as f:
+                    f.write(body)
+                os.rename(tmp, Path(loc.spool_dir) / fname)
+            else:
+                proc = await asyncio.create_subprocess_exec(
+                    "ssh", loc.host,
+                    f"mkdir -p {loc.spool_dir} && cat > {loc.spool_dir}/{fname}.tmp "
+                    f"&& mv {loc.spool_dir}/{fname}.tmp {loc.spool_dir}/{fname}",
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+                _, err = await proc.communicate(body.encode())
+                if proc.returncode != 0:
+                    raise OSError(err.decode(errors="replace"))
+        except Exception:
+            logger.exception("trigger card %s write failed", name)
+            return
+        logger.info("trigger card %s -> %s:%s", name, loc.host, loc.spool_dir)
+
+    # ------------------------------------------------------------- heartbeat
 
     async def _heartbeat(self) -> None:
         while True:
             await asyncio.sleep(60)
+            n_trig = self.conn.execute(
+                "SELECT count(*) FROM triggers WHERE created_utc >= ?",
+                ((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(
+                    timespec="milliseconds"),)).fetchone()[0]
             logger.info("heartbeat: %d batches, %d cands -> %d clusters stored, "
-                        "%d would-trigger (last minute)",
-                        self.n_batches, self.n_cands, self.n_clusters, self.n_would)
-            self.n_batches = self.n_cands = self.n_clusters = self.n_would = 0
+                        "%d trigger decisions (last minute)%s",
+                        self.n_batches, self.n_cands, self.n_clusters, n_trig,
+                        " [SHADOW]" if self.shadow else "")
+            self.n_batches = self.n_cands = self.n_clusters = 0
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="T2 clustering daemon (shadow mode)")
-    p.add_argument("--listen-host", default="127.0.0.1")
-    p.add_argument("--listen-base", type=int, default=13345,
-                   help="first ingest port (tee ports in shadow deployment)")
-    p.add_argument("--nports", type=int, default=8)
-    p.add_argument("--db", default=db.DEFAULT_PATH)
-    p.add_argument("--coalesce-s", type=float, default=2.0,
-                   help="wait this long after a gulp's first batch before clustering")
-    p.add_argument("--eps", type=float, default=1.0)
-    p.add_argument("--min-samples", type=int, default=5)
-    p.add_argument("--samp-scale", type=float, default=64.0)
-    p.add_argument("--dm-idx-scale", type=float, default=32.0)
-    p.add_argument("--width-scale", type=float, default=2.0)
-    p.add_argument("--beam-scale", type=float, default=4.0)
-    p.add_argument("--max-nbeam", type=int, default=32,
-                   help="clusters wider than this many beams are tagged rfi_wide")
-    p.add_argument("--beam-veto", default="2", help="comma-separated beams")
-    p.add_argument("--dm-floor", type=float, default=20.0,
-                   help="would-trigger requires peak DM at or above this")
-    p.add_argument("--store-min-snr", type=float, default=TIER_C_SNR,
-                   help="store only clusters at or above this peak SNR; the"
-                        " default keeps tiered T2 events only, not the T1 noise floor")
+    p = argparse.ArgumentParser(description="T2 clustering + trigger daemon")
+    p.add_argument("config", nargs="?",
+                   default="/home/casm/software/dev/casm_t2/config/t2d.yaml")
+    p.add_argument("--shadow", action="store_true",
+                   help="full chain but no dumps, no trigger cards")
     args = p.parse_args()
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    daemon = T2Daemon(args)
-    logger.info("shadow mode: recording to %s, no dumps will be requested", args.db)
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+    shadow = args.shadow or cfg.get("shadow", False)
+
+    daemon = T2Daemon(cfg, shadow=shadow)
+    logger.info("t2d starting%s: db=%s, voltage=%s",
+                " in SHADOW mode" if shadow else "",
+                cfg.get("db", db.DEFAULT_PATH),
+                "enabled" if daemon.voltage_enabled else "disabled")
     try:
         asyncio.run(daemon.serve())
     except KeyboardInterrupt:
