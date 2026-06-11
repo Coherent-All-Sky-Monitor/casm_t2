@@ -118,7 +118,7 @@ def reconcile(conn, inj_id: int, cfg: dict) -> None:
                 gates["fail_reason"] or "recovered")
 
 
-async def run(cfg: dict, once: bool) -> None:
+async def run(cfg: dict, once: bool) -> None:  # noqa: C901
     icfg = cfg.get("injection", {})
     scratch = Path(icfg.get("scratch_dir", "/mnt/nvme5/casm_pipeline/injections"))
     scratch.mkdir(parents=True, exist_ok=True)
@@ -126,7 +126,20 @@ async def run(cfg: dict, once: bool) -> None:
     cadence_s = icfg.get("cadence_min", 30) * 60.0
     conn = db.connect(cfg.get("db", db.DEFAULT_PATH))
     i = 0
+    first = True
     while True:
+        # Hold the cadence on startup too: otherwise every daemon restart
+        # fires a surprise injection (and a dump) immediately.
+        if first and not once:
+            first = False
+            last = conn.execute("SELECT max(inject_utc) FROM injections").fetchone()[0]
+            if last:
+                from datetime import datetime as _dt
+                elapsed = (_dt.now(timezone.utc) - _dt.fromisoformat(last)).total_seconds()
+                wait = max(cadence_s - elapsed, 0)
+                if wait:
+                    logger.info("startup: %.0f s until next scheduled injection", wait)
+                    await asyncio.sleep(wait)
         stream = streams[i % len(streams)]
         local_beam = random.randint(4, 59)
         beam = stream * 64 + local_beam
