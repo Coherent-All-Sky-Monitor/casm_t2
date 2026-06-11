@@ -34,8 +34,8 @@ trigger:
   post_s: 2.0
   disk_floor_gb: 200    # refuse any dump if target fs has less free
   intensity:
-    min_spacing_s: 120
-    daily_max: 20
+    min_spacing_s: 14400   # one dump per 4 h
+    daily_max: 6
   voltage:
     enabled: false      # flip to true to enable voltage dumps (tier A only)
     tier: A
