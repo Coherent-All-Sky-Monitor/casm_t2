@@ -30,6 +30,9 @@ filters:
 
 # DISK SAFETY: dumps are scarce on purpose. Caps are global across reasons.
 trigger:
+  # cluster-first (strict T2) since 2026-06-11: every dump decision waits
+  # for DBSCAN; ring-window misses are recorded, not dodged.
+  fast_path: false
   pre_s: 2.0
   post_s: 2.0
   disk_floor_gb: 200    # refuse any dump if target fs has less free

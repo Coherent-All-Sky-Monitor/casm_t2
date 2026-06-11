@@ -126,6 +126,11 @@ class T2Daemon:
         self.voltage_tier = vcfg.get("tier", "A")
         self.pre_s = trig.get("pre_s", 2.0)
         self.post_s = trig.get("post_s", 2.0)
+        # Strict mode (fast_path: false) waits for clustering before any
+        # dump — DSA-110 style. Misses from the ring window expiring are
+        # then deliberate and audited, the data that argues for a deeper
+        # intensity ring. Flip back on if the latency budget tightens.
+        self.fast_path = bool(trig.get("fast_path", True))
         self.disk = DiskMonitor(trig.get("disk_floor_gb", 200.0),
                                 set(beams.STREAM_HOSTS.values()) - {LOCAL_HOSTNAME},
                                 beams.CAND_BEAM_DUMP_DIR)
@@ -191,7 +196,8 @@ class T2Daemon:
             tsamp = batch.tsamp_s or timing.TSAMP_S
             for c in batch.cands:
                 self.context.append((epoch + c.samp * tsamp, c.beam, c.dm, c.snr, c.width))
-        self._spawn(self._fast_path(batch))
+        if self.fast_path:
+            self._spawn(self._fast_path(batch))
         key = (batch.utc_start, batch.gulp)
         first = key not in self.pending
         self.pending[key].extend(batch.cands)
