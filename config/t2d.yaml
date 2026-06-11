@@ -34,8 +34,11 @@ trigger:
   post_s: 2.0
   disk_floor_gb: 200    # refuse any dump if target fs has less free
   intensity:
-    min_spacing_s: 300     # anti-burst only; daily_max is the real limiter
-    daily_max: 48
+    # No rate gate: every T2-passed candidate is dumped, plotted, and its
+    # .dada deleted (plotter --delete-dumps). The spacing only prevents
+    # overlapping dump writes; daily_max is a runaway-storm backstop.
+    min_spacing_s: 60
+    daily_max: 300
   voltage:
     enabled: false      # flip to true to enable voltage dumps (tier A only)
     tier: A
