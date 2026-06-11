@@ -71,5 +71,5 @@ injection:
   streams: [0, 1, 2, 3]
   dm_range: [100.0, 1000.0]
   amp_range: [25.0, 45.0]
-  sigma_ms_range: [1.0, 10.0]
+  sigma_ms_range: [1.0, 100.0]
   scratch_dir: /mnt/nvme5/casm_pipeline/injections
