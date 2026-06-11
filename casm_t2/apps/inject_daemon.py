@@ -81,10 +81,13 @@ def reconcile(conn, inj_id: int, cfg: dict) -> None:
     lo = (t0 - timedelta(seconds=10)).isoformat(timespec="milliseconds")
     hi = (t0 + timedelta(seconds=90)).isoformat(timespec="milliseconds")
     dm_tol = max(0.15 * dm, 5.0)
+    # Prefer the fast-triggered cluster: that is the one with the dump,
+    # the plot, and the trigger audit attached.
     cand = conn.execute(
         "SELECT id, snr, dm, tier, tags, n_beams, beam FROM clusters"
         " WHERE event_utc BETWEEN ? AND ? AND beam_lo <= ? AND beam_hi >= ?"
-        " AND dm_lo <= ? AND dm_hi >= ? ORDER BY snr DESC LIMIT 1",
+        " AND dm_lo <= ? AND dm_hi >= ?"
+        " ORDER BY (tags LIKE '%fast_triggered%') DESC, snr DESC LIMIT 1",
         (lo, hi, beam + 2, beam - 2, dm + dm_tol, dm - dm_tol)).fetchone()
 
     filt = cfg.get("filters", {})
