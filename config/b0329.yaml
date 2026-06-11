@@ -18,6 +18,10 @@ beam_veto: []
 schedule_csv: /mnt/nvme5/casm_pipeline/schedules/b0329_schedule.csv
 schedule_pad_s: 120
 
+# Forward every raw payload to 127.0.0.1:<tee_base_port>+job for the
+# shadow t2d clustering daemon. Fire-and-forget; safe if t2d is down.
+tee_base_port: 13345
+
 trigger:
   enabled: true
   pre_s: 2.0

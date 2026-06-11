@@ -10,9 +10,12 @@ requires-python = ">=3.10"
 dependencies = [
     "numpy",
     "pyyaml",
+    "scikit-learn",
 ]
 
 [project.scripts]
+t2d = "casm_t2.apps.t2d:main"
+t2-replay = "casm_t2.apps.replay:main"
 t2-source-watch = "casm_t2.apps.source_watch:main"
 t2-transit-schedule = "casm_t2.apps.transit_schedule:main"
 t2-dump = "casm_t2.dump_client:main"

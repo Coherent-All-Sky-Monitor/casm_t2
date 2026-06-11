@@ -1,0 +1,100 @@
+"""SQLite event store for T2.
+
+One WAL-mode database on corr1 holds the clustered event stream and the
+trigger bookkeeping. Raw T1 trials stay in hella's .dat files; this only
+records clusters (the objects the trigger logic reasons about), so volume
+is a few hundred thousand rows per day at current RFI levels.
+
+Writers open with `connect()`, which applies WAL and a busy timeout so the
+daemon and ad-hoc readers (sqlite3 CLI, notebooks) coexist safely.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+
+from casm_t2.cluster import Cluster
+
+DEFAULT_PATH = "/mnt/nvme5/casm_pipeline/db/t2.sqlite"
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS clusters (
+    id            INTEGER PRIMARY KEY,
+    obs_utc_start TEXT NOT NULL,     -- PSRDADA UTC of the observation
+    gulp          INTEGER,
+    event_utc     TEXT NOT NULL,     -- peak trial arrival, ISO 8601
+    samp          INTEGER NOT NULL,
+    snr           REAL NOT NULL,
+    dm            REAL NOT NULL,
+    dm_idx        INTEGER NOT NULL,
+    width         INTEGER NOT NULL,
+    beam          INTEGER NOT NULL,
+    n_members     INTEGER NOT NULL,  -- raw T1 trials in the cluster
+    n_beams       INTEGER NOT NULL,
+    beam_lo       INTEGER NOT NULL,
+    beam_hi       INTEGER NOT NULL,
+    dm_lo         REAL NOT NULL,
+    dm_hi         REAL NOT NULL,
+    samp_lo       INTEGER NOT NULL,
+    samp_hi       INTEGER NOT NULL,
+    tier          TEXT NOT NULL,     -- A/B/C or '-' below tier floor
+    tags          TEXT NOT NULL,     -- comma-joined: rfi_wide, veto, would_trigger, ...
+    created_utc   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_clusters_event ON clusters(event_utc);
+CREATE INDEX IF NOT EXISTS idx_clusters_snr ON clusters(snr);
+
+CREATE TABLE IF NOT EXISTS triggers (
+    id            INTEGER PRIMARY KEY,
+    cluster_id    INTEGER REFERENCES clusters(id),
+    candname      TEXT NOT NULL,
+    stream        INTEGER NOT NULL,
+    action        TEXT NOT NULL,     -- triggered / refused / failed / shadow
+    detail        TEXT NOT NULL,
+    created_utc   TEXT NOT NULL
+);
+"""
+
+
+def connect(path: str | Path = DEFAULT_PATH) -> sqlite3.Connection:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.executescript(SCHEMA)
+    return conn
+
+
+def insert_clusters(conn: sqlite3.Connection, rows: list[tuple[Cluster, str, int | None,
+                                                               str, str, str]]) -> list[int]:
+    """Insert clusters; each row is (cluster, obs_utc_start, gulp, event_utc, tier, tags).
+
+    Returns the assigned ids, in input order.
+    """
+    now = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    ids = []
+    with conn:
+        for cl, obs, gulp, event_utc, tier, tags in rows:
+            cur = conn.execute(
+                "INSERT INTO clusters (obs_utc_start, gulp, event_utc, samp, snr, dm,"
+                " dm_idx, width, beam, n_members, n_beams, beam_lo, beam_hi, dm_lo,"
+                " dm_hi, samp_lo, samp_hi, tier, tags, created_utc)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (obs, gulp, event_utc, cl.peak.samp, cl.peak.snr, cl.peak.dm,
+                 cl.peak.dm_idx, cl.peak.width, cl.peak.beam, cl.n_members,
+                 cl.n_beams, cl.beam_lo, cl.beam_hi, cl.dm_lo, cl.dm_hi,
+                 cl.samp_lo, cl.samp_hi, tier, tags, now))
+            ids.append(cur.lastrowid)
+    return ids
+
+
+def insert_trigger(conn: sqlite3.Connection, cluster_id: int | None, candname: str,
+                   stream: int, action: str, detail: str) -> None:
+    now = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    with conn:
+        conn.execute(
+            "INSERT INTO triggers (cluster_id, candname, stream, action, detail,"
+            " created_utc) VALUES (?,?,?,?,?,?)",
+            (cluster_id, candname, stream, action, detail, now))

@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import functools
 from collections import deque
 import json
 import logging
@@ -151,6 +152,11 @@ class SourceWatch:
         # enough to reconstruct the beam/DM neighbourhood of a trigger.
         self.context: deque[tuple[float, int, float, float, int]] = deque(maxlen=400_000)
         self._card_tasks: set[asyncio.Task] = set()
+        # Optional tee: forward each raw payload to 127.0.0.1:<base>+job so a
+        # shadow consumer (t2d) sees the stream without owning hella's ports.
+        # Strictly fire-and-forget; a dead consumer must never cost latency.
+        self.tee_base = cfg.get("tee_base_port")
+        self._tee_tasks: set[asyncio.Task] = set()
         self.log_path = Path(cfg["log_csv"])
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         if not self.log_path.exists():
@@ -164,15 +170,17 @@ class SourceWatch:
     async def serve(self) -> None:
         host = self.cfg.get("listen_host", "0.0.0.0")
         servers = []
-        for port in self.cfg["ports"]:
-            servers.append(await asyncio.start_server(self._handle, host, port))
+        for job, port in enumerate(self.cfg["ports"]):
+            handler = functools.partial(self._handle, job=job)
+            servers.append(await asyncio.start_server(handler, host, port))
             logger.info("listening on %s:%d", host, port)
         async with asyncio.TaskGroup() as tg:
             tg.create_task(self._heartbeat())
             for s in servers:
                 tg.create_task(s.serve_forever())
 
-    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+                      job: int = 0) -> None:
         try:
             # Hella closes the connection after each gulp; read to EOF.
             payload = await asyncio.wait_for(reader.read(-1), timeout=30)
@@ -181,11 +189,26 @@ class SourceWatch:
             return
         finally:
             writer.close()
+        if self.tee_base is not None and payload:
+            task = asyncio.create_task(self._tee(job, payload))
+            self._tee_tasks.add(task)
+            task.add_done_callback(self._tee_tasks.discard)
         batch = wire.parse_batch(payload.decode(errors="replace"))
         self.n_batches += 1
         self.n_cands += len(batch.cands)
         if batch.cands:
             await self._process(batch)
+
+    async def _tee(self, job: int, payload: bytes) -> None:
+        try:
+            _, w = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", self.tee_base + job), timeout=1.0)
+            w.write(payload)
+            await w.drain()
+            w.close()
+            await w.wait_closed()
+        except (OSError, asyncio.TimeoutError):
+            pass  # shadow consumer down; the live path does not care
 
     async def _heartbeat(self) -> None:
         while True:
