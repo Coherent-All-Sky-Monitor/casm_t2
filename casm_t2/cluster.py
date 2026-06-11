@@ -35,7 +35,7 @@ class ClusterParams:
     min_samples: int = 5
     samp_scale: float = 64.0     # samples, ~67 ms at 1.048576 ms/sample
     dm_idx_scale: float = 32.0   # DM trial steps
-    width_scale: float = 2.0     # log2(boxcar width) steps
+    width_scale: float = 2.0     # steps of the width column (already log2 samples)
     beam_scale: float = 4.0      # adjacent sky beams
 
 
@@ -63,7 +63,7 @@ def _features(cands: list[Candidate], p: ClusterParams) -> np.ndarray:
     for i, c in enumerate(cands):
         x[i] = (c.samp / p.samp_scale,
                 c.dm_idx / p.dm_idx_scale,
-                np.log2(max(c.width, 1)) / p.width_scale,
+                c.width / p.width_scale,
                 c.beam / p.beam_scale)
     return x
 
@@ -82,7 +82,7 @@ def _dedup_grid(cands: list[Candidate],
     for c in cands:
         key = (c.samp // max(int(p.samp_scale / 2), 1),
                c.dm_idx // max(int(p.dm_idx_scale / 2), 1),
-               int(np.log2(max(c.width, 1))),
+               int(c.width),
                c.beam)
         cur = cells.get(key)
         if cur is None:

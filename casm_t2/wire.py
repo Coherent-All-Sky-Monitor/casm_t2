@@ -29,7 +29,7 @@ class Candidate:
     snr: float
     samp: int
     time_days: float
-    width: int
+    width: int  # log2 of the boxcar length in samples (0 -> 1 samp)
     dm_idx: int
     dm: float
     beam: int

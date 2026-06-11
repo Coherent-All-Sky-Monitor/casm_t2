@@ -418,7 +418,7 @@ class T2Daemon:
         loc = beams.stream_location(stream)
         start = event_utc - timedelta(seconds=self.pre_s)
         stop = event_utc + timedelta(
-            seconds=timing.dispersion_sweep_s(c.dm) + c.width * timing.TSAMP_S + self.post_s)
+            seconds=timing.dispersion_sweep_s(c.dm) + (2 ** c.width) * timing.TSAMP_S + self.post_s)
         now = datetime.now(timezone.utc)
         start_s, stop_s = timing.format_dada_utc(start), timing.format_dada_utc(stop)
 
