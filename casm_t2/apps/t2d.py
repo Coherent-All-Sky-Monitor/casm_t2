@@ -122,6 +122,9 @@ class T2Daemon:
                                                icfg.get("daily_max", 20))
         self.budget_vol = policy.TriggerBudget(vcfg.get("min_spacing_s", 600),
                                                vcfg.get("daily_max", 2))
+        jcfg = trig.get("injection", {})
+        self.budget_inj = policy.TriggerBudget(jcfg.get("min_spacing_s", 60),
+                                               jcfg.get("daily_max", 30))
         self.voltage_enabled = bool(vcfg.get("enabled", False))
         self.voltage_tier = vcfg.get("tier", "A")
         self.pre_s = trig.get("pre_s", 2.0)
@@ -249,9 +252,11 @@ class T2Daemon:
                     break
             if reason is None and c.snr >= self.tier_b and c.dm >= self.dm_floor:
                 reason = "tier_A" if c.snr >= self.tier_a else "tier_B"
-            if reason is None:
-                continue
             if self._cand_injection_match(event_utc.timestamp(), c.beam, c.dm):
+                # injections never compete for the candidate budget, but they
+                # get dumped+plotted on their own budget for the gallery
+                reason = "injection" if c.snr >= self.tier_c else None
+            if reason is None:
                 continue
             if best is None or c.snr > best[0].snr:
                 best = (c, event_utc, reason)
@@ -421,8 +426,9 @@ class T2Daemon:
                               dump_utc_start=start_s, dump_utc_stop=stop_s)
             return
 
-        refusal = (self.budget_int.check(now)
-                   or self.disk.refusal(loc.host, loc.dump_dir))
+        is_injection = reason.endswith("injection")
+        budget = self.budget_inj if is_injection else self.budget_int
+        refusal = budget.check(now) or self.disk.refusal(loc.host, loc.dump_dir)
         if refusal:
             logger.warning("intensity trigger %s refused: %s", name, refusal)
             db.insert_trigger(self.conn, cluster_id, name, stream, "refused",
@@ -439,11 +445,11 @@ class T2Daemon:
                                   f"{reason};{reply}", dump_utc_start=start_s,
                                   dump_utc_stop=stop_s)
                 if reply == "OK":
-                    self.budget_int.record(now)
+                    budget.record(now)
                     self._spawn(self._delayed_card(cl, name, event_utc,
                                                    start_s, stop_s, loc, reason))
 
-        if self.voltage_enabled and tier <= self.voltage_tier:
+        if self.voltage_enabled and tier <= self.voltage_tier and not is_injection:
             v_refusal = self.budget_vol.check(now)
             if v_refusal:
                 db.insert_trigger(self.conn, cluster_id, name, -1, "refused",
@@ -481,7 +487,8 @@ class T2Daemon:
         n_members, n_beams = row if row else (cl.n_members, cl.n_beams)
         card = {
             "candname": name,
-            "source": reason.split(":", 1)[1] if reason.startswith("known_source") else "blind",
+            "source": (reason.split(":", 1)[1] if reason.startswith("known_source")
+                       else "injection" if reason.endswith("injection") else "blind"),
             "event_utc": event_utc.isoformat(timespec="milliseconds"),
             "beam": c.beam,
             "local_beam": beams.local_beam(c.beam),
