@@ -217,3 +217,10 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 reference/
+
+# LLM-assistant working files — never published
+CLAUDE.md
+MEMORY.md
+.claude/
+*.llm.md
+source_transit_*.png
