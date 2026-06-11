@@ -1,56 +1,49 @@
 # casm_t2
 
-Real-time T2 stage of the CASM fast-transient search. It ingests
-single-pulse candidates from the casm-hella GPU search (T1) over TCP,
-clusters them, filters RFI and known sources, and fires ring-buffer
-intensity dumps for the events worth keeping — all within the few seconds
-the upstream ring buffer allows.
+T2 stage of the CASM fast-transient search. It takes the single-pulse
+candidate stream from the casm-hella GPU search (T1), clusters it, throws
+out the RFI, and decides — inside the few seconds the upstream ring buffer
+allows — which events are worth dumping to disk. casm_t3 turns those dumps
+into plots and a monitoring UI.
 
-Pipeline position:
+Hella emits thousands of candidates a second in bad RFI weather, and
+almost all of it is junk. The job here is to get from that firehose to a
+handful of defensible dump decisions per hour, with every decision
+recorded so the misses can be audited as honestly as the hits.
 
-    T1  casm-hella GPU single-pulse search  (8 jobs, 512 beams)
-    T2  this repo: clustering, filtering, trigger policy
-    T3  casm_t3: dump plotting, monitoring web UI, disk janitor
+## How it works
 
-## What it does
+`t2d` owns eight TCP ports, one per hella job. Each gulp it coalesces the
+per-job batches, deduplicates, and clusters with DBSCAN over (time, DM,
+width, beam) — beam count is the main RFI discriminator, since a real
+pulse is compact in beam and RFI is not. Clusters then run a filter
+chain: injection match (stored, never dumped), beam veto, wide-beam RFI
+cut, known-source DM-range match, and S/N tiers (A >= 30, B >= 15,
+C >= 12; blind triggers need A/B plus DM >= 20). Survivors hit the
+trigger budgets — minimum spacing, daily caps, one dump per gulp in a
+storm, and a free-disk floor — before a dump command goes to the owning
+backend node.
 
-- Listens on eight TCP ports for per-gulp candidate batches
-  (~10^3-10^4 candidates/s in typical RFI weather).
-- Coalesces the per-job batches, deduplicates, and clusters with DBSCAN
-  over (time, DM, width, beam).
-- Classifies every cluster: injection match, beam veto, wide-beam RFI cut,
-  known-source DM-range match, S/N tier (A >= 30, B >= 15, C >= 12).
-- Applies trigger policy — token-bucket rate budgets, per-gulp storm rule,
-  daily caps, and a hard free-disk floor — then commands intensity dumps
-  on the owning backend node.
-- Records the full decision chain (stored clusters, trigger audit,
-  injection ledger, per-gulp funnel stats) in a single SQLite database.
-- Runs a scheduled live injection program with per-gate recovery
-  accounting.
+Everything lands in one SQLite database: stored clusters, the full
+trigger audit (refusals with reasons, including ring-window misses), the
+injection ledger with per-gate recovery, and per-gulp funnel counters.
 
 ## Install
 
-    python -m venv env && source env/bin/activate
     pip install -e .
 
-Python >= 3.10. Runtime dependencies are numpy, scikit-learn, and pyyaml.
+Python >= 3.10; numpy, scikit-learn, pyyaml.
 
 ## Run
 
-    t2d config/t2d.yaml          # the daemon (one YAML is the only config)
-    t2d config/t2d.yaml --shadow # full dry-run: cluster + record, no dumps
+    t2d config/t2d.yaml            # the daemon; that YAML is the only config
+    t2d config/t2d.yaml --shadow   # cluster and record, fire nothing
 
-Utilities: `t2-dump` (manual smoke dump), `t2-replay` (offline replay of a
-UTC slice for parameter tuning), `t2-inject` (injection daemon),
-`t2-inject-report` (daily recovery report), `t2-transit-schedule`.
+Also ships `t2-dump` (manual smoke dump), `t2-replay` (offline replay of
+a UTC slice), `t2-inject` / `t2-inject-report` (live injections and the
+daily recovery report), and `t2-transit-schedule`.
 
-## Documentation
+See `docs/architecture.md` for the data path and database schema, and
+`docs/operations.md` for deployment, config reference, and runbooks.
 
-- [docs/architecture.md](docs/architecture.md) — data path, wire format,
-  clustering, decision chain, database schema.
-- [docs/operations.md](docs/operations.md) — deployment, configuration
-  reference, runbooks, latency budget.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+MIT license.

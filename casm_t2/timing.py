@@ -1,7 +1,7 @@
 """Time conversions between hella sample numbers and absolute UTC.
 
-The native CASM sample interval is 32.768 us x 32 = 1.048576 ms. Note that
-hella's own ``time_days`` output column has historically been computed with
+The native CASM sample interval is 32.768 us x 32 = 1.048576 ms. Hella's
+own ``time_days`` output column has historically been computed with
 an assumed 1.0 ms sample time in some builds, so all absolute timing here
 is derived from the integer sample number and TSAMP_S only.
 

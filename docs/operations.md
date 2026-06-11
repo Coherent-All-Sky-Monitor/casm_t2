@@ -2,74 +2,63 @@
 
 ## Deployment
 
-Everything runs as systemd user units (`deploy/systemd/`, requires
-`loginctl enable-linger`):
+systemd user units, `deploy/systemd/`. Run `loginctl enable-linger` once
+per node or they die at logout.
 
 | unit | host | role |
 |---|---|---|
-| `t2d` | corr1 | the trigger daemon (owns the hella candidate ports) |
-| `t2-inject` | corr1 | scheduled live injections |
-| `t2-inject-report.timer` | corr1 | daily recovery report |
+| t2d | corr1 | the trigger daemon; owns the hella candidate ports |
+| t2-inject | corr1 | scheduled live injections |
+| t2-inject-report.timer | corr1 | daily recovery report |
 
-Install with `pip install -e .` into the shared venv, copy units to
-`~/.config/systemd/user/`, then `systemctl --user enable --now <unit>`.
-The second backend node needs no casm_t2 services; t2d commands its dump
-daemons over TCP.
+The second backend node runs no casm_t2 services — t2d commands its dump
+daemons over TCP. Config changes need `systemctl --user restart t2d`,
+which costs the in-flight gulp and nothing else; budgets rebuild from the
+DB.
 
 ## Configuration
 
-One YAML (`config/t2d.yaml`) is the only user config. Key blocks:
+`config/t2d.yaml` is the only user config. The blocks you'll actually
+touch:
 
-- `ports` / `listen_host` — the eight hella candidate ports.
-- `cluster` — DBSCAN scales (`eps`, `min_samples`, per-axis scales).
-- `tiers` — S/N thresholds for A/B/C.
-- `filters` — `beam_veto`, `max_nbeam`, `dm_floor`.
-- `known_sources` — per-source DM, transit schedule CSV, `snr_min`.
-- `trigger` — `fast_path` (strict cluster-first when false), per-kind
-  budgets (`min_spacing_s`, `daily_max`), `disk_floor_gb`, voltage block
-  (`enabled: false` by default), dump pre/post seconds.
-- `injections` — cadence, parameter ranges, FIFO paths, scratch quota.
-- `db` — SQLite path.
-
-Config changes take effect on `systemctl --user restart t2d`. Restarting
-loses only the in-flight gulp; the budgets are rebuilt from the DB.
+`tiers` and `filters` (S/N thresholds, `beam_veto`, `max_nbeam`,
+`dm_floor`) shape what counts as an event. `trigger` holds `fast_path`
+(strict cluster-first when false), the per-kind budgets, `disk_floor_gb`,
+and the voltage block, which ships `enabled: false`. `known_sources` is
+per-source DM, transit schedule CSV, and `snr_min`. `injections` sets
+cadence, parameter ranges, FIFO paths, and the scratch quota.
 
 ## Runbooks
 
-**Smoke-test a dump path**
+Smoke-test a dump path:
 
     t2-dump --stream 2 --last 5
 
-Requests a 5 s dump on stream 2's owning node; check the dump directory
-and the daemon reply.
+then check the stream's dump directory on the owning node.
 
-**Replay a UTC slice offline** (parameter tuning, post-mortems)
+Replay a UTC slice offline (tuning, post-mortems) — reads the on-disk T1
+files only, never dumps; the CSV loads straight into hiplot:
 
     t2-replay --from 2026-06-11T03:00:00 --to 2026-06-11T04:00:00 \
               --config config/t2d.yaml --csv /tmp/clusters.csv
 
-Reads the on-disk T1 `.dat` files only; never dumps. The CSV loads
-directly into hiplot for interactive exploration.
-
-**One manual injection**
+One manual injection, then verify the ledger row appears, the cluster a
+minute later is tagged `injection`, and no dump fires:
 
     t2-inject config/t2d.yaml --once
 
-Verify: ledger row appears, the cluster a minute later is tagged
-`injection`, and no dump fires.
+## When misses pile up
 
-**Latency budget** (why misses happen)
-
-T1 reports a pulse 13-25 s after it happened (gulp fill + ring hand-offs
-+ search compute). T2 adds well under a second (coalesce wait + DBSCAN +
-dump RTT). The dump daemon can only reach back as far as its ring holds.
-If misses (`refused_daemon` in the audit, red on the web) become common,
-the fix is a deeper ring or shorter gulps upstream — both backend config
-changes, not T2 code.
+`refused_daemon` rows (red on the web UI) mean T2's dump command arrived
+after the event left the intensity ring. T2 contributes under a second to
+that race; the other 13-25 s is T1's reporting latency. If misses become
+common the fix is upstream — a deeper ring or shorter gulps in the
+backend config — not in this repo.
 
 ## Disk safety
 
-Hard constraints, all enforced in the trigger path: free-space floor on
-the receiving filesystem, per-kind daily caps, minimum spacing, one dump
-per gulp during storms. Every refusal is recorded with its reason in the
-`triggers` table.
+The dump disks run close to full, so scarcity is enforced in the trigger
+path itself: free-space floor on the receiving filesystem, daily caps,
+minimum spacing, one dump per gulp in a storm. Every refusal lands in the
+`triggers` table with a reason. Don't lift the caps to "catch up" — fix
+whatever is eating the disk first.
