@@ -38,7 +38,7 @@ from pathlib import Path
 
 import yaml
 
-from casm_t2 import db, logsetup
+from casm_t2 import db, inject_plot, logsetup
 
 logger = logging.getLogger("t2.inject")
 
@@ -182,6 +182,19 @@ async def run(cfg: dict, once: bool) -> None:  # noqa: C901
         logger.info("injection %d: beam %d (stream %d) dm=%.1f amp=%.1f "
                     "sigma=%.1fms est_snr=%s", inj_id, beam, stream, dm, amp,
                     sigma_ms, f"{est_snr:.1f}" if est_snr else "?")
+
+        # truth plot for the web gallery, rendered from the injected .fil
+        # (dumps tap upstream of the injection merge and cannot show it)
+        try:
+            png_dir = Path(icfg.get("plot_dir",
+                                    "/mnt/nvme5/casm_pipeline/candidates/injections"))
+            await asyncio.to_thread(
+                inject_plot.render, scratch / f"{file_id}.fil", dm, est_snr,
+                png_dir / f"{file_id}.png",
+                f"injection {inj_id}   beam {beam}   DM={dm:.1f}   "
+                f"sigma={sigma_ms:.1f} ms   est S/N={est_snr or float('nan'):.0f}")
+        except Exception:
+            logger.exception("truth plot for injection %d failed", inj_id)
 
         # T1 reports 20-30 s late; give it 3 minutes, then attribute gates.
         await asyncio.sleep(180)

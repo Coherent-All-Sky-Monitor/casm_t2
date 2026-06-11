@@ -39,9 +39,6 @@ trigger:
     # overlapping dump writes; daily_max is a runaway-storm backstop.
     min_spacing_s: 60
     daily_max: 300
-  injection:             # injection gallery dumps (separate from candidates)
-    min_spacing_s: 60
-    daily_max: 30
   voltage:
     enabled: false      # flip to true to enable voltage dumps (tier A only)
     tier: A
