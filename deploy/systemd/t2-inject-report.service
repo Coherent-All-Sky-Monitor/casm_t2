@@ -4,4 +4,4 @@ Description=CASM daily injection recovery report
 [Service]
 Type=oneshot
 ExecStart=/home/casm/software/dev/casm_venvs/casm_offline_env/bin/t2-inject-report
-StandardOutput=append:/mnt/nvme5/casm_pipeline/logs/t2_inject_report.log
+StandardOutput=journal

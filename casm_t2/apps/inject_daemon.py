@@ -38,7 +38,7 @@ from pathlib import Path
 
 import yaml
 
-from casm_t2 import db
+from casm_t2 import db, logsetup
 
 logger = logging.getLogger("t2.inject")
 
@@ -190,9 +190,9 @@ def main() -> None:
     p.add_argument("config", nargs="?",
                    default="/home/casm/software/dev/casm_t2/config/t2d.yaml")
     p.add_argument("--once", action="store_true", help="single injection, then exit")
+    p.add_argument("--log-file", default="/mnt/nvme5/casm_pipeline/logs/t2_inject.log")
     args = p.parse_args()
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    logsetup.setup(args.log_file)
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
     try:

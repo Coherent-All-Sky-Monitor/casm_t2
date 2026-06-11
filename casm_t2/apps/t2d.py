@@ -7,6 +7,15 @@ runs every cluster through the decision chain:
     injection match -> beam veto -> wide-beam RFI cut -> known-source match
     -> SNR tier -> trigger budgets + disk guard -> dump + trigger card
 
+Latency note: the dump ring only reaches ~20 s back and T1 itself reports
+20-24 s after the pulse, so dump triggering CANNOT wait for clustering.
+A fast path evaluates trigger-worthy candidates per batch the moment they
+arrive (cheap per-trial thresholds + injection/veto checks) and fires the
+dump immediately; the clustering path then recognises the same event,
+reuses its name, back-fills cluster_id on the trigger row, and enriches
+the delayed trigger card. The slow (post-cluster) trigger path remains as
+a fallback and audit trail for anything the fast path skipped.
+
 Everything is recorded in the SQLite event DB: tiered clusters (with their
 YYMMDDxxxx event names), per-gulp funnel statistics, and a full audit row
 for every trigger decision including refusals and their reasons.
@@ -37,7 +46,7 @@ from pathlib import Path
 
 import yaml
 
-from casm_t2 import beams, cluster, db, events, known_source, policy, timing, wire
+from casm_t2 import beams, cluster, db, events, known_source, logsetup, policy, timing, wire
 from casm_t2.dump_client import request_dump_async, request_voltage_dump_async
 
 logger = logging.getLogger("t2d")
@@ -138,6 +147,11 @@ class T2Daemon:
         self.pending_jobs: dict[tuple, int] = {}
         self.tasks: set[asyncio.Task] = set()
         self.n_batches = self.n_cands = self.n_clusters = self.n_triggers = 0
+        # fast-path bookkeeping: recently fired fast triggers awaiting their
+        # cluster (name -> (event_epoch, beam, dm)), plus a dedup clock so a
+        # bright event spread over several jobs' batches fires only once.
+        self.pending_fast: dict[str, tuple[float, int, float]] = {}
+        self._last_fast_mono = 0.0
         # injection ledger cache, refreshed per gulp from the DB
         self._inj_cache: list[tuple[float, int, float]] = []  # (epoch, beam, dm)
         self._inj_cache_ts = 0.0
@@ -177,6 +191,7 @@ class T2Daemon:
             tsamp = batch.tsamp_s or timing.TSAMP_S
             for c in batch.cands:
                 self.context.append((epoch + c.samp * tsamp, c.beam, c.dm, c.snr, c.width))
+        self._spawn(self._fast_path(batch))
         key = (batch.utc_start, batch.gulp)
         first = key not in self.pending
         self.pending[key].extend(batch.cands)
@@ -202,6 +217,68 @@ class T2Daemon:
             await self._process(key, clusters, n_jobs, len(cands), dt * 1e3)
         except Exception:
             logger.exception("processing gulp %s failed", key)
+
+    # ------------------------------------------------------------ fast path
+
+    def _cand_injection_match(self, epoch: float, beam: int, dm: float) -> bool:
+        for inj_epoch, inj_beam, inj_dm in self._inj_cache:
+            if (abs(epoch - inj_epoch) <= 60 and abs(beam - inj_beam) <= 2
+                    and abs(dm - inj_dm) <= max(0.1 * inj_dm, 5)):
+                return True
+        return False
+
+    async def _fast_path(self, batch: wire.Batch) -> None:
+        """Per-batch trigger evaluation, ~1 s after T1 reports."""
+        if batch.utc_start is None:
+            return
+        utc_start = timing.parse_dada_utc(batch.utc_start)
+        tsamp = batch.tsamp_s or timing.TSAMP_S
+        self._refresh_injections()
+
+        best = None
+        for c in batch.cands:
+            if c.beam in self.veto:
+                continue
+            event_utc = timing.samp_to_utc(c.samp, utc_start, tsamp)
+            reason = None
+            for src in self.sources:
+                if (src.dm_min <= c.dm <= src.dm_max
+                        and c.snr >= self.source_snr_min.get(src.name, 11.0)
+                        and src.active(c.beam, event_utc)):
+                    reason = f"known_source:{src.name}"
+                    break
+            if reason is None and c.snr >= self.tier_b and c.dm >= self.dm_floor:
+                reason = "tier_A" if c.snr >= self.tier_a else "tier_B"
+            if reason is None:
+                continue
+            if self._cand_injection_match(event_utc.timestamp(), c.beam, c.dm):
+                continue
+            if best is None or c.snr > best[0].snr:
+                best = (c, event_utc, reason)
+        if best is None:
+            return
+        if time.monotonic() - self._last_fast_mono < 60:
+            return  # one fast attempt per minute; budgets do the real limiting
+        self._last_fast_mono = time.monotonic()
+
+        c, event_utc, reason = best
+        name = events.new_event_name(self.conn, event_utc)
+        self.pending_fast[name] = (event_utc.timestamp(), c.beam, c.dm)
+        pseudo = cluster.Cluster(peak=c, n_members=1, n_beams=1,
+                                 beam_lo=c.beam, beam_hi=c.beam, dm_lo=c.dm,
+                                 dm_hi=c.dm, samp_lo=c.samp, samp_hi=c.samp)
+        tier = ("A" if c.snr >= self.tier_a else
+                "B" if c.snr >= self.tier_b else "C")
+        await self._trigger(pseudo, name, event_utc, tier, f"fast:{reason}", None)
+
+    def _match_fast(self, cl: cluster.Cluster, event_epoch: float) -> str | None:
+        """Name of a pending fast trigger this cluster corresponds to."""
+        for name, (epoch, beam, dm) in self.pending_fast.items():
+            if (abs(event_epoch - epoch) <= 30
+                    and cl.beam_lo - 2 <= beam <= cl.beam_hi + 2
+                    and cl.dm_lo - 5 <= dm <= cl.dm_hi + 5):
+                return name
+        return None
 
     # ----------------------------------------------------------- decisions
 
@@ -262,16 +339,33 @@ class T2Daemon:
         utc_start = timing.parse_dada_utc(utc_start_s) if utc_start_s else None
         self._refresh_injections()
 
-        rows, to_trigger = [], []
+        # expire stale fast-trigger entries (cluster never showed up)
+        now_ts = datetime.now(timezone.utc).timestamp()
+        for name in [n for n, (e, _, _) in self.pending_fast.items()
+                     if now_ts - e > 120]:
+            self.pending_fast.pop(name, None)
+
+        rows, to_trigger, fast_names = [], [], []
         for cl in clusters:
             event_utc = (timing.samp_to_utc(cl.peak.samp, utc_start)
                          if utc_start else None)
             tier, tags = self._classify(cl, event_utc)
             reason = self._wants_trigger(cl, tier, tags)
-            store = (tier != "-" or reason is not None or "injection" in tags)
+            fast_name = (self._match_fast(cl, event_utc.timestamp())
+                         if event_utc else None)
+            store = (tier != "-" or reason is not None or "injection" in tags
+                     or fast_name is not None)
             if not store:
                 continue
-            name = events.new_event_name(self.conn, event_utc or datetime.now(timezone.utc))
+            if fast_name is not None:
+                # the fast path already triggered and named this event
+                name = self.pending_fast.pop(fast_name, None) and fast_name
+                tags.append("fast_triggered")
+                fast_names.append(name)
+                reason = None
+            else:
+                name = events.new_event_name(self.conn,
+                                             event_utc or datetime.now(timezone.utc))
             ev_iso = event_utc.isoformat(timespec="milliseconds") if event_utc else ""
             rows.append((cl, utc_start_s or "", gulp, ev_iso, tier, ",".join(tags), name))
             if reason is not None and event_utc is not None:
@@ -280,6 +374,12 @@ class T2Daemon:
         ids = db.insert_clusters(self.conn, rows) if rows else []
         id_by_name = {row[6]: cid for row, cid in zip(rows, ids)}
         self.n_clusters += len(rows)
+        for name in fast_names:
+            if name in id_by_name:
+                with self.conn:
+                    self.conn.execute(
+                        "UPDATE triggers SET cluster_id = ? WHERE candname = ?"
+                        " AND cluster_id IS NULL", (id_by_name[name], name))
 
         gulp_utc = (timing.samp_to_utc(min(c.samp_lo for c in clusters), utc_start)
                     .isoformat(timespec="milliseconds") if clusters and utc_start else "")
@@ -374,6 +474,11 @@ class T2Daemon:
         # Hold the card back so context candidates from lagging jobs arrive.
         await asyncio.sleep(self.ctx_delay_s)
         c = cl.peak
+        # fast-path cards start as single trials; by now the cluster row
+        # usually exists, so take the envelope numbers from it.
+        row = self.conn.execute("SELECT n_members, n_beams FROM clusters"
+                                " WHERE name = ?", (name,)).fetchone()
+        n_members, n_beams = row if row else (cl.n_members, cl.n_beams)
         card = {
             "candname": name,
             "source": reason.split(":", 1)[1] if reason.startswith("known_source") else "blind",
@@ -385,8 +490,8 @@ class T2Daemon:
             "dm": c.dm,
             "width": c.width,
             "samp": c.samp,
-            "n_members": cl.n_members,
-            "n_beams": cl.n_beams,
+            "n_members": n_members,
+            "n_beams": n_beams,
             "trigger_reason": reason,
             "dump_utc_start": start_s,
             "dump_utc_stop": stop_s,
@@ -442,10 +547,10 @@ def main() -> None:
                    default="/home/casm/software/dev/casm_t2/config/t2d.yaml")
     p.add_argument("--shadow", action="store_true",
                    help="full chain but no dumps, no trigger cards")
+    p.add_argument("--log-file", default="/mnt/nvme5/casm_pipeline/logs/t2d.out")
     args = p.parse_args()
 
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    logsetup.setup(args.log_file)
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
     shadow = args.shadow or cfg.get("shadow", False)

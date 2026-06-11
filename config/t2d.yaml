@@ -3,7 +3,7 @@
 
 listen_host: 0.0.0.0
 ports: [12345, 12346, 12347, 12348, 12349, 12350, 12351, 12352]
-coalesce_s: 2.0
+coalesce_s: 0.75
 db: /mnt/nvme5/casm_pipeline/db/t2.sqlite
 
 # Set true (or run with --shadow) for a full dry-run: clusters, names, DB

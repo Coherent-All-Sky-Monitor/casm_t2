@@ -50,11 +50,15 @@ class KnownSource:
         logger.info("source %s: %d transit windows, DM %.1f-%.1f",
                     name, sum(len(v) for v in self._by_beam.values()), dm_min, dm_max)
 
+    def active(self, beam: int, t: datetime) -> bool:
+        """Is this beam inside a (padded) transit window at time t?"""
+        return any(w.start - self._pad <= t <= w.end + self._pad
+                   for w in self._by_beam.get(beam, ()))
+
     def matches(self, cl: Cluster, event_utc: datetime) -> bool:
         if cl.dm_hi < self.dm_min or cl.dm_lo > self.dm_max:
             return False
-        return any(w.start - self._pad <= event_utc <= w.end + self._pad
-                   for w in self._by_beam.get(cl.peak.beam, ()))
+        return self.active(cl.peak.beam, event_utc)
 
 
 def load_sources(cfg_blocks: list[dict]) -> list[KnownSource]:
