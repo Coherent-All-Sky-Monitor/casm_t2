@@ -46,4 +46,4 @@ daily recovery report), and `t2-transit-schedule`.
 See `docs/architecture.md` for the data path and database schema, and
 `docs/operations.md` for deployment, config reference, and runbooks.
 
-MIT license.
+GPL-3.0 license.
