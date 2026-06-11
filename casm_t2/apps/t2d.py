@@ -44,6 +44,7 @@ class T2Daemon:
         # (utc_start, gulp) -> accumulating candidate list; flushed
         # coalesce_s after the first job's batch for that gulp arrives.
         self.pending: dict[tuple, list[wire.Candidate]] = defaultdict(list)
+        self.pending_jobs: dict[tuple, int] = {}
         self.flushers: set[asyncio.Task] = set()
         self.n_batches = self.n_cands = self.n_clusters = self.n_would = 0
 
@@ -76,6 +77,7 @@ class T2Daemon:
         key = (batch.utc_start, batch.gulp)
         first = key not in self.pending
         self.pending[key].extend(batch.cands)
+        self.pending_jobs[key] = self.pending_jobs.get(key, 0) + 1
         if first:
             task = asyncio.create_task(self._flush_later(key))
             self.flushers.add(task)
@@ -84,15 +86,16 @@ class T2Daemon:
     async def _flush_later(self, key: tuple) -> None:
         await asyncio.sleep(self.args.coalesce_s)
         cands = self.pending.pop(key, [])
+        n_jobs = self.pending_jobs.pop(key, 0)
         if not cands:
             return
         t0 = time.monotonic()
         clusters = await asyncio.to_thread(cluster.cluster_candidates, cands, self.params)
+        dt = time.monotonic() - t0
         try:
-            self._record(key, clusters)
+            self._record(key, clusters, n_jobs, len(cands), dt * 1e3)
         except Exception:
             logger.exception("recording gulp %s failed", key)
-        dt = time.monotonic() - t0
         if dt > 2.0:
             logger.warning("slow gulp %s: %d cands -> %d clusters in %.1f s",
                            key, len(cands), len(clusters), dt)
@@ -114,9 +117,11 @@ class T2Daemon:
             self.n_would += 1
         return tier, tags
 
-    def _record(self, key: tuple, clusters: list[cluster.Cluster]) -> None:
+    def _record(self, key: tuple, clusters: list[cluster.Cluster], n_jobs: int,
+                n_cands: int, clustering_ms: float) -> None:
         utc_start_s, gulp = key
         utc_start = timing.parse_dada_utc(utc_start_s) if utc_start_s else None
+        n_would_before = self.n_would
         rows = []
         for cl in clusters:
             if cl.peak.snr < self.args.store_min_snr:
@@ -133,6 +138,12 @@ class T2Daemon:
         if rows:
             db.insert_clusters(self.conn, rows)
             self.n_clusters += len(rows)
+        # Per-gulp funnel accounting: T1 trials in, clusters, stored, would-trigger.
+        gulp_utc = (timing.samp_to_utc(min(c.samp_lo for c in clusters), utc_start)
+                    .isoformat(timespec="milliseconds") if clusters and utc_start else "")
+        db.insert_gulp_stats(self.conn, utc_start_s or "", gulp, gulp_utc, n_jobs,
+                             n_cands, len(clusters), len(rows),
+                             self.n_would - n_would_before, clustering_ms)
 
     async def _heartbeat(self) -> None:
         while True:

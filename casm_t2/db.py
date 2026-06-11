@@ -46,6 +46,21 @@ CREATE TABLE IF NOT EXISTS clusters (
 CREATE INDEX IF NOT EXISTS idx_clusters_event ON clusters(event_utc);
 CREATE INDEX IF NOT EXISTS idx_clusters_snr ON clusters(snr);
 
+CREATE TABLE IF NOT EXISTS gulp_stats (
+    id            INTEGER PRIMARY KEY,
+    obs_utc_start TEXT NOT NULL,
+    gulp          INTEGER,
+    gulp_utc      TEXT NOT NULL,     -- arrival UTC of the gulp's earliest trial
+    n_jobs        INTEGER NOT NULL,  -- hella jobs heard from (8 = all)
+    n_cands       INTEGER NOT NULL,  -- raw T1 trials in
+    n_clusters    INTEGER NOT NULL,  -- DBSCAN clusters (incl. noise singletons)
+    n_stored      INTEGER NOT NULL,  -- tiered events persisted
+    n_would       INTEGER NOT NULL,  -- would-trigger decisions
+    clustering_ms REAL NOT NULL,
+    created_utc   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_gulp_stats_utc ON gulp_stats(gulp_utc);
+
 CREATE TABLE IF NOT EXISTS triggers (
     id            INTEGER PRIMARY KEY,
     cluster_id    INTEGER REFERENCES clusters(id),
@@ -98,3 +113,17 @@ def insert_trigger(conn: sqlite3.Connection, cluster_id: int | None, candname: s
             "INSERT INTO triggers (cluster_id, candname, stream, action, detail,"
             " created_utc) VALUES (?,?,?,?,?,?)",
             (cluster_id, candname, stream, action, detail, now))
+
+
+def insert_gulp_stats(conn: sqlite3.Connection, obs_utc_start: str, gulp: int | None,
+                      gulp_utc: str, n_jobs: int, n_cands: int, n_clusters: int,
+                      n_stored: int, n_would: int, clustering_ms: float) -> None:
+    """One accounting row per coalesced gulp: the T1->T2 survival funnel."""
+    now = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    with conn:
+        conn.execute(
+            "INSERT INTO gulp_stats (obs_utc_start, gulp, gulp_utc, n_jobs, n_cands,"
+            " n_clusters, n_stored, n_would, clustering_ms, created_utc)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (obs_utc_start, gulp, gulp_utc, n_jobs, n_cands, n_clusters,
+             n_stored, n_would, round(clustering_ms, 1), now))

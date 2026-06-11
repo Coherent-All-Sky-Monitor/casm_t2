@@ -1,0 +1,13 @@
+[Unit]
+Description=CASM T2 known-source watcher (live trigger path)
+After=network-online.target
+
+[Service]
+ExecStart=/home/casm/software/dev/casm_venvs/casm_offline_env/bin/t2-source-watch /home/casm/software/dev/casm_t2/config/b0329.yaml
+Restart=always
+RestartSec=5
+StandardOutput=append:/mnt/nvme5/casm_pipeline/logs/t2_source_watch.out
+StandardError=inherit
+
+[Install]
+WantedBy=default.target

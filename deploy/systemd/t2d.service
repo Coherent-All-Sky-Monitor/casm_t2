@@ -1,0 +1,13 @@
+[Unit]
+Description=CASM T2 clustering daemon
+After=network-online.target
+
+[Service]
+ExecStart=/home/casm/software/dev/casm_venvs/casm_offline_env/bin/t2d
+Restart=always
+RestartSec=5
+StandardOutput=append:/mnt/nvme5/casm_pipeline/logs/t2d.out
+StandardError=inherit
+
+[Install]
+WantedBy=default.target
