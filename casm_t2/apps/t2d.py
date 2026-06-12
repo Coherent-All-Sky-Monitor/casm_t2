@@ -189,14 +189,14 @@ class T2Daemon:
         batch = wire.parse_batch(payload.decode(errors="replace"))
         self.n_batches += 1
         self.n_cands += len(batch.cands)
-        if not batch.cands:
-            return
-        if batch.utc_start is not None:
+        # empty batches still register in the coalescer so all-quiet gulps
+        # get a gulp_stats row (duty cycle = observed time, not busy time)
+        if batch.cands and batch.utc_start is not None:
             epoch = timing.parse_dada_utc(batch.utc_start).timestamp()
             tsamp = batch.tsamp_s or timing.TSAMP_S
             for c in batch.cands:
                 self.context.append((epoch + c.samp * tsamp, c.beam, c.dm, c.snr, c.width))
-        if self.fast_path:
+        if self.fast_path and batch.cands:
             self._spawn(self._fast_path(batch))
         key = (batch.utc_start, batch.gulp)
         first = key not in self.pending
@@ -215,6 +215,15 @@ class T2Daemon:
         cands = self.pending.pop(key, [])
         n_jobs = self.pending_jobs.pop(key, 0)
         if not cands:
+            # quiet gulp: no candidates from any job, but it was observed
+            utc_start_s, gulp = key
+            gulp_utc = ""
+            if utc_start_s:
+                utc_start = timing.parse_dada_utc(utc_start_s)
+                gulp_utc = timing.samp_to_utc(gulp * 8192, utc_start).isoformat(
+                    timespec="milliseconds")
+            db.insert_gulp_stats(self.conn, utc_start_s or "", gulp, gulp_utc,
+                                 n_jobs, 0, 0, 0, 0, 0.0)
             return
         t0 = time.monotonic()
         clusters = await asyncio.to_thread(cluster.cluster_candidates, cands, self.params)
