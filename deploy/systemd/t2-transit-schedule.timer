@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily B0329 schedule regeneration just after 00:00 UTC
+
+[Timer]
+OnCalendar=*-*-* 00:02:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
