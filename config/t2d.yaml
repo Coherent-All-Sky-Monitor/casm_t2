@@ -20,11 +20,15 @@ cluster:
 
 tiers:                  # peak-SNR thresholds
   A: 30.0
-  B: 15.0
+  B: 13.0               # TEMP 2026-06-12: was 15.0; lowered so the web page
+                        # gets events during/after the Jun-11 RFI storm.
+                        # Restore to 15.0 once the SNAP-I input is fixed.
   C: 12.0               # also the DB storage floor
 
 filters:
-  beam_veto: [2]        # RFI hotspot
+  beam_veto: [2, 64]    # 2: RFI hotspot; 64: first-beam-of-stream-1
+                        # instrumental artifact (snr~13.4, dm~44, single-beam,
+                        # fires every ~2 min — would eat the dump budget)
   max_nbeam: 32         # wider clusters are tagged rfi_wide, never trigger
   dm_floor: 20.0        # blind (tier) triggers require peak DM >= this
 
