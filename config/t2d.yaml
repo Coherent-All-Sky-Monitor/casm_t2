@@ -26,9 +26,9 @@ tiers:                  # peak-SNR thresholds
   C: 12.0               # also the DB storage floor
 
 filters:
-  beam_veto: [2, 64]    # 2: RFI hotspot; 64: first-beam-of-stream-1
-                        # instrumental artifact (snr~13.4, dm~44, single-beam,
-                        # fires every ~2 min — would eat the dump budget)
+  beam_veto: [2]        # RFI hotspot. (beam-64 veto removed 2026-06-12
+                        # after the railed N21-E3 input was zeroed from the
+                        # weights — the first-beam artifact died with it)
   max_nbeam: 32         # wider clusters are tagged rfi_wide, never trigger
   dm_floor: 20.0        # blind (tier) triggers require peak DM >= this
 
