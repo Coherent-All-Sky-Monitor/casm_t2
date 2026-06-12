@@ -383,6 +383,17 @@ class T2Daemon:
         ids = db.insert_clusters(self.conn, rows) if rows else []
         id_by_name = {row[6]: cid for row, cid in zip(rows, ids)}
         self.n_clusters += len(rows)
+        # ledger-matched injections get an automatic 'injection' label;
+        # a later human click overrides it (UI shows newest label per event)
+        inj_named = [r[6] for r in rows if "injection" in r[5].split(",") and r[6]]
+        if inj_named:
+            now_iso = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+            with self.conn:
+                self.conn.executemany(
+                    "INSERT INTO labels (name, label, who, notes, created_utc)"
+                    " VALUES (?,?,?,?,?)",
+                    [(n, "injection", "auto", "ledger match", now_iso)
+                     for n in inj_named])
         for name in fast_names:
             if name in id_by_name:
                 with self.conn:
