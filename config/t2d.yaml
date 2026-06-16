@@ -20,9 +20,13 @@ cluster:
 
 tiers:                  # peak-SNR thresholds
   A: 30.0
-  B: 13.0               # TEMP 2026-06-12: was 15.0; lowered so the web page
-                        # gets events during/after the Jun-11 RFI storm.
-                        # Restore to 15.0 once the SNAP-I input is fixed.
+  B: 18.0               # 2026-06-15: raised 13->18 for the 11-antenna array.
+                        # The reduced aperture floods tier B with marginal
+                        # S/N 13-15 noise (uniform across beams + DM, diurnal);
+                        # at this rate B>=15 still ~470 eligible/day (> the 300
+                        # cap), B>=18 ~120/day. (was TEMP-13 since 06-12, itself
+                        # down from 15.) Lower back toward 13-15 as antennas
+                        # are recovered.
   C: 12.0               # also the DB storage floor (T1 itself reports down to S/N 10)
 
 filters:
