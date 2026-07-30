@@ -201,3 +201,75 @@ def test_force_turns_every_refusal_into_a_warning():
                                                         force=True)
     assert forced_refusals == []
     assert set(refusals) <= set(forced_warnings)
+
+
+# ---------------------------------------------------------------------------
+# --gather arithmetic
+# ---------------------------------------------------------------------------
+
+from casm_t2.dump_client import (  # noqa: E402
+    expected_stream_bytes,
+    reader_prefix,
+    stream_dump_state,
+)
+
+
+def _name(utc="2026-07-30-22:25:22", offset=0, num=0):
+    return f"{utc}_{offset:016d}.{num:06d}.dada"
+
+
+def test_expected_bytes_track_the_stream_rate():
+    assert expected_stream_bytes(2.0) == int(2.0 * VOLTAGE_BYTES_PER_SECOND * 0.999)
+
+
+def test_dump_state_waiting_before_any_new_file():
+    before = {_name(offset=1)}
+    assert stream_dump_state(before, {_name(offset=1): 10**9}, 10**6) == ("waiting", [])
+
+
+def test_dump_state_growing_until_the_payload_lands():
+    new = _name(offset=2)
+    state, files = stream_dump_state(set(), {new: 4096 + 500}, 1000)
+    assert (state, files) == ("growing", [new])
+
+
+def test_dump_state_done_ignores_preexisting_files():
+    old, new = _name(offset=1), _name(offset=2)
+    sizes = {old: 123, new: 4096 + 1000}
+    assert stream_dump_state({old}, sizes, 1000) == ("done", [new])
+
+
+def test_dump_state_sums_a_split_dump():
+    a, b = _name(offset=0, num=0), _name(offset=500, num=1)
+    sizes = {a: 4096 + 600, b: 4096 + 400}
+    assert stream_dump_state(set(), sizes, 1000) == ("done", [a, b])
+
+
+def test_reader_prefix_pins_a_single_file_dump():
+    new = {0: [_name(offset=7)], 3: [_name(offset=7)]}
+    prefix, notes = reader_prefix(new)
+    assert prefix == f"2026-07-30-22:25:22_{7:016d}"
+    assert notes == []
+
+
+def test_reader_prefix_falls_back_for_split_dumps():
+    new = {0: [_name(offset=0, num=0), _name(offset=500, num=1)],
+           1: [_name(offset=0, num=0)]}
+    prefix, notes = reader_prefix(new)
+    assert prefix == "2026-07-30-22:25:22"
+    assert any("several files" in n for n in notes)
+
+
+def test_reader_prefix_refuses_mixed_utc_starts():
+    new = {0: [_name(utc="2026-07-30-22:25:22")],
+           1: [_name(utc="2026-07-30-23:00:00")]}
+    prefix, notes = reader_prefix(new)
+    assert prefix is None
+    assert any("different dumps" in n for n in notes)
+
+
+def test_reader_prefix_notes_offset_mismatch():
+    new = {0: [_name(offset=1)], 1: [_name(offset=2)]}
+    prefix, notes = reader_prefix(new)
+    assert prefix == "2026-07-30-22:25:22"
+    assert any("OBS_OFFSET" in n for n in notes)

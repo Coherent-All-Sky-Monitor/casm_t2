@@ -21,9 +21,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
+import re
 import shutil
 import socket
 import subprocess
+import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
@@ -299,6 +302,197 @@ def free_bytes(host: str) -> int | None:
         return None
 
 
+# ---------------------------------------------------------------------------
+# --gather: after the daemons ack, wait for the files to finish and pull the
+# remote node's streams over, so one node holds the whole dump.
+# ---------------------------------------------------------------------------
+
+_DUMP_NAME_RE = re.compile(r"^(?P<utc>.+)_(?P<offset>\d{16})\.(?P<num>\d{6})\.dada$")
+
+GATHER_POLL_S = 5.0
+
+# A dump is finished once its new files hold the commanded window's bytes;
+# allow a whisker under for the window landing on sample boundaries.
+GATHER_SIZE_TOLERANCE = 0.999
+
+
+def local_hostname() -> str:
+    """Short hostname, as the endpoint tables spell it."""
+    return socket.gethostname().split(".")[0]
+
+
+def expected_stream_bytes(duration_s: float) -> int:
+    """Payload bytes one stream writes for a window of this length."""
+    return int(duration_s * VOLTAGE_BYTES_PER_SECOND * GATHER_SIZE_TOLERANCE)
+
+
+def stream_dir(stream: int) -> str:
+    return f"{VOLTAGE_DUMP_DIR}/stream_{stream}"
+
+
+def stream_file_sizes(host: str, stream: int) -> dict[str, int] | None:
+    """{filename: bytes} for a stream's dump directory, or None if unreadable.
+
+    The local node is read directly; the other one over ssh. A missing
+    directory reads as empty — the writer creates it with the first dump.
+    """
+    path = stream_dir(stream)
+    if host == local_hostname():
+        try:
+            return {e.name: e.stat().st_size for e in os.scandir(path)
+                    if e.name.endswith(".dada")}
+        except FileNotFoundError:
+            return {}
+        except OSError:
+            return None
+    try:
+        out = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", host,
+             f"find {path} -maxdepth 1 -name '*.dada' -printf '%f %s\\n' "
+             f"2>/dev/null; true"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=DEFAULT_TIMEOUT_S, check=True)
+        sizes = {}
+        for line in out.stdout.splitlines():
+            name, _, size = line.rpartition(" ")
+            if name:
+                sizes[name] = int(size)
+        return sizes
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def stream_dump_state(before: set[str], sizes: dict[str, int],
+                      expected_bytes: int) -> tuple[str, list[str]]:
+    """("waiting" | "growing" | "done", new files) for one stream.
+
+    New files are the ones absent from the pre-trigger listing; the dump is
+    done when they hold the commanded window's payload (each file carries a
+    4096-byte header on top).
+    """
+    new = sorted(n for n in sizes if n not in before)
+    if not new:
+        return "waiting", []
+    payload = sum(sizes[n] for n in new) - 4096 * len(new)
+    return ("done" if payload >= expected_bytes else "growing"), new
+
+
+def reader_prefix(new_by_stream: dict[int, list[str]]) -> tuple[str | None, list[str]]:
+    """VoltageReader timestamp prefix for a gathered dump, with any caveats.
+
+    The full UTC_START_OBSOFFSET prefix pins this dump even when another one
+    shares its UTC_START, but it only matches a dump's first file — so a
+    dump split over several files falls back to the bare UTC_START, with a
+    note. Streams that disagree on UTC_START return no prefix at all.
+    """
+    parsed = {}
+    for stream, names in new_by_stream.items():
+        matches = [_DUMP_NAME_RE.match(n) for n in names]
+        if not matches or None in matches:
+            return None, [f"stream {stream} has oddly named files: {names}"]
+        parsed[stream] = sorted((m["utc"], m["offset"]) for m in matches)
+
+    utcs = {p[0][0] for p in parsed.values()}
+    if len(utcs) != 1:
+        return None, [f"streams disagree on UTC_START: {sorted(utcs)} — "
+                      "they are different dumps; gather them by hand"]
+    utc = utcs.pop()
+
+    first_offsets = {p[0][1] for p in parsed.values()}
+    multi_file = any(len(p) > 1 for p in parsed.values())
+    if multi_file:
+        return utc, ["the dump spans several files per stream, so only the bare "
+                     "UTC_START prefix matches them all — if another dump shares "
+                     "it, the reader will refuse to stitch (see allow_gaps)"]
+    if len(first_offsets) == 1:
+        return f"{utc}_{first_offsets.pop()}", []
+    return utc, ["streams start at different OBS_OFFSETs — expect the reader "
+                 "to refuse them as different dumps"]
+
+
+def gather_dump(streams: list[int], dest: str, before: dict[int, set[str]],
+                stop: datetime, duration_s: float) -> int:
+    """Wait for the dump files, pull the remote streams into dest.
+
+    Returns the number of streams that never finished. Blocks from just
+    after the trigger until the window has passed and every stream's new
+    files hold the expected bytes (or a timeout of the dump length plus a
+    minute past the window's end).
+    """
+    local = local_hostname()
+    expected = expected_stream_bytes(duration_s)
+    deadline = stop.timestamp() + duration_s + 60.0
+
+    remaining = (stop - datetime.now(timezone.utc)).total_seconds()
+    if remaining > 0:
+        print(f"gather   window ends in {remaining:.0f} s; waiting")
+        time.sleep(remaining)
+
+    states: dict[int, tuple[str, list[str]]] = {s: ("waiting", []) for s in streams}
+    while True:
+        for stream in streams:
+            if states[stream][0] == "done":
+                continue
+            host, _ = voltage_endpoint(stream)
+            sizes = stream_file_sizes(host, stream)
+            if sizes is None:
+                print(f"gather   stream {stream}: cannot list {host}:{stream_dir(stream)}")
+                continue
+            states[stream] = stream_dump_state(before[stream], sizes, expected)
+        pending = [s for s in streams if states[s][0] != "done"]
+        if not pending:
+            break
+        if time.time() > deadline:
+            for stream in pending:
+                state, new = states[stream]
+                print(f"gather   stream {stream} never finished ({state}"
+                      f"{': ' + ', '.join(new) if new else ''}) — the writer may "
+                      f"have dropped it (disk guard); check the node's log")
+            break
+        print(f"gather   waiting on stream(s) {', '.join(str(s) for s in pending)}")
+        time.sleep(GATHER_POLL_S)
+
+    done = {s: names for s, (state, names) in states.items() if state == "done"}
+    failures = len(streams) - len(done)
+
+    for stream, names in sorted(done.items()):
+        host, _ = voltage_endpoint(stream)
+        if host == local and dest == VOLTAGE_DUMP_DIR:
+            continue  # already where it belongs
+        dest_dir = f"{dest}/stream_{stream}"
+        os.makedirs(dest_dir, exist_ok=True)
+        if host == local:
+            # Already on this node's disk: a symlink beats a second copy
+            print(f"gather   stream {stream}: {len(names)} symlink(s) to local files")
+            for n in names:
+                link = os.path.join(dest_dir, n)
+                try:
+                    if not os.path.lexists(link):
+                        os.symlink(os.path.join(stream_dir(stream), n), link)
+                except OSError as exc:
+                    print(f"gather   stream {stream}: symlink failed: {exc}")
+                    failures += 1
+                    break
+            continue
+        print(f"gather   stream {stream}: {len(names)} file(s) from {host}")
+        sources = [f"{host}:{stream_dir(stream)}/{n}" for n in names]
+        try:
+            subprocess.run(["rsync", "-a", *sources, dest_dir + "/"],
+                           stdin=subprocess.DEVNULL, check=True)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"gather   stream {stream}: rsync failed: {exc}")
+            failures += 1
+
+    if done:
+        prefix, notes = reader_prefix(done)
+        for note in notes:
+            print(f"gather   NOTE: {note}")
+        if prefix:
+            print(f"\ngathered under {dest}/stream_N/ — read it with:")
+            print(f"  VoltageReader({dest!r}, {prefix!r})")
+    return failures
+
+
 def voltage_main() -> None:
     """Manual voltage dump trigger for the antenna-stream casm_cand_dump daemons.
 
@@ -307,6 +501,8 @@ def voltage_main() -> None:
         casm-voltage-dump --last 5                  # the 5 s ending 2 s ago
         casm-voltage-dump --streams 3,4 --next 1    # one node only
         casm-voltage-dump --start 2026-07-31-18:00:00 --stop 2026-07-31-18:00:02
+        casm-voltage-dump --last 2 --gather         # wait for the files and pull
+                                                    # the other node's streams here
 
     These daemons are part of the Fourier Space stack and know nothing about
     T2, so this works whether or not t2d is running. Unlike
@@ -329,6 +525,12 @@ def voltage_main() -> None:
     p.add_argument("--force", action="store_true",
                    help="downgrade the janitor-quota and disk-floor refusals to warnings")
     p.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
+    p.add_argument("--gather", nargs="?", const=VOLTAGE_DUMP_DIR, default=None,
+                   metavar="DEST_DIR",
+                   help="after the daemons ack, wait for the files, rsync the "
+                        "other node's streams into DEST_DIR/stream_N/ (local "
+                        "streams are symlinked, not copied; default "
+                        f"{VOLTAGE_DUMP_DIR}), then print the reader prefix")
     args = p.parse_args()
 
     logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
@@ -388,6 +590,18 @@ def voltage_main() -> None:
     if stale:
         print(f"WARNING: {stale} — expect the daemons to refuse")
 
+    # Snapshot each stream directory before triggering, so the gather step
+    # can tell this dump's files from everything already there.
+    before: dict[int, set[str]] = {}
+    if args.gather is not None:
+        for stream in streams:
+            host, _ = voltage_endpoint(stream)
+            sizes = stream_file_sizes(host, stream)
+            if sizes is None:
+                print(f"WARNING: cannot list {host}:{stream_dir(stream)} — "
+                      f"gather will treat every file there as new")
+            before[stream] = set(sizes or ())
+
     failed = 0
     for stream in streams:
         host, port = voltage_endpoint(stream)
@@ -412,6 +626,9 @@ def voltage_main() -> None:
     print("the disk guard the writer drops the dump and says nothing back to us —")
     print("it logs the refusal on its own node — and slow dumps can still fail")
     print("late, so go and look at the directories above.")
+
+    if args.gather is not None:
+        failed += gather_dump(streams, args.gather, before, stop, duration_s)
 
     if failed:
         raise SystemExit(f"{failed} of {len(streams)} endpoints did not reply OK")
