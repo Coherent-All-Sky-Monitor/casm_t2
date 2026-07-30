@@ -135,8 +135,10 @@ def main() -> None:
     """
     p = argparse.ArgumentParser(description="Trigger a beam intensity dump")
     p.add_argument("--stream", type=int, required=True, help="global stream index 0-7")
-    p.add_argument("--start", help="DUMP_UTC_START (PSRDADA UTC)")
-    p.add_argument("--stop", help="DUMP_UTC_STOP (PSRDADA UTC)")
+    p.add_argument("--start",
+                   help="DUMP_UTC_START (PSRDADA UTC, e.g. 2026-07-30-22:25:22.958)")
+    p.add_argument("--stop",
+                   help="DUMP_UTC_STOP (PSRDADA UTC, e.g. 2026-07-30-22:25:24.958)")
     p.add_argument("--last", type=float, help="dump this many seconds, ending 2 s before now")
     p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
     args = p.parse_args()
@@ -313,8 +315,10 @@ def voltage_main() -> None:
     operator wants each reply attributed as it arrives.
     """
     p = argparse.ArgumentParser(description="Trigger a raw voltage dump")
-    p.add_argument("--start", help="DUMP_UTC_START (PSRDADA UTC)")
-    p.add_argument("--stop", help="DUMP_UTC_STOP (PSRDADA UTC)")
+    p.add_argument("--start",
+                   help="DUMP_UTC_START (PSRDADA UTC, e.g. 2026-07-30-22:25:22.958)")
+    p.add_argument("--stop",
+                   help="DUMP_UTC_STOP (PSRDADA UTC, e.g. 2026-07-30-22:25:24.958)")
     p.add_argument("--last", type=float, help="dump this many seconds, ending 2 s before now")
     p.add_argument("--next", type=float, dest="ahead", metavar="SECONDS",
                    help="dump this many seconds, starting 5 s from now (long dumps)")
