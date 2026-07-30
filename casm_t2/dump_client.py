@@ -411,13 +411,13 @@ def reader_prefix(new_by_stream: dict[int, list[str]]) -> tuple[str | None, list
 
 
 def gather_dump(streams: list[int], dest: str, before: dict[int, set[str]],
-                stop: datetime, duration_s: float) -> int:
+                stop: datetime, duration_s: float) -> tuple[int, str | None, list[str]]:
     """Wait for the dump files, pull the remote streams into dest.
 
-    Returns the number of streams that never finished. Blocks from just
-    after the trigger until the window has passed and every stream's new
-    files hold the expected bytes (or a timeout of the dump length plus a
-    minute past the window's end).
+    Returns (streams that never finished, reader prefix or None, gathered
+    file paths). Blocks from just after the trigger until the window has
+    passed and every stream's new files hold the expected bytes (or a
+    timeout of the dump length plus a minute past the window's end).
     """
     local = local_hostname()
     expected = expected_stream_bytes(duration_s)
@@ -455,13 +455,16 @@ def gather_dump(streams: list[int], dest: str, before: dict[int, set[str]],
     done = {s: names for s, (state, names) in states.items() if state == "done"}
     failures = len(streams) - len(done)
     linked = []
+    gathered: list[str] = []
 
     for stream, names in sorted(done.items()):
         host, _ = voltage_endpoint(stream)
         if host == local and dest == VOLTAGE_DUMP_DIR:
+            gathered += [os.path.join(stream_dir(stream), n) for n in names]
             continue  # already where it belongs
         dest_dir = f"{dest}/stream_{stream}"
         os.makedirs(dest_dir, exist_ok=True)
+        gathered += [os.path.join(dest_dir, n) for n in names]
         if host == local:
             # Already on this node's disk: a symlink beats a second copy
             print(f"gather   stream {stream}: {len(names)} symlink(s) to local files")
@@ -489,6 +492,7 @@ def gather_dump(streams: list[int], dest: str, before: dict[int, set[str]],
         print(f"gather   WARNING: stream(s) {', '.join(str(s) for s in linked)} are "
               f"symlinks into {VOLTAGE_DUMP_DIR} — deleting the originals breaks "
               f"them; copy them over if {dest} has to stand on its own")
+    prefix = None
     if done:
         prefix, notes = reader_prefix(done)
         for note in notes:
@@ -496,7 +500,73 @@ def gather_dump(streams: list[int], dest: str, before: dict[int, set[str]],
         if prefix:
             print(f"\ngathered under {dest}/stream_N/ — read it with:")
             print(f"  VoltageReader({dest!r}, {prefix!r})")
-    return failures
+    return failures, prefix, gathered
+
+
+def dump_voltages(seconds: float, gather_dir: str,
+                  streams: list[int] | str | None = None,
+                  timeout: float = DEFAULT_TIMEOUT_S,
+                  force: bool = False) -> tuple[str, str | None]:
+    """Dump the last `seconds` of voltages and gather them into gather_dir.
+
+    The notebook-friendly form of ``casm-voltage-dump --last S --gather D -y``:
+    triggers the dump, waits for the files on both nodes, pulls the remote
+    streams into gather_dir (local ones are symlinked), prints each gathered
+    file's absolute path, and returns (gather_dir, prefix) ready for
+    casm_io's VoltageReader:
+
+        data_dir, prefix = dump_voltages(2, "~/myrun")
+        reader = VoltageReader(data_dir, prefix)
+
+    streams selects a subset (list of indices or "1,2"); default all six.
+    Raises RuntimeError on preflight refusals (janitor quota, disk floor —
+    force=True downgrades them to warnings) and when no stream delivered.
+    """
+    if isinstance(streams, str):
+        streams = parse_streams(streams)
+    streams = sorted(streams) if streams else list(range(NVOLTAGE_STREAM))
+
+    now = datetime.now(timezone.utc)
+    start, stop = voltage_window(now, last=seconds)
+    stale = ring_age_refusal(now, start)
+    if stale:
+        raise RuntimeError(stale)
+
+    duration_s = (stop - start).total_seconds()
+    free_by_host = {host: free_bytes(host)
+                    for host in node_volumes(duration_s, streams)}
+    refusals, warnings = preflight_issues(duration_s, streams, free_by_host,
+                                          force=force)
+    for msg in warnings:
+        print(f"WARNING: {msg}")
+    if refusals:
+        raise RuntimeError("; ".join(refusals))
+
+    dest = os.path.abspath(os.path.expanduser(gather_dir))
+    before = {}
+    for stream in streams:
+        host, _ = voltage_endpoint(stream)
+        before[stream] = set(stream_file_sizes(host, stream) or ())
+
+    print(f"window   {format_dada_utc(start)} .. {format_dada_utc(stop)} "
+          f"({duration_s:.3f} s)")
+    for stream in streams:
+        host, port = voltage_endpoint(stream)
+        try:
+            reply = request_dump(host, port, start, stop, timeout=timeout)
+        except OSError as exc:
+            reply = f"ERROR {exc}"
+        print(f"stream {stream}  {host}:{port} -> {reply}")
+
+    not_done, prefix, gathered = gather_dump(streams, dest, before, stop,
+                                             duration_s)
+    if not gathered:
+        raise RuntimeError("no stream delivered any data — check the nodes' "
+                           "casm_cand_dump logs")
+    print("\ngathered files:")
+    for path in gathered:
+        print(f"  {path}")
+    return dest, prefix
 
 
 def voltage_main() -> None:
@@ -633,7 +703,8 @@ def voltage_main() -> None:
     print("late, so go and look at the directories above.")
 
     if args.gather is not None:
-        failed += gather_dump(streams, args.gather, before, stop, duration_s)
+        not_done, _, _ = gather_dump(streams, args.gather, before, stop, duration_s)
+        failed += not_done
 
     if failed:
         raise SystemExit(f"{failed} of {len(streams)} endpoints did not reply OK")
