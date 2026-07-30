@@ -64,8 +64,8 @@ the node that would receive the data. Every refusal is recorded with its
 reason.
 
 Survivors get a `YYMMDDxxxx` name, an intensity dump on the owning node,
-and a trigger card in the T3 spool. Voltage dumps are wired (tier A only)
-but ship disabled.
+and a trigger card in the T3 spool. Automatic voltage dumps are wired
+(tier A only) but ship disabled.
 
 `trigger.fast_path` picks between two trigger styles. Strict
 cluster-first (`false`) waits for DBSCAN and the full chain before any
@@ -74,6 +74,23 @@ are the data that sizes the ring buffer. The hybrid fast path (`true`)
 fires on bright single candidates immediately and reconciles with the
 cluster afterwards — for when the latency budget is tighter than the
 ring.
+
+## Voltage dumps
+
+A separate path with its own daemons. Raw voltages are tapped on the
+antenna side, before beamforming: six antenna streams, three per node,
+each with a casm_cand_dump daemon on port 27000 + stream (0-2 on corr1,
+3-5 on corr2). Every antenna sees the whole sky, so a voltage dump goes
+to all six endpoints. The streams split the band top-down in 15.625 MHz
+slices — stream 0 is 468.75-484.375 MHz, stream 5 is 390.625-406.25, and
+the 440-465 MHz live band sits in streams 1 and 2, both on corr1.
+
+t2d can command these on tier A but ships with `trigger.voltage`
+disabled. `casm-voltage-dump` drives them by hand instead and needs
+nothing from T2 — it runs with t2d stopped. At 2.0625 GB/s per stream the
+binding constraint is disk rather than the ring, so that CLI does the
+window and disk arithmetic itself before sending; see
+`docs/operations.md`.
 
 ## Database
 

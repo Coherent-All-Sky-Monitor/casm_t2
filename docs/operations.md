@@ -71,22 +71,31 @@ data is 2.0625 GB/s per stream and the casm_t3 janitor holds each
 `stream_N` tree to 150 GB, deleting oldest-first — about 72 s per stream of
 retention. Ask for more than that and the tail of your own dump starts
 eating the head of it. The CLI refuses such a request; `--force` overrides,
-and if you use it, move or label the files the moment they land.
+and if you use it, move or label the files the moment they land. One caveat
+in the other direction: the janitor's voltage patrol lists `cand_dumps/`
+itself, not the `stream_N/` subdirectories the files actually land in, so
+today it deletes nothing there. The 150 GB is the CLI's budget; clearing the
+trees is manual.
 
 Before sending it prints the window and the disk arithmetic, then asks for
 confirmation (`-y` skips it, `--dry-run` prints and sends nothing). 2 s
 across all six streams is 12.4 GB on each node. The disk guard is stricter
 than the raw size: casm_cand_dump_disk wants room for all three streams a
 node hosts whether or not you commanded them, so a 10 s dump of stream 3
-alone needs 62 GB free on corr2, not 21 GB. Under the guard it drops the
-dump — silently as far as this client is concerned; the daemon does log the
-refusal, so look at the casm_cand_dump_disk log on the owning node. The CLI
-also refuses outright if the dump would leave `/mnt/nvme4` under 200 GB
-free, the headroom the live recorders need (`--force` overrides that too).
+alone needs 61.9 GB free on corr2, not the 20.6 GB it writes. Under the
+guard it drops the dump — silently as far as this client is concerned; the
+daemon does log the refusal, so look at the casm_cand_dump_disk log on the
+owning node. The CLI also refuses outright if the dump would leave
+`/mnt/nvme4` under 200 GB free, the headroom the live recorders need
+(`--force` overrides that too).
 
 So "OK" means the daemon took the command, not that the data reached the
 disk. Check `/mnt/nvme4/data/casm/cand_dumps/stream_N/` on the owning node
-afterwards.
+afterwards. The same goes the other way: a connection error or timeout does
+not mean the dump didn't run, so look before retrying, or you get a second
+overlapping dump under the same `UTC_START`. Read the files back with
+casm_io's `VoltageReader` — `casm_io/examples/voltage_dumps.py` walks one
+end to end.
 
 ## When misses pile up
 

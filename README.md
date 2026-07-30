@@ -43,6 +43,12 @@ Also ships `t2-dump` (manual smoke dump), `t2-replay` (offline replay of
 a UTC slice), `t2-inject` / `t2-inject-report` (live injections and the
 daily recovery report), and `t2-transit-schedule`.
 
+`casm-voltage-dump` commands the antenna-side voltage daemons by hand. It
+talks to them directly, so it works with t2d stopped, and it is the only
+way to get raw voltages while automatic voltage triggering ships disabled:
+
+    casm-voltage-dump --next 2     # 2 s of all six streams, from 5 s hence
+
 See `docs/architecture.md` for the data path and database schema, and
 `docs/operations.md` for deployment, config reference, and runbooks.
 
