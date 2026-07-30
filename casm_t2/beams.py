@@ -29,11 +29,21 @@ STREAM_HOSTS = {
 # trigger fans out to ALL of these endpoints.
 VOLTAGE_CONTROL_BASE_PORT = 27000
 VOLTAGE_DUMP_DIR = "/mnt/nvme4/data/casm/cand_dumps"
+VOLTAGE_MOUNT = "/mnt/nvme4"
 
 VOLTAGE_ENDPOINTS = [
     ("casm-corr1", 27000), ("casm-corr1", 27001), ("casm-corr1", 27002),
     ("casm-corr2", 27003), ("casm-corr2", 27004), ("casm-corr2", 27005),
 ]
+
+NVOLTAGE_STREAM = len(VOLTAGE_ENDPOINTS)
+
+
+def voltage_endpoint(stream: int) -> tuple[str, int]:
+    """(host, control port) of an antenna-stream voltage dump daemon."""
+    if not 0 <= stream < NVOLTAGE_STREAM:
+        raise ValueError(f"voltage stream {stream} out of range 0-{NVOLTAGE_STREAM - 1}")
+    return VOLTAGE_ENDPOINTS[stream]
 
 
 @dataclass(frozen=True, slots=True)

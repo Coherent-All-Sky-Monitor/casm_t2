@@ -47,6 +47,47 @@ minute later is tagged `injection`, and no dump fires:
 
     t2-inject config/t2d.yaml --once
 
+## Voltage dumps (manual)
+
+`casm-voltage-dump` commands the antenna-side casm_cand_dump daemons
+(ports 27000-27005, streams 0-2 on corr1 and 3-5 on corr2). They belong to
+the Fourier Space stack and know nothing about T2, so this works with t2d
+stopped — and it is the only way to get voltages while `trigger.voltage`
+stays `enabled: false`.
+
+    casm-voltage-dump --next 2                  # 2 s starting 5 s from now
+    casm-voltage-dump --last 5                  # the 5 s ending 2 s ago
+    casm-voltage-dump --streams 3,4 --next 10   # corr2 only
+    casm-voltage-dump --start 2026-07-31-18:00:00 --stop 2026-07-31-18:00:02
+
+Use `--next` for anything long: the window is in the future, so ring depth
+stops mattering. `--last` and explicit windows are limited by the daemons'
+`-d 28`; the CLI refuses a `--last` that starts more than 26 s back rather
+than let you watch it fail, and re-checks that after the confirmation
+prompt in case you took your time answering.
+
+How long a dump can actually be is set by disk, not by the ring. Voltage
+data is 2.0625 GB/s per stream and the casm_t3 janitor holds each
+`stream_N` tree to 150 GB, deleting oldest-first — about 72 s per stream of
+retention. Ask for more than that and the tail of your own dump starts
+eating the head of it. The CLI refuses such a request; `--force` overrides,
+and if you use it, move or label the files the moment they land.
+
+Before sending it prints the window and the disk arithmetic, then asks for
+confirmation (`-y` skips it, `--dry-run` prints and sends nothing). 2 s
+across all six streams is 12.4 GB on each node. The disk guard is stricter
+than the raw size: casm_cand_dump_disk wants room for all three streams a
+node hosts whether or not you commanded them, so a 10 s dump of stream 3
+alone needs 62 GB free on corr2, not 21 GB. Under the guard it drops the
+dump — silently as far as this client is concerned; the daemon does log the
+refusal, so look at the casm_cand_dump_disk log on the owning node. The CLI
+also refuses outright if the dump would leave `/mnt/nvme4` under 200 GB
+free, the headroom the live recorders need (`--force` overrides that too).
+
+So "OK" means the daemon took the command, not that the data reached the
+disk. Check `/mnt/nvme4/data/casm/cand_dumps/stream_N/` on the owning node
+afterwards.
+
 ## When misses pile up
 
 `refused_daemon` rows (red on the web UI) mean T2's dump command arrived

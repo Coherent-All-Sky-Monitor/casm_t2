@@ -21,6 +21,11 @@ t2-replay = "casm_t2.apps.replay:main"
 t2-source-watch = "casm_t2.apps.source_watch:main"
 t2-transit-schedule = "casm_t2.apps.transit_schedule:main"
 t2-dump = "casm_t2.dump_client:main"
+casm-voltage-dump = "casm_t2.dump_client:voltage_main"
 
 [tool.setuptools.packages.find]
 include = ["casm_t2*"]
+
+[tool.pytest.ini_options]
+# reference/dsa110-T2 ships its own tests for a package we do not install.
+testpaths = ["tests"]
