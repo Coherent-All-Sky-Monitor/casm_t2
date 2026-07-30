@@ -454,6 +454,7 @@ def gather_dump(streams: list[int], dest: str, before: dict[int, set[str]],
 
     done = {s: names for s, (state, names) in states.items() if state == "done"}
     failures = len(streams) - len(done)
+    linked = []
 
     for stream, names in sorted(done.items()):
         host, _ = voltage_endpoint(stream)
@@ -464,6 +465,7 @@ def gather_dump(streams: list[int], dest: str, before: dict[int, set[str]],
         if host == local:
             # Already on this node's disk: a symlink beats a second copy
             print(f"gather   stream {stream}: {len(names)} symlink(s) to local files")
+            linked.append(stream)
             for n in names:
                 link = os.path.join(dest_dir, n)
                 try:
@@ -483,6 +485,10 @@ def gather_dump(streams: list[int], dest: str, before: dict[int, set[str]],
             print(f"gather   stream {stream}: rsync failed: {exc}")
             failures += 1
 
+    if linked:
+        print(f"gather   WARNING: stream(s) {', '.join(str(s) for s in linked)} are "
+              f"symlinks into {VOLTAGE_DUMP_DIR} — deleting the originals breaks "
+              f"them; copy them over if {dest} has to stand on its own")
     if done:
         prefix, notes = reader_prefix(done)
         for note in notes:
@@ -501,8 +507,8 @@ def voltage_main() -> None:
         casm-voltage-dump --last 5                  # the 5 s ending 2 s ago
         casm-voltage-dump --streams 3,4 --next 1    # one node only
         casm-voltage-dump --start 2026-07-31-18:00:00 --stop 2026-07-31-18:00:02
-        casm-voltage-dump --last 2 --gather         # wait for the files and pull
-                                                    # the other node's streams here
+        casm-voltage-dump --last 2 --gather ~/myrun # wait for the files and pull
+                                                    # all six streams into ~/myrun
 
     These daemons are part of the Fourier Space stack and know nothing about
     T2, so this works whether or not t2d is running. Unlike
@@ -525,12 +531,11 @@ def voltage_main() -> None:
     p.add_argument("--force", action="store_true",
                    help="downgrade the janitor-quota and disk-floor refusals to warnings")
     p.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
-    p.add_argument("--gather", nargs="?", const=VOLTAGE_DUMP_DIR, default=None,
-                   metavar="DEST_DIR",
+    p.add_argument("--gather", metavar="DEST_DIR", default=None,
                    help="after the daemons ack, wait for the files, rsync the "
-                        "other node's streams into DEST_DIR/stream_N/ (local "
-                        "streams are symlinked, not copied; default "
-                        f"{VOLTAGE_DUMP_DIR}), then print the reader prefix")
+                        "other node's streams into DEST_DIR/stream_N/ and "
+                        "symlink this node's, then print the reader prefix. "
+                        "Optional — scp by hand works too")
     args = p.parse_args()
 
     logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
