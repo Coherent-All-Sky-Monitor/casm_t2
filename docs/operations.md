@@ -28,6 +28,31 @@ and the voltage block, which ships `enabled: false`. `known_sources` is
 per-source DM, transit schedule CSV, and `snr_min`. `injections` sets
 cadence, parameter ranges, FIFO paths, and the scratch quota.
 
+`dumps_enabled` ships **false** while the telescope is commissioning:
+every trigger decision is still evaluated and written to `triggers` with
+action `suppressed_commissioning`, but no dump command goes out and no
+trigger card is spooled. Flip it to true to arm the dump path.
+
+`veto_widths` and `max_cands_per_gulp` are the storm defences. Watch what
+they cost with
+
+    sqlite3 /mnt/nvme5/casm_pipeline/db/t2.sqlite \
+      "SELECT date(gulp_utc), sum(n_cands), sum(n_vetoed), sum(n_shed)
+         FROM gulp_stats GROUP BY 1 ORDER BY 1 DESC LIMIT 7;"
+
+A `n_shed` that is nonzero outside a storm means the cap is too low. The
+daemon logs the first shedding gulp and every 50th after it.
+
+## Watchdog
+
+t2d is a `Type=notify` unit: it reports READY only once all eight ingest
+ports are bound, and its 60 s heartbeat sends WATCHDOG=1 from the asyncio
+event loop. `WatchdogSec=180` means two missed beats gets it killed and
+restarted. That is deliberate — the failure mode this guards against is
+the event loop wedging, which back-pressures the whole telescope DAQ, and
+a restart costs only the in-flight gulp. `systemctl --user show t2d -p
+WatchdogTimestamp` shows the last successful ping.
+
 ## Runbooks
 
 Smoke-test a dump path:

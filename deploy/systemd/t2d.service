@@ -3,6 +3,14 @@ Description=CASM T2 clustering + trigger daemon
 After=network-online.target
 
 [Service]
+# Type=notify: the unit is 'active' only once all eight ingest ports are
+# bound (READY=1 from serve()). WatchdogSec pairs with the 60 s _heartbeat,
+# which sends WATCHDOG=1 from the asyncio event loop — the same thread that
+# wedged three times on a spinning name search. Two missed beats and systemd
+# kills and restarts us, which is the whole point: a wedged t2d back-pressures
+# the telescope DAQ, so a restart is always cheaper than a hang.
+Type=notify
+WatchdogSec=180
 ExecStart=/home/casm/software/dev/casm_venvs/casm_offline_env/bin/t2d /home/casm/software/dev/casm_t2/config/t2d.yaml
 Restart=always
 RestartSec=5

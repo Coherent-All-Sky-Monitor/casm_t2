@@ -17,16 +17,26 @@ the delayed trigger card. The slow (post-cluster) trigger path remains as
 a fallback and audit trail for anything the fast path skipped.
 
 Everything is recorded in the SQLite event DB: tiered clusters (with their
-YYMMDDxxxx event names), per-gulp funnel statistics, and a full audit row
-for every trigger decision including refusals and their reasons.
+`YYMMDD` + six-letter event names), per-gulp funnel statistics, and a full
+audit row for every trigger decision including refusals and their reasons.
 
 Dumps are deliberately scarce (disks are nearly full): per-kind token
 buckets cap intensity and voltage dumps per day, and any trigger whose
 target filesystem is low on space is refused outright. Injections are
 matched against the ledger and never trigger anything.
 
+Storm defences (2026-07-31, after three production wedges). Candidate
+storms delivered up to 80,000 trials in one coalesced gulp, DBSCAN then
+took 83-137 s against an 8.7 s real-time budget, and ingest stalled. Two
+config knobs shed load at the door, both counted per gulp in gulp_stats:
+`veto_widths` drops whole boxcar-width indices (index 6 is 97-98.6% of
+stored rows on quiet days — red-noise junk at DM >= 200), and
+`max_cands_per_gulp` trips a per-beam S/N quota on whatever is left.
+
 All tunables live in one YAML config (config/t2d.yaml). `--shadow` runs the
-full chain without sending dump commands or writing trigger cards.
+full chain without sending dump commands or writing trigger cards;
+`dumps_enabled: false` is the same suppression as a persistent config key
+(commissioning kill-switch), recorded as 'suppressed_commissioning'.
 """
 
 from __future__ import annotations
@@ -34,8 +44,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import functools
+import heapq
 import json
 import logging
+import math
 import os
 import socket
 import tempfile
@@ -46,12 +58,64 @@ from pathlib import Path
 
 import yaml
 
-from casm_t2 import beams, cluster, db, events, known_source, logsetup, policy, timing, wire
+from casm_t2 import (beams, cluster, db, events, known_source, logsetup, policy,
+                     sdnotify, timing, wire)
 from casm_t2.dump_client import request_dump_async, request_voltage_dump_async
 
 logger = logging.getLogger("t2d")
 
 LOCAL_HOSTNAME = socket.gethostname().split(".")[0]
+
+# Candidates kept per global beam when the storm cap trips, as a fraction of
+# the cap: quota = ceil(max_cands_per_gulp / BEAM_QUOTA_DIVISOR).
+BEAM_QUOTA_DIVISOR = 64
+
+
+def apply_width_veto(cands: list[wire.Candidate],
+                     veto_widths: set[int] | list[int]) -> tuple[list[wire.Candidate], int]:
+    """Drop candidates whose boxcar width index is vetoed.
+
+    Width index 6 (the 67 ms boxcar) is 97-98.6% of everything stored on a
+    quiet day: red-noise junk piled up at DM >= 200 that clusters into
+    nothing and triggers nothing, but pays full DBSCAN cost. Vetoing it at
+    ingest is the cheapest storm defence available.
+
+    An empty veto list disables the filter entirely (returns the input
+    untouched). Returns (kept, n_vetoed).
+    """
+    if not veto_widths:
+        return cands, 0
+    keep = [c for c in cands if c.width not in veto_widths]
+    return keep, len(cands) - len(keep)
+
+
+def apply_storm_cap(cands: list[wire.Candidate],
+                    max_cands: int) -> tuple[list[wire.Candidate], int]:
+    """Shed a runaway gulp down to a per-beam S/N quota.
+
+    Nothing is shed while the gulp is at or below ``max_cands``. Above it,
+    keep the top ``ceil(max_cands / 64)`` candidates PER GLOBAL BEAM by S/N.
+
+    The quota is per beam on purpose. A global top-N would let a bright RFI
+    storm occupying a handful of beams crowd out a genuine single-beam FRB,
+    which is the one thing this daemon exists to catch. The consequence is
+    that the kept total is bounded by quota x (populated beams), not by
+    ``max_cands`` itself: the cap is the trip wire, the quota is the shape.
+
+    Returns (kept, n_shed). ``max_cands <= 0`` disables the cap.
+    """
+    if max_cands <= 0 or len(cands) <= max_cands:
+        return cands, 0
+    quota = max(1, math.ceil(max_cands / BEAM_QUOTA_DIVISOR))
+    by_beam: dict[int, list[wire.Candidate]] = defaultdict(list)
+    for c in cands:
+        by_beam[c.beam].append(c)
+    keep: list[wire.Candidate] = []
+    for beam_cands in by_beam.values():
+        if len(beam_cands) > quota:
+            beam_cands = heapq.nlargest(quota, beam_cands, key=lambda c: c.snr)
+        keep.extend(beam_cands)
+    return keep, len(cands) - len(keep)
 
 
 class DiskMonitor:
@@ -115,6 +179,15 @@ class T2Daemon:
         self.max_nbeam = filt.get("max_nbeam", 32)
         self.dm_floor = filt.get("dm_floor", 20.0)
 
+        # Storm defences. The width veto throws away real (if junk) data, so
+        # it defaults OFF and must be asked for; the storm cap is a liveness
+        # guard, so it defaults ON.
+        self.veto_widths = set(cfg.get("veto_widths", []))
+        self.max_cands_per_gulp = int(cfg.get("max_cands_per_gulp", 20000))
+        # Commissioning kill-switch: evaluate and record every trigger
+        # decision, send no dump command and write no trigger card.
+        self.dumps_enabled = bool(cfg.get("dumps_enabled", True))
+
         trig = cfg.get("trigger", {})
         icfg = trig.get("intensity", {})
         vcfg = trig.get("voltage", {})
@@ -157,6 +230,10 @@ class T2Daemon:
         # bright event spread over several jobs' batches fires only once.
         self.pending_fast: dict[str, tuple[float, int, float]] = {}
         self._last_fast_mono = 0.0
+        # rate-limiter state for the two log lines that can fire per gulp /
+        # per connection during a storm
+        self._ingest_errors: dict[str, int] = {}
+        self._n_storm_caps = 0
         # injection ledger cache, refreshed per gulp from the DB
         self._inj_cache: list[tuple[float, int, float]] = []  # (epoch, beam, dm)
         self._inj_cache_ts = 0.0
@@ -171,6 +248,10 @@ class T2Daemon:
             handler = functools.partial(self._handle, job=job)
             servers.append(await asyncio.start_server(handler, host, port))
             logger.info("listening on %s:%d", host, port)
+        # Every port is bound: only now is the unit genuinely ready. systemd
+        # starts the watchdog clock from here (see _heartbeat).
+        sdnotify.ready()
+        sdnotify.status(f"listening on {len(servers)} ports")
         async with asyncio.TaskGroup() as tg:
             tg.create_task(self._heartbeat())
             tg.create_task(self.disk.poll_remotes())
@@ -182,7 +263,7 @@ class T2Daemon:
         try:
             payload = await asyncio.wait_for(reader.read(-1), timeout=30)
         except (asyncio.TimeoutError, ConnectionError) as exc:
-            logger.warning("ingest connection error: %s", exc)
+            self._log_ingest_error(exc)
             return
         finally:
             writer.close()
@@ -205,6 +286,20 @@ class T2Daemon:
         if first:
             self._spawn(self._flush_later(key))
 
+    def _log_ingest_error(self, exc: BaseException) -> None:
+        """Rate-limited ingest-error log: first of each kind, then every 100th.
+
+        `str(asyncio.TimeoutError())` is the empty string, so the old
+        one-line-per-failure warning emitted 3,000 identical *blank* messages
+        in 4 ms during the 2026-07-30 outage and buried every useful line
+        around it. Log the exception class, and count the rest.
+        """
+        kind = type(exc).__name__
+        n = self._ingest_errors[kind] = self._ingest_errors.get(kind, 0) + 1
+        if n == 1 or n % 100 == 0:
+            logger.warning("ingest connection error: %s: %s (occurrence %d)",
+                           kind, str(exc) or "<no detail>", n)
+
     def _spawn(self, coro) -> None:
         task = asyncio.create_task(coro)
         self.tasks.add(task)
@@ -225,11 +320,26 @@ class T2Daemon:
             db.insert_gulp_stats(self.conn, utc_start_s or "", gulp, gulp_utc,
                                  n_jobs, 0, 0, 0, 0, 0.0)
             return
+        # Shed load BEFORE clustering: DBSCAN cost is what wedges the loop,
+        # so nothing that can be dropped may reach it. n_cands stays the raw
+        # count in, with the two losses accounted separately.
+        n_cands = len(cands)
+        cands, n_vetoed = apply_width_veto(cands, self.veto_widths)
+        cands, n_shed = apply_storm_cap(cands, self.max_cands_per_gulp)
+        if n_shed:
+            self._n_storm_caps += 1
+            if self._n_storm_caps == 1 or self._n_storm_caps % 50 == 0:
+                logger.warning(
+                    "storm cap: gulp %s shed %d of %d candidates to a per-beam "
+                    "quota of %d (cap %d, occurrence %d)", key, n_shed, n_cands,
+                    max(1, math.ceil(self.max_cands_per_gulp / BEAM_QUOTA_DIVISOR)),
+                    self.max_cands_per_gulp, self._n_storm_caps)
         t0 = time.monotonic()
         clusters = await asyncio.to_thread(cluster.cluster_candidates, cands, self.params)
         dt = time.monotonic() - t0
         try:
-            await self._process(key, clusters, n_jobs, len(cands), dt * 1e3)
+            await self._process(key, clusters, n_jobs, n_cands, dt * 1e3,
+                                n_vetoed, n_shed)
         except Exception:
             logger.exception("processing gulp %s failed", key)
 
@@ -280,7 +390,11 @@ class T2Daemon:
         self._last_fast_mono = time.monotonic()
 
         c, event_utc, reason = best
-        name = events.new_event_name(self.conn, event_utc)
+        # Names of fast triggers still awaiting their cluster: each already
+        # has a triggers row, but this batch's row is only written once
+        # _trigger runs below, so exclude the in-flight ones explicitly.
+        exclude = set(self.pending_fast)
+        name = events.new_event_name(self.conn, event_utc, exclude=exclude)
         self.pending_fast[name] = (event_utc.timestamp(), c.beam, c.dm)
         pseudo = cluster.Cluster(peak=c, n_members=1, n_beams=1,
                                  beam_lo=c.beam, beam_hi=c.beam, dm_lo=c.dm,
@@ -352,7 +466,8 @@ class T2Daemon:
         return None
 
     async def _process(self, key: tuple, clusters: list[cluster.Cluster],
-                       n_jobs: int, n_cands: int, clustering_ms: float) -> None:
+                       n_jobs: int, n_cands: int, clustering_ms: float,
+                       n_vetoed: int = 0, n_shed: int = 0) -> None:
         utc_start_s, gulp = key
         utc_start = timing.parse_dada_utc(utc_start_s) if utc_start_s else None
         self._refresh_injections()
@@ -364,6 +479,10 @@ class T2Daemon:
             self.pending_fast.pop(name, None)
 
         rows, to_trigger, fast_names = [], [], []
+        # Names minted for THIS gulp. The uniqueness SELECT cannot see rows
+        # that have not been inserted yet (every insert happens after the
+        # loop), so without this the batch can collide with itself.
+        minted: set[str] = set()
         for cl in clusters:
             event_utc = (timing.samp_to_utc(cl.peak.samp, utc_start)
                          if utc_start else None)
@@ -382,16 +501,22 @@ class T2Daemon:
                 fast_names.append(name)
                 reason = None
             else:
-                name = events.new_event_name(self.conn,
-                                             event_utc or datetime.now(timezone.utc))
+                name = events.new_event_name(
+                    self.conn, event_utc or datetime.now(timezone.utc),
+                    exclude=minted)
+                minted.add(name)
             ev_iso = event_utc.isoformat(timespec="milliseconds") if event_utc else ""
             rows.append((cl, utc_start_s or "", gulp, ev_iso, tier, ",".join(tags), name))
             if reason is not None and event_utc is not None:
                 to_trigger.append((cl, name, event_utc, tier, reason))
 
         ids = db.insert_clusters(self.conn, rows) if rows else []
-        id_by_name = {row[6]: cid for row, cid in zip(rows, ids)}
-        self.n_clusters += len(rows)
+        # insert_clusters returns None for any row it had to skip; those
+        # clusters have no id, and a trigger for one is still recorded with a
+        # NULL cluster_id rather than being lost.
+        id_by_name = {row[6]: cid for row, cid in zip(rows, ids) if cid is not None}
+        n_stored = sum(1 for cid in ids if cid is not None)
+        self.n_clusters += n_stored
         for name in fast_names:
             if name in id_by_name:
                 with self.conn:
@@ -402,8 +527,8 @@ class T2Daemon:
         gulp_utc = (timing.samp_to_utc(min(c.samp_lo for c in clusters), utc_start)
                     .isoformat(timespec="milliseconds") if clusters and utc_start else "")
         db.insert_gulp_stats(self.conn, utc_start_s or "", gulp, gulp_utc, n_jobs,
-                             n_cands, len(clusters), len(rows), len(to_trigger),
-                             clustering_ms)
+                             n_cands, len(clusters), n_stored, len(to_trigger),
+                             clustering_ms, n_vetoed, n_shed)
 
         # One dump per gulp: the same physical event can fragment into a few
         # clusters; fire only the strongest and audit the rest, so duplicates
@@ -434,8 +559,13 @@ class T2Daemon:
         logger.info("trigger candidate %s (%s): snr=%.1f dm=%.2f beam=%d nbeam=%d",
                     name, reason, c.snr, c.dm, c.beam, cl.n_beams)
 
-        if self.shadow:
-            db.insert_trigger(self.conn, cluster_id, name, stream, "shadow", reason,
+        # Two ways to suppress a dump, both recording the decision in full so
+        # the audit trail is identical to a live run: --shadow / shadow: true
+        # (dry-run), and dumps_enabled: false (commissioning kill-switch).
+        # Neither sends a dump command, and neither spools a trigger card.
+        if self.shadow or not self.dumps_enabled:
+            action = "shadow" if self.shadow else "suppressed_commissioning"
+            db.insert_trigger(self.conn, cluster_id, name, stream, action, reason,
                               dump_utc_start=start_s, dump_utc_stop=stop_s)
             return
 
@@ -548,14 +678,21 @@ class T2Daemon:
     async def _heartbeat(self) -> None:
         while True:
             await asyncio.sleep(60)
+            # Pet the systemd watchdog from the event loop itself: this is the
+            # thread that wedged, so a heartbeat that cannot run is exactly the
+            # condition WatchdogSec must catch. WatchdogSec=180 tolerates two
+            # missed beats before the restart.
+            sdnotify.watchdog()
             n_trig = self.conn.execute(
                 "SELECT count(*) FROM triggers WHERE created_utc >= ?",
                 ((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(
                     timespec="milliseconds"),)).fetchone()[0]
+            mode = (" [SHADOW]" if self.shadow else
+                    "" if self.dumps_enabled else " [DUMPS DISABLED]")
             logger.info("heartbeat: %d batches, %d cands -> %d clusters stored, "
                         "%d trigger decisions (last minute)%s",
                         self.n_batches, self.n_cands, self.n_clusters, n_trig,
-                        " [SHADOW]" if self.shadow else "")
+                        mode)
             self.n_batches = self.n_cands = self.n_clusters = 0
 
 
@@ -574,10 +711,13 @@ def main() -> None:
     shadow = args.shadow or cfg.get("shadow", False)
 
     daemon = T2Daemon(cfg, shadow=shadow)
-    logger.info("t2d starting%s: db=%s, voltage=%s",
+    logger.info("t2d starting%s: db=%s, dumps=%s, voltage=%s, "
+                "veto_widths=%s, max_cands_per_gulp=%d",
                 " in SHADOW mode" if shadow else "",
                 cfg.get("db", db.DEFAULT_PATH),
-                "enabled" if daemon.voltage_enabled else "disabled")
+                "enabled" if daemon.dumps_enabled else "DISABLED (commissioning)",
+                "enabled" if daemon.voltage_enabled else "disabled",
+                sorted(daemon.veto_widths) or "none", daemon.max_cands_per_gulp)
     try:
         asyncio.run(daemon.serve())
     except KeyboardInterrupt:

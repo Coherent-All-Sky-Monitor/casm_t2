@@ -28,6 +28,26 @@ One preamble line, then one candidate per line:
 tsamp = 1.048576 ms. The `time_days` column is not trusted, and tsamp is
 never 1.0 ms, whatever the column headers imply (timing.py).
 
+## Storm defences
+
+DBSCAN cost is superlinear in candidate count, and the coalescer feeds it
+all eight jobs at once. During the July 2026 storms that meant 80,000
+trials in one gulp and 83-137 s of clustering against an 8.7 s real-time
+budget — ingest stalled and the DAQ back-pressured. Two knobs shed load
+before clustering, both counted per gulp:
+
+`veto_widths` drops whole boxcar-width indices at ingest. Index 6 (67 ms)
+is 97-98.6% of stored rows on a quiet day, red-noise junk at DM >= 200.
+Empty list disables it. This throws away real data, so it defaults off in
+code and is turned on in the shipped config.
+
+`max_cands_per_gulp` is a trip wire, not a ceiling. Below it nothing is
+touched; above it each global beam keeps its top `ceil(cap/64)` candidates
+by S/N. Per beam, because a global top-N would let bright storm RFI in a
+few beams crowd out the single-beam FRB this daemon exists to catch — so
+the kept total scales with populated beams rather than being clamped to
+the cap.
+
 ## Clustering
 
 DBSCAN, cityblock metric, over scaled (samp, dm_idx, log2(width), beam).
@@ -63,9 +83,12 @@ cap), one dump per gulp during storms, and a free-disk floor checked on
 the node that would receive the data. Every refusal is recorded with its
 reason.
 
-Survivors get a `YYMMDDxxxx` name, an intensity dump on the owning node,
-and a trigger card in the T3 spool. Automatic voltage dumps are wired
-(tier A only) but ship disabled.
+Survivors get a name — `YYMMDD` plus 6 random lowercase letters, 12 chars
+(legacy 10-char names from before 2026-07-31 persist in the DB and in
+artifact paths) — an intensity dump on the owning node, and a trigger card
+in the T3 spool. Automatic voltage dumps are wired (tier A only) but ship
+disabled, and `dumps_enabled: false` suppresses intensity dumps too while
+the telescope is commissioning.
 
 `trigger.fast_path` picks between two trigger styles. Strict
 cluster-first (`false`) waits for DBSCAN and the full chain before any
@@ -105,7 +128,12 @@ One SQLite file, WAL mode (db.py):
 | labels, frbs | human classifications and the promoted catalog |
 
 Trigger actions are `triggered`, `refused` (policy), `refused_daemon`
-(the dump daemon said no — usually the ring window), `failed`, `shadow`.
+(the dump daemon said no — usually the ring window), `failed`, `shadow`,
+and `suppressed_commissioning` (`dumps_enabled: false`).
+
+`gulp_stats.n_cands` is the raw count in; `n_vetoed` and `n_shed` are what
+the width veto and the storm cap dropped before clustering, so DBSCAN saw
+`n_cands - n_vetoed - n_shed`.
 
 Timestamps are ISO-8601 UTC with a `T` separator. sqlite's
 `datetime('now')` renders with a space, which string-compares wrongly

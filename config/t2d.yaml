@@ -10,6 +10,33 @@ db: /mnt/nvme5/casm_pipeline/db/t2.sqlite
 # rows and trigger decisions, but no dump commands and no trigger cards.
 shadow: false
 
+# COMMISSIONING KILL-SWITCH (2026-07-31: the telescope is commissioning, so
+# this ships FALSE). false = run the whole chain and record every trigger
+# decision in the triggers table with action 'suppressed_commissioning', but
+# send no dump command and write no trigger card. Same suppression as
+# `shadow`, kept as a separate key so the dry-run flag stays available and
+# the audit rows say WHY the dump did not happen. Flip to true to arm.
+dumps_enabled: false
+
+# STORM DEFENCES (2026-07-31, after t2d wedged three times). A candidate
+# storm delivered up to 80,000 trials in one coalesced gulp (8 jobs x 10k
+# cap); DBSCAN then took 83-137 s against the 8.7 s real-time budget and
+# ingest stalled, back-pressuring the DAQ. Both knobs shed load before
+# clustering and are counted per gulp in gulp_stats (n_vetoed, n_shed).
+
+# Boxcar width indices dropped at ingest. Index 6 (the 67 ms boxcar) is
+# 97-98.6% of everything stored on a quiet day: red-noise junk at DM >= 200
+# that clusters into nothing and triggers nothing. Empty list = disabled.
+# Widening this throws away real data — check n_vetoed before and after.
+veto_widths: [6]
+
+# Above this many candidates in a coalesced gulp (after the width veto),
+# keep only the top ceil(cap/64) per GLOBAL BEAM by S/N. The quota is per
+# beam so a bright storm in a few beams cannot crowd a real single-beam FRB
+# out of a global top-N; the kept total is therefore bounded by
+# quota x populated beams, not by this number. 0 disables the cap.
+max_cands_per_gulp: 20000
+
 cluster:
   eps: 1.0
   min_samples: 5
