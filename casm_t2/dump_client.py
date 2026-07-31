@@ -503,8 +503,9 @@ def gather_dump(streams: list[int], dest: str, before: dict[int, set[str]],
     return failures, prefix, gathered
 
 
-def dump_voltages(gather_dir: str, seconds: float | None = None,
+def dump_voltages(gather_dir: str, duration: float | None = None,
                   start: str | None = None, stop: str | None = None,
+                  next_duration: float | None = None,
                   streams: list[int] | str | None = None,
                   timeout: float = DEFAULT_TIMEOUT_S,
                   force: bool = False,
@@ -512,14 +513,16 @@ def dump_voltages(gather_dir: str, seconds: float | None = None,
     """Dump voltages and gather them into gather_dir; the Python form of
     ``casm-voltage-dump ... --gather D -y``.
 
-    Give either seconds (the last N seconds, ending 2 s before now) or an
-    explicit start/stop pair of PSRDADA UTC strings
+    One of three window forms: duration (the LAST N seconds, ending 2 s
+    before now — the ring buffer only reaches ~26 s back), next_duration
+    (the NEXT N seconds, starting 5 s from now — how long dumps are taken),
+    or an explicit start/stop pair of PSRDADA UTC strings
     ("2026-07-30-22:25:22.958"). Triggers the dump, waits for the files on
     both nodes, pulls the remote streams into gather_dir (local ones are
     symlinked), prints each gathered file's absolute path, and returns
     (gather_dir, prefix) ready for casm_io's VoltageReader:
 
-        data_dir, prefix = dump_voltages("~/myrun", seconds=2)
+        data_dir, prefix = dump_voltages("~/myrun", duration=2)
         reader = VoltageReader(data_dir, prefix)
 
     streams selects a subset (list of indices or "1,2"); default all six.
@@ -533,9 +536,10 @@ def dump_voltages(gather_dir: str, seconds: float | None = None,
     streams = sorted(streams) if streams else list(range(NVOLTAGE_STREAM))
 
     now = datetime.now(timezone.utc)
-    start, stop = voltage_window(now, start=start, stop=stop, last=seconds)
+    start, stop = voltage_window(now, start=start, stop=stop, last=duration,
+                                 ahead=next_duration)
     stale = ring_age_refusal(now, start)
-    if stale and seconds is not None:
+    if stale and duration is not None:
         raise RuntimeError(stale)
     if stale:
         print(f"WARNING: {stale} — expect the daemons to refuse")
