@@ -503,38 +503,55 @@ def gather_dump(streams: list[int], dest: str, before: dict[int, set[str]],
     return failures, prefix, gathered
 
 
-def dump_voltages(seconds: float, gather_dir: str,
+def dump_voltages(gather_dir: str, seconds: float | None = None,
+                  start: str | None = None, stop: str | None = None,
                   streams: list[int] | str | None = None,
                   timeout: float = DEFAULT_TIMEOUT_S,
-                  force: bool = False) -> tuple[str, str | None]:
-    """Dump the last `seconds` of voltages and gather them into gather_dir.
+                  force: bool = False,
+                  dry_run: bool = False) -> tuple[str, str | None]:
+    """Dump voltages and gather them into gather_dir; the Python form of
+    ``casm-voltage-dump ... --gather D -y``.
 
-    The notebook-friendly form of ``casm-voltage-dump --last S --gather D -y``:
-    triggers the dump, waits for the files on both nodes, pulls the remote
-    streams into gather_dir (local ones are symlinked), prints each gathered
-    file's absolute path, and returns (gather_dir, prefix) ready for
-    casm_io's VoltageReader:
+    Give either seconds (the last N seconds, ending 2 s before now) or an
+    explicit start/stop pair of PSRDADA UTC strings
+    ("2026-07-30-22:25:22.958"). Triggers the dump, waits for the files on
+    both nodes, pulls the remote streams into gather_dir (local ones are
+    symlinked), prints each gathered file's absolute path, and returns
+    (gather_dir, prefix) ready for casm_io's VoltageReader:
 
-        data_dir, prefix = dump_voltages(2, "~/myrun")
+        data_dir, prefix = dump_voltages("~/myrun", seconds=2)
         reader = VoltageReader(data_dir, prefix)
 
     streams selects a subset (list of indices or "1,2"); default all six.
-    Raises RuntimeError on preflight refusals (janitor quota, disk floor —
-    force=True downgrades them to warnings) and when no stream delivered.
+    dry_run=True prints the plan and the per-node disk state, sends
+    nothing, and returns (gather_dir, None). Raises RuntimeError on
+    preflight refusals (janitor quota, disk floor — force=True downgrades
+    them to warnings) and when no stream delivered.
     """
     if isinstance(streams, str):
         streams = parse_streams(streams)
     streams = sorted(streams) if streams else list(range(NVOLTAGE_STREAM))
 
     now = datetime.now(timezone.utc)
-    start, stop = voltage_window(now, last=seconds)
+    start, stop = voltage_window(now, start=start, stop=stop, last=seconds)
     stale = ring_age_refusal(now, start)
-    if stale:
+    if stale and seconds is not None:
         raise RuntimeError(stale)
+    if stale:
+        print(f"WARNING: {stale} — expect the daemons to refuse")
 
     duration_s = (stop - start).total_seconds()
-    free_by_host = {host: free_bytes(host)
-                    for host in node_volumes(duration_s, streams)}
+    print(f"window   {format_dada_utc(start)} .. {format_dada_utc(stop)} "
+          f"({duration_s:.3f} s)")
+
+    volumes = node_volumes(duration_s, streams)
+    free_by_host = {host: free_bytes(host) for host in volumes}
+    for host, (n, dump_bytes, guard_bytes) in volumes.items():
+        free = free_by_host[host]
+        free_txt = "unknown" if free is None else f"{free / 1e9:.0f} GB"
+        print(f"{host}  {n} stream(s), writes {dump_bytes / 1e9:.1f} GB, "
+              f"needs {guard_bytes / 1e9:.1f} GB free, has {free_txt}")
+
     refusals, warnings = preflight_issues(duration_s, streams, free_by_host,
                                           force=force)
     for msg in warnings:
@@ -543,13 +560,14 @@ def dump_voltages(seconds: float, gather_dir: str,
         raise RuntimeError("; ".join(refusals))
 
     dest = os.path.abspath(os.path.expanduser(gather_dir))
+    if dry_run:
+        print("dry run: nothing sent")
+        return dest, None
+
     before = {}
     for stream in streams:
         host, _ = voltage_endpoint(stream)
         before[stream] = set(stream_file_sizes(host, stream) or ())
-
-    print(f"window   {format_dada_utc(start)} .. {format_dada_utc(stop)} "
-          f"({duration_s:.3f} s)")
     for stream in streams:
         host, port = voltage_endpoint(stream)
         try:
