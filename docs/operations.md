@@ -41,7 +41,13 @@ they cost with
          FROM gulp_stats GROUP BY 1 ORDER BY 1 DESC LIMIT 7;"
 
 A `n_shed` that is nonzero outside a storm means the cap is too low. The
-daemon logs the first shedding gulp and every 50th after it.
+daemon logs the first shedding gulp and every 50th after it, with the
+count it shed down to.
+
+`n_cands` is the raw arrival count: `n_vetoed` is subtracted at parse time
+(per batch, aggregated per gulp) and `n_shed` by the cap, so DBSCAN saw
+`n_cands - n_vetoed - n_shed`. That figure is bounded by
+`max_cands_per_gulp + 4 x 512`, whatever the storm looks like.
 
 ## Watchdog
 

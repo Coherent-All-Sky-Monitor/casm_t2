@@ -29,9 +29,11 @@ Storm defences (2026-07-31, after three production wedges). Candidate
 storms delivered up to 80,000 trials in one coalesced gulp, DBSCAN then
 took 83-137 s against an 8.7 s real-time budget, and ingest stalled. Two
 config knobs shed load at the door, both counted per gulp in gulp_stats:
-`veto_widths` drops whole boxcar-width indices (index 6 is 97-98.6% of
-stored rows on quiet days — red-noise junk at DM >= 200), and
-`max_cands_per_gulp` trips a per-beam S/N quota on whatever is left.
+`veto_widths` drops whole boxcar-width indices at parse time (index 6 is
+97-98.6% of stored rows on quiet days — red-noise junk at DM >= 200), and
+`max_cands_per_gulp` bounds what reaches DBSCAN — a per-beam S/N quota,
+then a global truncation with a per-beam floor so the bound holds even for
+a storm spread evenly across all 512 beams.
 
 All tunables live in one YAML config (config/t2d.yaml). `--shadow` runs the
 full chain without sending dump commands or writing trigger cards;
@@ -43,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import functools
 import heapq
 import json
@@ -66,9 +69,14 @@ logger = logging.getLogger("t2d")
 
 LOCAL_HOSTNAME = socket.gethostname().split(".")[0]
 
-# Candidates kept per global beam when the storm cap trips, as a fraction of
-# the cap: quota = ceil(max_cands_per_gulp / BEAM_QUOTA_DIVISOR).
+# Stage-1 per-beam quota when the storm cap trips, as a fraction of the cap:
+# quota = ceil(max_cands_per_gulp / BEAM_QUOTA_DIVISOR).
 BEAM_QUOTA_DIVISOR = 64
+
+# Stage-2 floor: candidates every populated beam keeps regardless of how it
+# ranks globally. This is what stops a bright storm elsewhere in the sky from
+# evicting a real single-beam FRB during the global truncation.
+BEAM_FLOOR = 4
 
 
 def apply_width_veto(cands: list[wire.Candidate],
@@ -89,32 +97,62 @@ def apply_width_veto(cands: list[wire.Candidate],
     return keep, len(cands) - len(keep)
 
 
-def apply_storm_cap(cands: list[wire.Candidate],
-                    max_cands: int) -> tuple[list[wire.Candidate], int]:
-    """Shed a runaway gulp down to a per-beam S/N quota.
+def apply_storm_cap(cands: list[wire.Candidate], max_cands: int,
+                    beam_floor: int = BEAM_FLOOR) -> tuple[list[wire.Candidate], int]:
+    """Shed a runaway gulp down to a real bound on what DBSCAN will see.
 
     Nothing is shed while the gulp is at or below ``max_cands``. Above it,
-    keep the top ``ceil(max_cands / 64)`` candidates PER GLOBAL BEAM by S/N.
+    two stages run in order:
 
-    The quota is per beam on purpose. A global top-N would let a bright RFI
-    storm occupying a handful of beams crowd out a genuine single-beam FRB,
-    which is the one thing this daemon exists to catch. The consequence is
-    that the kept total is bounded by quota x (populated beams), not by
-    ``max_cands`` itself: the cap is the trip wire, the quota is the shape.
+    Stage 1 — per-beam quota. Each global beam keeps its top
+    ``ceil(max_cands / 64)`` candidates by S/N. This handles the
+    beam-concentrated case (RFI hammering a handful of beams) and keeps the
+    shed fair across the sky rather than letting the loudest beams decide.
 
-    Returns (kept, n_shed). ``max_cands <= 0`` disables the cap.
+    Stage 2 — global truncation with a floor. Stage 1 alone is NOT a bound:
+    its allowance is quota x populated beams, which at the shipped cap is
+    313 x 512 = 160k, so a storm spread evenly over all 512 beams passes
+    through untouched. That is exactly what happened on 2026-07-31 (80,000
+    width-0 spikes across every beam, which `veto_widths: [6]` also does not
+    touch), and DBSCAN still saw the full 80k. So if stage 1 leaves more than
+    ``max_cands``, keep the global top ``max_cands`` by S/N, then add back
+    each populated beam's top ``beam_floor``.
+
+    The floor is the whole reason stage 2 is safe: a plain global top-N would
+    let a bright storm elsewhere in the sky evict a genuine single-beam FRB,
+    which is the one thing this daemon exists to catch. Worst case kept is
+    therefore ``max_cands + beam_floor x 512`` (~22k at the shipped cap) —
+    a real bound, and well inside the clustering budget.
+
+    Returns (kept, n_shed), survivors in input order. ``max_cands <= 0``
+    disables the cap.
     """
     if max_cands <= 0 or len(cands) <= max_cands:
         return cands, 0
+
+    def by_beam(idxs: list[int]) -> dict[int, list[int]]:
+        out: dict[int, list[int]] = defaultdict(list)
+        for i in idxs:
+            out[cands[i].beam].append(i)
+        return out
+
+    def top(idxs: list[int], n: int) -> list[int]:
+        if len(idxs) <= n:
+            return idxs
+        return heapq.nlargest(n, idxs, key=lambda i: cands[i].snr)
+
     quota = max(1, math.ceil(max_cands / BEAM_QUOTA_DIVISOR))
-    by_beam: dict[int, list[wire.Candidate]] = defaultdict(list)
-    for c in cands:
-        by_beam[c.beam].append(c)
-    keep: list[wire.Candidate] = []
-    for beam_cands in by_beam.values():
-        if len(beam_cands) > quota:
-            beam_cands = heapq.nlargest(quota, beam_cands, key=lambda c: c.snr)
-        keep.extend(beam_cands)
+    survivors: list[int] = []
+    for idxs in by_beam(range(len(cands))).values():
+        survivors.extend(top(idxs, quota))
+
+    if len(survivors) > max_cands:
+        keep_idx = set(top(survivors, max_cands))
+        for idxs in by_beam(survivors).values():
+            keep_idx.update(top(idxs, beam_floor))
+        survivors = list(keep_idx)
+
+    keep = [cands[i] for i in sorted(survivors)]
     return keep, len(cands) - len(keep)
 
 
@@ -223,6 +261,9 @@ class T2Daemon:
         self.conn = db.connect(cfg.get("db", db.DEFAULT_PATH))
         self.pending: dict[tuple, list[wire.Candidate]] = defaultdict(list)
         self.pending_jobs: dict[tuple, int] = {}
+        # width-vetoed trials per coalescer key: filtered per batch in
+        # _handle, reported per gulp by _flush_later
+        self.pending_vetoed: dict[tuple, int] = {}
         self.tasks: set[asyncio.Task] = set()
         self.n_batches = self.n_cands = self.n_clusters = self.n_triggers = 0
         # fast-path bookkeeping: recently fired fast triggers awaiting their
@@ -269,19 +310,29 @@ class T2Daemon:
             writer.close()
         batch = wire.parse_batch(payload.decode(errors="replace"))
         self.n_batches += 1
-        self.n_cands += len(batch.cands)
+        self.n_cands += len(batch.cands)   # raw arrivals, before any veto
+        # Width veto at PARSE time, ahead of every consumer: the fast path
+        # triggers dumps per batch, so a veto applied later would still let
+        # vetoed junk fire a dump. Vetoed trials also stay out of the context
+        # deque embedded in trigger cards.
+        key = (batch.utc_start, batch.gulp)
+        cands, n_vetoed = apply_width_veto(batch.cands, self.veto_widths)
+        if n_vetoed:
+            # Filtering is per batch but accounting is per gulp, so the count
+            # is aggregated under the coalescer key and consumed by
+            # _flush_later along with the candidates themselves.
+            self.pending_vetoed[key] = self.pending_vetoed.get(key, 0) + n_vetoed
         # empty batches still register in the coalescer so all-quiet gulps
         # get a gulp_stats row (duty cycle = observed time, not busy time)
-        if batch.cands and batch.utc_start is not None:
+        if cands and batch.utc_start is not None:
             epoch = timing.parse_dada_utc(batch.utc_start).timestamp()
             tsamp = batch.tsamp_s or timing.TSAMP_S
-            for c in batch.cands:
+            for c in cands:
                 self.context.append((epoch + c.samp * tsamp, c.beam, c.dm, c.snr, c.width))
-        if self.fast_path and batch.cands:
-            self._spawn(self._fast_path(batch))
-        key = (batch.utc_start, batch.gulp)
+        if self.fast_path and cands:
+            self._spawn(self._fast_path(dataclasses.replace(batch, cands=cands)))
         first = key not in self.pending
-        self.pending[key].extend(batch.cands)
+        self.pending[key].extend(cands)
         self.pending_jobs[key] = self.pending_jobs.get(key, 0) + 1
         if first:
             self._spawn(self._flush_later(key))
@@ -309,8 +360,12 @@ class T2Daemon:
         await asyncio.sleep(self.cfg.get("coalesce_s", 2.0))
         cands = self.pending.pop(key, [])
         n_jobs = self.pending_jobs.pop(key, 0)
+        # already applied per batch in _handle; this is the gulp total
+        n_vetoed = self.pending_vetoed.pop(key, 0)
         if not cands:
-            # quiet gulp: no candidates from any job, but it was observed
+            # quiet gulp: nothing survived from any job, but it was observed.
+            # A gulp whose every trial was vetoed lands here too, so n_cands
+            # is the veto count rather than zero.
             utc_start_s, gulp = key
             gulp_utc = ""
             if utc_start_s:
@@ -318,22 +373,24 @@ class T2Daemon:
                 gulp_utc = timing.samp_to_utc(gulp * 8192, utc_start).isoformat(
                     timespec="milliseconds")
             db.insert_gulp_stats(self.conn, utc_start_s or "", gulp, gulp_utc,
-                                 n_jobs, 0, 0, 0, 0, 0.0)
+                                 n_jobs, n_vetoed, 0, 0, 0, 0.0,
+                                 n_vetoed=n_vetoed, n_shed=0)
             return
         # Shed load BEFORE clustering: DBSCAN cost is what wedges the loop,
-        # so nothing that can be dropped may reach it. n_cands stays the raw
-        # count in, with the two losses accounted separately.
-        n_cands = len(cands)
-        cands, n_vetoed = apply_width_veto(cands, self.veto_widths)
+        # so nothing that can be dropped may reach it. n_cands is reconstructed
+        # as the raw count in, with the two losses accounted separately.
+        n_cands = len(cands) + n_vetoed
         cands, n_shed = apply_storm_cap(cands, self.max_cands_per_gulp)
         if n_shed:
             self._n_storm_caps += 1
             if self._n_storm_caps == 1 or self._n_storm_caps % 50 == 0:
                 logger.warning(
-                    "storm cap: gulp %s shed %d of %d candidates to a per-beam "
-                    "quota of %d (cap %d, occurrence %d)", key, n_shed, n_cands,
+                    "storm cap: gulp %s shed %d of %d candidates down to %d "
+                    "(cap %d, per-beam quota %d, per-beam floor %d, "
+                    "occurrence %d)", key, n_shed, n_cands, len(cands),
+                    self.max_cands_per_gulp,
                     max(1, math.ceil(self.max_cands_per_gulp / BEAM_QUOTA_DIVISOR)),
-                    self.max_cands_per_gulp, self._n_storm_caps)
+                    BEAM_FLOOR, self._n_storm_caps)
         t0 = time.monotonic()
         clusters = await asyncio.to_thread(cluster.cluster_candidates, cands, self.params)
         dt = time.monotonic() - t0

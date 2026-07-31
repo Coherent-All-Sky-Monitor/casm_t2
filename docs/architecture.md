@@ -36,17 +36,26 @@ trials in one gulp and 83-137 s of clustering against an 8.7 s real-time
 budget — ingest stalled and the DAQ back-pressured. Two knobs shed load
 before clustering, both counted per gulp:
 
-`veto_widths` drops whole boxcar-width indices at ingest. Index 6 (67 ms)
-is 97-98.6% of stored rows on a quiet day, red-noise junk at DM >= 200.
-Empty list disables it. This throws away real data, so it defaults off in
-code and is turned on in the shipped config.
+`veto_widths` drops whole boxcar-width indices at parse time, ahead of the
+fast path and the trigger-card context. Index 6 (67 ms) is 97-98.6% of
+stored rows on a quiet day, red-noise junk at DM >= 200. Empty list
+disables it. This throws away real data, so it defaults off in code and is
+turned on in the shipped config.
 
-`max_cands_per_gulp` is a trip wire, not a ceiling. Below it nothing is
-touched; above it each global beam keeps its top `ceil(cap/64)` candidates
-by S/N. Per beam, because a global top-N would let bright storm RFI in a
-few beams crowd out the single-beam FRB this daemon exists to catch — so
-the kept total scales with populated beams rather than being clamped to
-the cap.
+`max_cands_per_gulp` bounds what reaches DBSCAN, in two stages. Stage 1
+gives each global beam a quota of its top `ceil(cap/64)` by S/N, which
+handles RFI concentrated in a few beams and keeps the shed fair across the
+sky. Stage 2 runs only if that still leaves more than the cap: keep the
+global top `cap` by S/N, then add back every populated beam's top 4.
+
+Stage 2 is not optional. Stage 1's allowance is quota x populated beams —
+313 x 512 = 160k at the shipped cap — so a storm spread evenly over every
+beam passes straight through it, which is precisely what the 2026-07-31
+storm was (width-0 spikes in all beams, untouched by `veto_widths: [6]`).
+The per-beam floor in stage 2 is what keeps the global truncation safe: a
+plain global top-N would let a bright storm elsewhere in the sky evict the
+single-beam FRB this daemon exists to catch. Worst case kept is
+`cap + 4 x 512` ~ 22k.
 
 ## Clustering
 
