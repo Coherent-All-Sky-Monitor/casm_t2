@@ -16,7 +16,7 @@ shadow: false
 # send no dump command and write no trigger card. Same suppression as
 # `shadow`, kept as a separate key so the dry-run flag stays available and
 # the audit rows say WHY the dump did not happen. Flip to true to arm.
-dumps_enabled: false
+dumps_enabled: true   # armed 2026-08-13 per Vishnu (IB-sub-off restart); voltage below stays false
 
 # STORM DEFENCES (2026-07-31, after t2d wedged three times). A candidate
 # storm delivered up to 80,000 trials in one coalesced gulp (8 jobs x 10k
