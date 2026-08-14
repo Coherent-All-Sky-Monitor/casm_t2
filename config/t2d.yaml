@@ -44,6 +44,12 @@ veto_widths: [6]
 # cap + 4 x 512 ~ 22k. 0 disables the cap entirely.
 max_cands_per_gulp: 20000
 
+# 2026-08-13 (Vishnu): a gulp over the cap is dropped WHOLE instead of shed
+# to the two-stage bound — during a storm the gulp is junk; skip it and stay
+# real-time. Costs any real FRB that lands inside a storm gulp (the cap's
+# per-beam floor used to preserve those); flip back to false to shed instead.
+storm_skip_gulp: true
+
 cluster:
   eps: 1.0
   min_samples: 5
@@ -77,6 +83,12 @@ trigger:
   fast_path: false
   pre_s: 2.0
   post_s: 2.0
+  # 2026-08-13 (Vishnu): blind triggers need 30 s of blind-eligible QUIET.
+  # Every eligible blind event restarts the clock (dumped or not), so an RFI
+  # storm gets one dump then locks out until it ends — min_spacing_s alone
+  # would let a storm take a dump every 60 s for its whole duration.
+  # Known-source triggers (B0329) are exempt. 0 disables.
+  storm_lockout_s: 30
   disk_floor_gb: 200    # refuse any dump if target fs has less free
   intensity:
     # No rate gate: every T2-passed candidate is dumped, plotted, and its

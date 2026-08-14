@@ -222,6 +222,10 @@ class T2Daemon:
         # guard, so it defaults ON.
         self.veto_widths = set(cfg.get("veto_widths", []))
         self.max_cands_per_gulp = int(cfg.get("max_cands_per_gulp", 20000))
+        # skip-entirely alternative to the two-stage cap: a gulp over the cap
+        # is dropped whole (n_shed = everything). Trades the cap's
+        # FRB-during-a-storm survival for zero storm work; operator's call.
+        self.storm_skip_gulp = bool(cfg.get("storm_skip_gulp", False))
         # Commissioning kill-switch: evaluate and record every trigger
         # decision, send no dump command and write no trigger card.
         self.dumps_enabled = bool(cfg.get("dumps_enabled", True))
@@ -237,6 +241,15 @@ class T2Daemon:
         self.voltage_tier = vcfg.get("tier", "A")
         self.pre_s = trig.get("pre_s", 2.0)
         self.post_s = trig.get("post_s", 2.0)
+        # Storm lockout: a BLIND (tier) trigger additionally requires this
+        # many seconds of blind-trigger-eligible quiet. Every eligible blind
+        # event restarts the clock whether or not it dumped, so a sustained
+        # RFI storm gets exactly one dump and then silence until it ends,
+        # instead of one dump per min_spacing_s for its whole duration.
+        # Known-source triggers are exempt (a pulsar train must not lock
+        # itself out). 0 disables.
+        self.storm_lockout_s = float(trig.get("storm_lockout_s", 0.0))
+        self._last_blind_eligible: datetime | None = None
         # Strict mode (fast_path: false) waits for clustering before any
         # dump — DSA-110 style. Misses from the ring window expiring are
         # then deliberate and audited, the data that argues for a deeper
@@ -380,17 +393,28 @@ class T2Daemon:
         # so nothing that can be dropped may reach it. n_cands is reconstructed
         # as the raw count in, with the two losses accounted separately.
         n_cands = len(cands) + n_vetoed
-        cands, n_shed = apply_storm_cap(cands, self.max_cands_per_gulp)
-        if n_shed:
+        if (self.storm_skip_gulp and self.max_cands_per_gulp > 0
+                and len(cands) > self.max_cands_per_gulp):
+            # storm_skip_gulp: drop the whole gulp rather than shed to a cap.
+            n_shed, cands = len(cands), []
             self._n_storm_caps += 1
             if self._n_storm_caps == 1 or self._n_storm_caps % 50 == 0:
                 logger.warning(
-                    "storm cap: gulp %s shed %d of %d candidates down to %d "
-                    "(cap %d, per-beam quota %d, per-beam floor %d, "
-                    "occurrence %d)", key, n_shed, n_cands, len(cands),
-                    self.max_cands_per_gulp,
-                    max(1, math.ceil(self.max_cands_per_gulp / BEAM_QUOTA_DIVISOR)),
-                    BEAM_FLOOR, self._n_storm_caps)
+                    "storm skip: gulp %s dropped whole (%d candidates > cap "
+                    "%d, occurrence %d)", key, n_shed,
+                    self.max_cands_per_gulp, self._n_storm_caps)
+        else:
+            cands, n_shed = apply_storm_cap(cands, self.max_cands_per_gulp)
+            if n_shed:
+                self._n_storm_caps += 1
+                if self._n_storm_caps == 1 or self._n_storm_caps % 50 == 0:
+                    logger.warning(
+                        "storm cap: gulp %s shed %d of %d candidates down to %d "
+                        "(cap %d, per-beam quota %d, per-beam floor %d, "
+                        "occurrence %d)", key, n_shed, n_cands, len(cands),
+                        self.max_cands_per_gulp,
+                        max(1, math.ceil(self.max_cands_per_gulp / BEAM_QUOTA_DIVISOR)),
+                        BEAM_FLOOR, self._n_storm_caps)
         t0 = time.monotonic()
         clusters = await asyncio.to_thread(cluster.cluster_candidates, cands, self.params)
         dt = time.monotonic() - t0
@@ -625,6 +649,20 @@ class T2Daemon:
             db.insert_trigger(self.conn, cluster_id, name, stream, action, reason,
                               dump_utc_start=start_s, dump_utc_stop=stop_s)
             return
+
+        # Storm lockout (blind triggers only): any eligible blind event —
+        # dumped or not — restarts the clock, so consecutive storm gulps
+        # extend the lockout and the storm costs one dump total.
+        if self.storm_lockout_s > 0 and reason.startswith("tier"):
+            prev, self._last_blind_eligible = self._last_blind_eligible, now
+            if prev is not None and (now - prev).total_seconds() < self.storm_lockout_s:
+                logger.warning("blind trigger %s locked out: previous eligible "
+                               "event %.1f s ago (< %.0f s quiet required)",
+                               name, (now - prev).total_seconds(),
+                               self.storm_lockout_s)
+                db.insert_trigger(self.conn, cluster_id, name, stream, "refused",
+                                  f"{reason};storm_lockout")
+                return
 
         budget = self.budget_int
         refusal = budget.check(now) or self.disk.refusal(loc.host, loc.dump_dir)
