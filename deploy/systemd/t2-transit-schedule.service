@@ -3,6 +3,6 @@ Description=CASM daily B0329 transit schedule regeneration
 
 [Service]
 Type=oneshot
-ExecStart=/home/casm/software/dev/casm_venvs/casm_offline_env/bin/t2-transit-schedule /home/casm/software/vishnu/beamforming_weights/20260527/weights_may27_thr2_512beams_int8.h5 --source B0329+54 --out /mnt/nvme5/casm_pipeline/schedules/b0329_schedule.csv
+ExecStart=/home/casm/software/dev/casm_venvs/casm_offline_env/bin/t2-transit-schedule /home/casm/software/vishnu/beamforming_weights/20260807/weights_aug06_17ant_no33_uniform_512beams_int8.h5 --source B0329+54 --out /mnt/nvme5/casm_pipeline/schedules/b0329_schedule.csv
 ExecStartPost=/usr/bin/systemctl --user restart t2d
 StandardOutput=journal
