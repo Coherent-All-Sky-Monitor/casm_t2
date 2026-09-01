@@ -76,6 +76,19 @@ filters:
   max_nbeam: 32         # wider clusters are tagged rfi_wide, never trigger
   dm_floor: 20.0        # blind (tier) triggers require peak DM >= this
 
+# Beam-occupancy veto (iteration-2 closure design, casm-wiki hella-sigma.md):
+# a cluster is tagged occupancy:<n> and never triggers when the gulp's RAW
+# candidates span >= min_beams distinct beams within +-window_samp samples of
+# its peak. Multi-beam coincidence: real sources 0-2 beams, broadband zero-DM
+# junk 40-64 (measured on the fixed 807f507 binary at threshold 8; on the
+# production binary capped storm gulps arrive with a 1-beam footprint, so
+# this fires rarely until that binary is redeployed). Counted on raw
+# candidates because DBSCAN fragments the junk into single-beam clusters.
+# min_beams: 0 disables.
+occupancy:
+  min_beams: 8
+  window_samp: 256      # +-0.27 s at 1.048576 ms sampling
+
 # DISK SAFETY: dumps are scarce on purpose. Caps are global across reasons.
 trigger:
   # cluster-first (strict T2) since 2026-06-11: every dump decision waits

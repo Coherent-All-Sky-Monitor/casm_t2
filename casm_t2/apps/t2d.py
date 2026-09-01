@@ -4,8 +4,9 @@ The always-on heart of T2. Owns the eight TCP ports hella publishes to,
 coalesces the jobs' batches per gulp, clusters each gulp with DBSCAN, and
 runs every cluster through the decision chain:
 
-    injection match -> beam veto -> wide-beam RFI cut -> known-source match
-    -> SNR tier -> trigger budgets + disk guard -> dump + trigger card
+    injection match -> beam veto -> wide-beam RFI cut -> beam-occupancy
+    veto -> known-source match -> SNR tier -> trigger budgets + disk guard
+    -> dump + trigger card
 
 Latency note: the dump ring only reaches ~20 s back and T1 itself reports
 20-24 s after the pulse, so dump triggering CANNOT wait for clustering.
@@ -45,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import bisect
 import dataclasses
 import functools
 import heapq
@@ -156,6 +158,36 @@ def apply_storm_cap(cands: list[wire.Candidate], max_cands: int,
     return keep, len(cands) - len(keep)
 
 
+def build_beam_footprint(
+        cands: list[wire.Candidate]) -> tuple[list[int], list[int]]:
+    """(samples sorted ascending, beams in the same order) for one gulp.
+
+    Built from the raw candidates BEFORE the storm cap sheds anything, so a
+    junk event's true beam footprint is preserved even when most of its
+    trials are then dropped. hella-side truncation is the remaining blind
+    spot: the production binary stops searching a gulp at its own 10k cap,
+    so capped storm gulps arrive with a 1-beam footprint (measured
+    2026-08-31, casm-wiki hella-t1-saturation.md); the full 43-64 beam
+    footprint appears once the iteration-2 binary's per-beam quota is live.
+    """
+    order = sorted(range(len(cands)), key=lambda i: cands[i].samp)
+    return ([cands[i].samp for i in order], [cands[i].beam for i in order])
+
+
+def occupancy_beams(samps: list[int], beam_by_samp: list[int],
+                    peak_samp: int, window_samp: int) -> int:
+    """Distinct beams with any candidate within +-window_samp of peak_samp.
+
+    The zero-DM junk discriminator from the iteration-2 closure
+    (casm-wiki hella-sigma.md): real sources occupy 0-2 beams, broadband
+    junk 40-64, and DBSCAN cannot substitute because junk fragments into
+    single-beam clusters. Counted on raw candidates, not clusters.
+    """
+    lo = bisect.bisect_left(samps, peak_samp - window_samp)
+    hi = bisect.bisect_right(samps, peak_samp + window_samp)
+    return len(set(beam_by_samp[lo:hi]))
+
+
 class DiskMonitor:
     """Cached free-space checks for the dump filesystems on both nodes.
 
@@ -216,6 +248,12 @@ class T2Daemon:
         self.veto = set(filt.get("beam_veto", []))
         self.max_nbeam = filt.get("max_nbeam", 32)
         self.dm_floor = filt.get("dm_floor", 20.0)
+        # Beam-occupancy veto (iteration-2 closure design): tag any cluster
+        # whose surrounding raw candidates span >= min_beams distinct beams
+        # within +-window_samp samples. min_beams 0 disables.
+        occ = cfg.get("occupancy", {}) or {}
+        self.occ_min_beams = int(occ.get("min_beams", 0))
+        self.occ_window_samp = int(occ.get("window_samp", 256))
 
         # Storm defences. The width veto throws away real (if junk) data, so
         # it defaults OFF and must be asked for; the storm cap is a liveness
@@ -389,6 +427,9 @@ class T2Daemon:
                                  n_jobs, n_vetoed, 0, 0, 0, 0.0,
                                  n_vetoed=n_vetoed, n_shed=0)
             return
+        # Beam footprint for the occupancy veto, from the FULL pre-shed set.
+        footprint = (build_beam_footprint(cands)
+                     if self.occ_min_beams else None)
         # Shed load BEFORE clustering: DBSCAN cost is what wedges the loop,
         # so nothing that can be dropped may reach it. n_cands is reconstructed
         # as the raw count in, with the two losses accounted separately.
@@ -420,7 +461,7 @@ class T2Daemon:
         dt = time.monotonic() - t0
         try:
             await self._process(key, clusters, n_jobs, n_cands, dt * 1e3,
-                                n_vetoed, n_shed)
+                                n_vetoed, n_shed, footprint=footprint)
         except Exception:
             logger.exception("processing gulp %s failed", key)
 
@@ -537,7 +578,8 @@ class T2Daemon:
 
     def _wants_trigger(self, cl: cluster.Cluster, tier: str, tags: list[str]) -> str | None:
         """Why this cluster deserves a dump, or None."""
-        if any(t in ("injection", "veto", "rfi_wide") for t in tags):
+        if any(t in ("injection", "veto", "rfi_wide")
+               or t.startswith("occupancy:") for t in tags):
             return None
         src = next((t[4:] for t in tags if t.startswith("src:")), None)
         if src is not None and cl.peak.snr >= self.source_snr_min.get(src, 11.0):
@@ -548,7 +590,9 @@ class T2Daemon:
 
     async def _process(self, key: tuple, clusters: list[cluster.Cluster],
                        n_jobs: int, n_cands: int, clustering_ms: float,
-                       n_vetoed: int = 0, n_shed: int = 0) -> None:
+                       n_vetoed: int = 0, n_shed: int = 0,
+                       footprint: tuple[list[int], list[int]] | None = None,
+                       ) -> None:
         utc_start_s, gulp = key
         utc_start = timing.parse_dada_utc(utc_start_s) if utc_start_s else None
         self._refresh_injections()
@@ -568,6 +612,11 @@ class T2Daemon:
             event_utc = (timing.samp_to_utc(cl.peak.samp, utc_start)
                          if utc_start else None)
             tier, tags = self._classify(cl, event_utc)
+            if self.occ_min_beams and footprint is not None:
+                n_occ = occupancy_beams(footprint[0], footprint[1],
+                                        cl.peak.samp, self.occ_window_samp)
+                if n_occ >= self.occ_min_beams:
+                    tags.append(f"occupancy:{n_occ}")
             reason = self._wants_trigger(cl, tier, tags)
             fast_name = (self._match_fast(cl, event_utc.timestamp())
                          if event_utc else None)
