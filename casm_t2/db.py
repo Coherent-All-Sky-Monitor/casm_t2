@@ -47,7 +47,14 @@ CREATE TABLE IF NOT EXISTS clusters (
     -- event name: YYMMDD + 6 random lowercase letters (12 chars). Legacy
     -- 10-char names from before 2026-07-31 persist. Tiered events only.
     name          TEXT,
-    created_utc   TEXT NOT NULL
+    created_utc   TEXT NOT NULL,
+    -- sky position of the peak beam from the weights live at event_utc
+    -- (casm_t2.weights_registry); NULL when no single pointing was resolvable
+    weights_id    TEXT,
+    alt_deg       REAL,
+    az_deg        REAL,
+    ra_deg        REAL,
+    dec_deg       REAL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_clusters_name ON clusters(name)
     WHERE name IS NOT NULL;
@@ -140,6 +147,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE clusters ADD COLUMN name TEXT")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_clusters_name"
                      " ON clusters(name) WHERE name IS NOT NULL")
+    for col, decl in [("weights_id", "TEXT"), ("alt_deg", "REAL"), ("az_deg", "REAL"),
+                      ("ra_deg", "REAL"), ("dec_deg", "REAL")]:
+        if cols and col not in cols:
+            conn.execute(f"ALTER TABLE clusters ADD COLUMN {col} {decl}")
     tcols = {r[1] for r in conn.execute("PRAGMA table_info(triggers)")}
     for col, decl in [("kind", "TEXT NOT NULL DEFAULT 'intensity'"),
                       ("dump_utc_start", "TEXT"), ("dump_utc_stop", "TEXT"),
@@ -165,10 +176,11 @@ def connect(path: str | Path = DEFAULT_PATH) -> sqlite3.Connection:
 
 
 def insert_clusters(conn: sqlite3.Connection,
-                    rows: list[tuple[Cluster, str, int | None, str, str, str,
-                                     str | None]]) -> list[int | None]:
+                    rows: list[tuple]) -> list[int | None]:
     """Insert clusters; each row is
-    (cluster, obs_utc_start, gulp, event_utc, tier, tags, name).
+    (cluster, obs_utc_start, gulp, event_utc, tier, tags, name[, sky])
+    where the optional ``sky`` is the dict from ``weights_registry.sky_for``
+    (weights_id/alt_deg/az_deg/ra_deg/dec_deg) or None.
 
     Returns the assigned ids in input order, with **None** for any row that
     could not be stored. Callers must tolerate the None holes.
@@ -184,18 +196,23 @@ def insert_clusters(conn: sqlite3.Connection,
     now = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
     ids: list[int | None] = []
     with conn:
-        for cl, obs, gulp, event_utc, tier, tags, name in rows:
+        for row in rows:
+            cl, obs, gulp, event_utc, tier, tags, name = row[:7]
+            sky = row[7] if len(row) > 7 and row[7] else {}
             conn.execute("SAVEPOINT cluster_row")
             try:
                 cur = conn.execute(
                     "INSERT INTO clusters (obs_utc_start, gulp, event_utc, samp, snr, dm,"
                     " dm_idx, width, beam, n_members, n_beams, beam_lo, beam_hi, dm_lo,"
-                    " dm_hi, samp_lo, samp_hi, tier, tags, name, created_utc)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " dm_hi, samp_lo, samp_hi, tier, tags, name, created_utc,"
+                    " weights_id, alt_deg, az_deg, ra_deg, dec_deg)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (obs, gulp, event_utc, cl.peak.samp, cl.peak.snr, cl.peak.dm,
                      cl.peak.dm_idx, cl.peak.width, cl.peak.beam, cl.n_members,
                      cl.n_beams, cl.beam_lo, cl.beam_hi, cl.dm_lo, cl.dm_hi,
-                     cl.samp_lo, cl.samp_hi, tier, tags, name, now))
+                     cl.samp_lo, cl.samp_hi, tier, tags, name, now,
+                     sky.get("weights_id"), sky.get("alt_deg"), sky.get("az_deg"),
+                     sky.get("ra_deg"), sky.get("dec_deg")))
             except sqlite3.IntegrityError as exc:
                 conn.execute("ROLLBACK TO cluster_row")
                 logger.error("cluster row skipped, name=%r event_utc=%s: %s",

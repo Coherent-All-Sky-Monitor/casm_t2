@@ -63,7 +63,7 @@ from pathlib import Path
 
 import yaml
 
-from casm_t2 import (beams, cluster, db, events, known_source, logsetup, policy,
+from casm_t2 import (beams, cluster, db, events, known_source, logsetup, policy, weights_registry,
                      sdnotify, timing, wire)
 from casm_t2.dump_client import request_dump_async, request_voltage_dump_async
 
@@ -310,6 +310,10 @@ class T2Daemon:
         self.context: deque[tuple[float, int, float, float, int]] = deque(maxlen=400_000)
 
         self.conn = db.connect(cfg.get("db", db.DEFAULT_PATH))
+        # Beam pointings come from the weights live at the event time
+        # (casm_t2.weights_registry); never from a static table.
+        self.registry = weights_registry.Registry(
+            cfg.get("weights_registry", weights_registry.REGISTRY_DIR))
         self.pending: dict[tuple, list[wire.Candidate]] = defaultdict(list)
         self.pending_jobs: dict[tuple, int] = {}
         # width-vetoed trials per coalescer key: filtered per batch in
@@ -636,10 +640,15 @@ class T2Daemon:
                     exclude=minted)
                 minted.add(name)
             ev_iso = event_utc.isoformat(timespec="milliseconds") if event_utc else ""
-            rows.append((cl, utc_start_s or "", gulp, ev_iso, tier, ",".join(tags), name))
+            sky = self._sky(event_utc, cl.peak.beam, radec=False)
+            rows.append((cl, utc_start_s or "", gulp, ev_iso, tier, ",".join(tags), name, sky))
             if reason is not None and event_utc is not None:
                 to_trigger.append((cl, name, event_utc, tier, reason))
 
+        if rows:
+            # one vectorised RA/Dec transform per gulp, not one per cluster
+            weights_registry.fill_radec([r[7] for r in rows],
+                                        [datetime.fromisoformat(r[3]) if r[3] else datetime.now(timezone.utc) for r in rows])
         ids = db.insert_clusters(self.conn, rows) if rows else []
         # insert_clusters returns None for any row it had to skip; those
         # clusters have no id, and a trigger for one is still recorded with a
@@ -760,6 +769,17 @@ class T2Daemon:
         return [[round(t - event_epoch, 4), b, round(dm, 3), round(snr, 2), w]
                 for t, b, dm, snr, w in sel]
 
+    def _sky(self, event_utc: datetime | None, beam: int, radec: bool = True,
+             sun: bool = False) -> dict | None:
+        """Pointing of ``beam`` from the weights live at ``event_utc``; None if unresolvable."""
+        if event_utc is None:
+            return None
+        try:
+            return self.registry.sky_for(event_utc, int(beam), radec=radec, sun=sun)
+        except Exception:
+            logger.exception("weights registry lookup failed")
+            return None
+
     async def _delayed_card(self, cl: cluster.Cluster, name: str, event_utc: datetime,
                             start_s: str, stop_s: str, loc: beams.StreamLocation,
                             reason: str) -> None:
@@ -784,6 +804,7 @@ class T2Daemon:
             "samp": c.samp,
             "n_members": n_members,
             "n_beams": n_beams,
+            "sky": self._sky(event_utc, c.beam, sun=True),
             "trigger_reason": reason,
             "dump_utc_start": start_s,
             "dump_utc_stop": stop_s,
