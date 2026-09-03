@@ -780,6 +780,15 @@ class T2Daemon:
             logger.exception("weights registry lookup failed")
             return None
 
+    def _pointings(self, event_utc: datetime | None) -> dict | None:
+        if event_utc is None:
+            return None
+        try:
+            return self.registry.pointings_for(event_utc)
+        except Exception:
+            logger.exception("weights registry pointings lookup failed")
+            return None
+
     async def _delayed_card(self, cl: cluster.Cluster, name: str, event_utc: datetime,
                             start_s: str, stop_s: str, loc: beams.StreamLocation,
                             reason: str) -> None:
@@ -805,6 +814,9 @@ class T2Daemon:
             "n_members": n_members,
             "n_beams": n_beams,
             "sky": self._sky(event_utc, c.beam, sun=True),
+            # full pointing table of the weights live at the event, so the plotter on
+            # either node can draw the footprint without reaching the registry
+            "pointings": self._pointings(event_utc),
             "trigger_reason": reason,
             "dump_utc_start": start_s,
             "dump_utc_stop": stop_s,

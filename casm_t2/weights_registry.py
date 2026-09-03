@@ -221,6 +221,13 @@ class Registry:
             return None, "partial"
         return self.product(pids.pop()), "ok"
 
+    def pointings_for(self, utc: datetime) -> dict | None:
+        """{'weights_id', 'alt_deg'[512], 'az_deg'[512]} live at utc, for self-contained cards."""
+        prod, status = self.product_at(utc)
+        if prod is None:
+            return None
+        return {"weights_id": prod["product_id"], "alt_deg": prod["alt_deg"], "az_deg": prod["az_deg"]}
+
     def sky_for(self, utc: datetime, beam: int, radec: bool = True, sun: bool = False) -> dict | None:
         """alt/az (and RA/Dec, sun) of a beam at an event time, from the weights live then.
         None when no single trustworthy pointing exists (callers store NULLs).
