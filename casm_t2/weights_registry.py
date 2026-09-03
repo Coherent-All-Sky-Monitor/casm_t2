@@ -241,9 +241,11 @@ class Registry:
             fill_radec([out], [utc])
         if sun:
             try:
-                out["sun_alt_deg"], out["sun_az_deg"] = sun_altaz(utc)
+                srcs = source_altaz(utc)
+                out["sun_alt_deg"], out["sun_az_deg"] = srcs["Sun"]
+                out["sources"] = {k: list(v) for k, v in srcs.items()}
             except Exception as exc:
-                logger.debug("sun position unavailable: %s", exc)
+                logger.debug("sun/source positions unavailable: %s", exc)
         return out
 
 
@@ -267,6 +269,28 @@ def fill_radec(skies: list[dict | None], utcs: list[datetime]) -> None:
             skies[i]["dec_deg"] = round(float(c.dec.deg[k]), 5)
     except Exception as exc:
         logger.warning("RA/Dec conversion failed, alt/az kept: %s", exc)
+
+
+# Bright calibrator sources marked on the candidate sky panel (ICRS J2000, deg).
+SKY_SOURCES = {"Cas A": (350.850, 58.815), "Cyg A": (299.868, 40.734), "Tau A": (83.633, 22.014)}
+
+
+def source_altaz(utc: datetime) -> dict[str, tuple[float, float]]:
+    """alt/az (deg) of the sun and the SKY_SOURCES at ``utc``; all of them, the
+    caller decides what to draw (below-horizon ones are not plotted)."""
+    from astropy.coordinates import AltAz, EarthLocation, SkyCoord, get_sun
+    from astropy.time import Time
+    import astropy.units as u
+    loc = EarthLocation(lat=OVRO_LAT_DEG * u.deg, lon=OVRO_LON_DEG * u.deg, height=OVRO_ALT_M * u.m)
+    t = Time(utc.astimezone(timezone.utc).replace(tzinfo=None))
+    frame = AltAz(obstime=t, location=loc)
+    out = {}
+    s = get_sun(t).transform_to(frame)
+    out["Sun"] = (round(float(s.alt.deg), 2), round(float(s.az.deg), 2))
+    for name, (ra, dec) in SKY_SOURCES.items():
+        c = SkyCoord(ra=ra * u.deg, dec=dec * u.deg).transform_to(frame)
+        out[name] = (round(float(c.alt.deg), 2), round(float(c.az.deg), 2))
+    return out
 
 
 def sun_altaz(utc: datetime) -> tuple[float, float]:
