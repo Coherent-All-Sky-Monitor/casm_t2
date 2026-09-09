@@ -115,6 +115,25 @@ minute later is tagged `injection`, and no dump fires:
 
     t2-inject config/t2d.yaml --once
 
+Force one shot's parameters:
+
+    t2-inject config/t2d.yaml --once --beam 90 --dm 300 \
+        --fwhm-ms 11.8 --target-snr 25
+
+`--fwhm-ms` is the width argument. `--sigma-ms` still works and is
+converted (FWHM = 2.355 sigma), but it logs a deprecation line.
+`--target-snr` is still clamped to `injection.target_rec_snr_max`; a test
+shot is not a reason to blind the search for a gulp.
+
+The narrowest pulse that can be injected is **FWHM 2.47 ms**. That is not a
+policy choice: `make_noise_fil_with_frb_snr.py` renders with
+`sigma_samp = max(1.0, ...)` and offers no argument to lower it, so a
+narrower request silently comes out at one sample of sigma. Reachable
+trials are therefore ibox 1 to 5; ibox 0 cannot be targeted (it shares a
+1.0 ms kernel FWHM with ibox 1 in any case), and ibox 6 is vetoed by t2d.
+If narrow-end coverage matters, the fix is an argument in that script, not
+a config change here.
+
 ### Injection messages in Slack
 
 The daemon can post one Slack message per injection: a "sent" line when
@@ -146,12 +165,36 @@ Before enabling it, render the messages offline — no token, no network:
 
 That writes, per shot, the sent text, the outcome text and a PNG card of
 each (the colour bar is the attachment colour Slack would show), plus the
-daily summary text and three figures: recovered vs target S/N against the
+daily summary text and three figures: recovered vs expected S/N against the
 1:1 line with misses hollow at zero, outcome counts, and DM error against
-recovered width. With no `--ids` it takes a whole UTC day (`--day`).
+the recovered kernel FWHM. With no `--ids` it takes a whole UTC day
+(`--day`).
+
+The messages are deliberately short:
+
+    injection 661 sent: beam 90 (stream 1), DM 300, FWHM 11.8 ms,
+        amp 8 counts, expected S/N 25
+    recovered: S/N 35.5, DM 299.8, width 11.5 ms (ibox 4)
+
+The recovered width is the kernel FWHM for that trial, not `2**ibox`
+samples. The expected S/N is the reported S/N the solver aimed at, which is
+known at fire time from the live beam std; a legacy row fired in the fixed
+`amp_range` mode has no target, so its expectation is estimated from
+`est_snr` and shown with a tilde ("expected S/N ~407").
+
+A shot that resolves badly says only which stage lost it:
+
+    NOT recovered: not detected by hella (T1)
+    NOT recovered: dropped by T2 clustering
+    NOT recovered: dropped by T2 filter criteria
+    injection not fired: FIFO write failed
+
+The last is injector plumbing, not a pipeline miss: it gets a grey bar
+rather than a red one and never counts toward a miss streak.
 
 Rows written before these columns existed have no `target_snr`, so their
-preview shows `n/a` and they do not appear in the S/N figure.
+preview shows an estimated expectation with a tilde and they do not appear
+in the S/N figure.
 
 ## Voltage dumps (manual)
 

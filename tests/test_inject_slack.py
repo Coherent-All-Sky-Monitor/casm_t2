@@ -9,7 +9,7 @@ import sqlite3
 
 import pytest
 
-from casm_t2 import db, inject_outcome as oc, inject_slack
+from casm_t2 import db, inject_calib, inject_outcome as oc, inject_slack
 
 
 # --- schema migration -------------------------------------------------------
@@ -43,6 +43,9 @@ def test_migration_is_idempotent_and_keeps_rows(tmp_path):
     conn = db.connect(path)
     cols = {r[1] for r in conn.execute("PRAGMA table_info(injections)")}
     assert new_cols <= cols
+    # sigma_ms stays: the ledger keeps the Gaussian sigma even though every
+    # user-facing number is now FWHM.
+    assert "sigma_ms" in cols
     conn.close()
 
     # Second connect must be a no-op, not a duplicate-column error.
@@ -77,13 +80,15 @@ def test_every_outcome_has_an_explanation():
 
 # --- message text -----------------------------------------------------------
 
+# Modelled on id 661: sigma 5 ms in the ledger is FWHM 11.8 ms, and the
+# matched trial ibox 4 has a kernel FWHM of 11.5 ms.
 RECOVERED_ROW = {
-    "id": 659, "inject_utc": "2026-09-09T04:58:50.327+00:00", "stream": 0,
-    "beam": 40, "dm": 150.0, "amp": 5.0, "sigma_ms": 5.0, "est_snr": 19.821,
-    "target_snr": 20.0, "sigma_n": 41.3, "nchan_usable": 2600,
-    "gate_t1": 1, "gate_t2": 1, "gate_trigger": 1, "rec_snr": 25.8361,
-    "rec_dm": 150.298, "rec_width": 3, "rec_beam": 41, "rec_samp": 12345,
-    "rec_lead_s": -12.5, "outcome": oc.RECOVERED, "fail_reason": None,
+    "id": 661, "inject_utc": "2026-09-09T22:17:55.642+00:00", "stream": 1,
+    "beam": 90, "dm": 300.0, "amp": 8.0, "sigma_ms": 5.0, "est_snr": 19.662,
+    "target_snr": 25.0, "sigma_n": 62.39, "nchan_usable": 2600,
+    "gate_t1": 1, "gate_t2": 1, "gate_trigger": 1, "rec_snr": 35.5246,
+    "rec_dm": 299.818, "rec_width": 4, "rec_beam": 90, "rec_samp": 12345,
+    "rec_lead_s": -19.32, "outcome": oc.RECOVERED, "fail_reason": None,
 }
 
 MISSED_ROW = {
@@ -94,47 +99,97 @@ MISSED_ROW = {
     "rec_dm": None, "outcome": oc.MISSED_T1, "fail_reason": "t1_no_detection",
 }
 
+NBSP = inject_slack.NBSP
 
-def test_sent_text_recovered_row():
+
+def test_sent_text_is_the_short_form():
     text = inject_slack.sent_text(RECOVERED_ROW)
-    assert text.startswith("injection sent: `659`")
-    assert "beam 40 (stream 0)" in text
-    assert "DM 150.0 pc/cc" in text
-    # FWHM = 2.355 sigma
-    assert "sigma 5.0 ms (FWHM 11.8 ms)" in text
-    assert "amp 5 counts" in text
-    assert "live std 41.30" in text
-    assert "target reported S/N 20.0" in text
+    assert text.split("\n")[0] == (
+        f"injection 661 sent: beam 90 (stream 1), DM 300, "
+        f"FWHM 11.8{NBSP}ms, amp 8{NBSP}counts, expected S/N 25")
     assert text.endswith("_awaiting recovery..._")
+    # sigma and the live std are deliberately gone from user-facing text
+    assert "sigma" not in text
+    assert "std" not in text
 
 
-def test_sent_text_tolerates_missing_solver_fields():
+def test_expected_snr_falls_back_to_est_snr_with_a_tilde():
+    """Legacy amp_range rows have no target_snr: scale est_snr by the ratio."""
     text = inject_slack.sent_text(MISSED_ROW)
-    assert "live std n/a" in text
-    assert "target reported S/N n/a" in text
+    # est_snr 333.7 at FWHM 23.44 ms -> ratio 1.22 -> ~407
+    ratio = inject_calib.rec_per_true(9.955 * 2.355)
+    assert f"expected S/N ~{333.7 * ratio:.0f}" in text
+    snr, approx = inject_slack.expected_snr(MISSED_ROW)
+    assert approx is True and snr == pytest.approx(333.7 * ratio)
 
 
-def test_outcome_text_recovered():
+def test_expected_snr_is_the_target_when_the_solver_set_one():
+    snr, approx = inject_slack.expected_snr(RECOVERED_ROW)
+    assert snr == 25.0 and approx is False
+
+
+def test_no_slack_text_says_target():
+    for text in (inject_slack.sent_text(RECOVERED_ROW),
+                 inject_slack.summary_text([RECOVERED_ROW], "2026-09-09")):
+        assert "target" not in text.lower()
+
+
+def test_sent_text_says_n_a_with_nothing_to_go_on():
+    assert "expected S/N n/a" in inject_slack.sent_text(
+        {"id": 1, "beam": 4, "stream": 0, "dm": 100.0, "amp": 5.0,
+         "sigma_ms": 5.0})
+
+
+def test_injected_fwhm_is_2355_sigma():
+    assert inject_slack.injected_fwhm_ms(RECOVERED_ROW) == pytest.approx(11.775)
+    assert inject_slack.injected_fwhm_ms({"sigma_ms": None}) is None
+
+
+def test_outcome_text_recovered_uses_the_kernel_fwhm():
     text = inject_slack.outcome_text(RECOVERED_ROW)
-    assert text.startswith("recovered: S/N 25.8 at DM 150.3 (delta +0.3)")
-    # ibox 3 -> 8 samples -> 8 * 1.048576 = 8.4 ms
-    assert "width 2^3 = 8 samp = 8.4 ms" in text
-    assert "beam 41 (+1)" in text
-    assert "ratio reported/target 1.29" in text
-    assert "lead -12.5 s" in text
+    # ibox 4 is a 16-sample trial, but the kernel that matched is 11 samples
+    # wide: 11.5 ms, not 16.8 ms.
+    assert text == (f"recovered: S/N 35.5, DM 299.8, "
+                    f"width 11.5{NBSP}ms (ibox 4)")
     assert inject_slack.outcome_color(RECOVERED_ROW) == inject_slack.COLOR_RECOVERED
 
 
-def test_width_conversion():
-    assert inject_slack.width_ms(0) == (1, pytest.approx(1.048576))
-    assert inject_slack.width_ms(5) == (32, pytest.approx(33.554432))
+def test_outcome_text_carries_nothing_else():
+    text = inject_slack.outcome_text(RECOVERED_ROW)
+    for word in ("lead", "ratio", "beam", "samp", "delta"):
+        assert word not in text
 
 
 def test_outcome_text_missed():
     text = inject_slack.outcome_text(MISSED_ROW)
-    assert text.startswith("NOT recovered: ")
-    assert oc.EXPLANATIONS[oc.MISSED_T1] in text
+    assert text == "NOT recovered: not detected by hella (T1)"
     assert inject_slack.outcome_color(MISSED_ROW) == inject_slack.COLOR_MISSED
+
+
+@pytest.mark.parametrize("outcome,expect", [
+    (oc.MISSED_T1, "NOT recovered: not detected by hella (T1)"),
+    (oc.MISSED_T2, "NOT recovered: dropped by T2 clustering"),
+    (oc.MISSED_TRIGGER, "NOT recovered: dropped by T2 filter criteria"),
+])
+def test_miss_lines_are_short_and_name_only_the_stage(outcome, expect):
+    text = inject_slack.outcome_text(dict(MISSED_ROW, outcome=outcome))
+    assert text == expect
+    # no mechanism, no tier names, no parentheticals beyond "(T1)"
+    for word in ("tier", "DM floor", "beam veto", "coincid", "window"):
+        assert word not in text
+
+
+def test_fire_failed_is_not_phrased_as_a_miss():
+    row = dict(MISSED_ROW, outcome=oc.FIRE_FAILED,
+               fail_reason="fifo_write_failed:[Errno 6] No such device")
+    assert inject_slack.outcome_text(row) == (
+        "injection not fired: FIFO write failed")
+    assert inject_slack.outcome_color(row) == inject_slack.COLOR_NEUTRAL
+
+
+def test_streak_uses_the_same_short_phrase():
+    text = inject_slack.streak_text(5, [656], oc.MISSED_TRIGGER)
+    assert text.endswith("latest loss stage: dropped by T2 filter criteria")
 
 
 def test_streak_and_summary_text():
@@ -145,7 +200,7 @@ def test_streak_and_summary_text():
     text = inject_slack.summary_text([RECOVERED_ROW, MISSED_ROW], "2026-09-09")
     assert "2 injected, 1 recovered" in text
     assert "1 missed_t1" in text
-    assert "median 1.29" in text
+    assert "reported/expected S/N: median 1.42" in text   # 35.5246 / 25.0
 
 
 # --- figures ----------------------------------------------------------------
@@ -195,9 +250,9 @@ def test_dry_run_writes_files_and_never_posts(tmp_path, no_network):
     # The numeric prefix keeps the files in posting order.
     names = sorted(p.name for p in out.glob("*.txt"))
     assert [n.split("_", 1)[1] for n in names] == [
-        "sent_659.txt", "outcome_659.txt", "streak_5.txt",
+        "sent_661.txt", "outcome_661.txt", "streak_5.txt",
         "summary_2026-09-09.txt"]
-    assert "recovered: S/N 25.8" in (out / names[1]).read_text()
+    assert "recovered: S/N 35.5" in (out / names[1]).read_text()
     assert (out / "snr_recovery.png").is_file()
 
 

@@ -60,6 +60,13 @@ a UTC slice), `t2-inject` / `t2-inject-report` (live injections and the
 daily recovery report), `t2-inject-slack-preview`, and
 `t2-transit-schedule`.
 
+Injected widths are FWHM, drawn log-uniformly so hella's power-of-two
+boxcar trials get exercised evenly, and the amplitude is solved per shot
+from a target *reported* S/N so that target is independent of width.
+Recovered widths are quoted as the FWHM of hella's smoothing kernel
+(`casm_t2.hella_kernel`), which is about two thirds of the `2**ibox` trial
+label.
+
 The injection daemon can post one Slack message per shot, edited in place
 with the outcome when reconciliation finishes. It ships disabled
 (`injection.slack.enabled: false`); `t2-inject-slack-preview` renders the

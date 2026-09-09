@@ -28,7 +28,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
-from casm_t2 import inject_outcome as oc
+from casm_t2 import hella_kernel, inject_calib, inject_outcome as oc
 
 logger = logging.getLogger("t2.inject.slack")
 
@@ -39,9 +39,9 @@ CHANNEL_OVERRIDE_PATH = Path.home() / ".config" / "slack_channel_injections"
 _SLACK_API = "https://slack.com/api"
 _TIMEOUT_S = 15.0
 
-#: Sample interval in ms. Boxcar widths are reported by hella as ibox =
-#: log2(boxcar length in samples), so a width of 3 is 8 samples = 8.4 ms.
-TSAMP_MS = 1.048576
+#: FWHM = 2.355 sigma. The ledger keeps the Gaussian sigma for backward
+#: compatibility; every message and axis label is FWHM.
+FWHM_PER_SIGMA = 2.355
 
 NBSP = " "
 
@@ -104,78 +104,96 @@ def dm_bucket(dm: float | None):
     return DM_BUCKETS[-1][1:]
 
 
-def width_ms(ibox) -> tuple[int, float]:
-    """(boxcar samples, boxcar ms) for a hella ibox (log2 samples)."""
-    nsamp = 2 ** int(ibox)
-    return nsamp, nsamp * TSAMP_MS
-
-
 # ---------------------------------------------------------------------------
 # message text
 # ---------------------------------------------------------------------------
 
-def sent_text(row) -> str:
+def injected_fwhm_ms(row) -> float | None:
+    """The injected width as FWHM. The ledger stores the Gaussian sigma."""
+    sigma = _f(row, "sigma_ms")
+    return None if sigma is None else sigma * FWHM_PER_SIGMA
+
+
+def expected_snr(row, icfg: dict | None = None) -> tuple[float | None, bool]:
+    """The S/N this shot is expected to be reported at, and whether it is a guess.
+
+    Known at fire time: the solver picked the amplitude from the live beam
+    std so that hella would report `target_snr`, so that number IS the
+    expectation. Legacy rows fired in the fixed-amplitude `amp_range` mode
+    have no target; for those, scale the generator's own true-S/N estimate
+    by the measured reported/true ratio for that width and mark it a guess.
+    (`est_snr` may come from the generator's numerical matched filter rather
+    than the analytical one the ratio is defined against; they agree to a
+    few percent above FWHM 5 ms, which is well inside a "~".)
+    """
+    target = _f(row, "target_snr")
+    if target is not None:
+        return target, False
+    est = _f(row, "est_snr")
+    fwhm = injected_fwhm_ms(row)
+    if est is None or fwhm is None:
+        return None, True
+    return est * inject_calib.rec_per_true(fwhm, icfg), True
+
+
+def sent_text(row, icfg: dict | None = None) -> str:
     """The message posted the moment the injection hits the FIFO.
 
-    Non-breaking spaces join every number to its unit so Slack's wrapping
-    can never split "5.0 ms" across two lines.
+    Deliberately short: id, where, and the three numbers that describe the
+    shot. Non-breaking spaces join every number to its unit so Slack's
+    wrapping can never split "11.8 ms" across two lines.
     """
-    sigma = _f(row, "sigma_ms")
-    fwhm = sigma * 2.355 if sigma is not None else None
-    target = _f(row, "target_snr")
-    sigma_n = _f(row, "sigma_n")
-    parts = [
-        f"injection sent: `{_g(row, 'id', '?')}`",
+    fwhm = injected_fwhm_ms(row)
+    snr, approx = expected_snr(row, icfg)
+    bits = [
         f"beam {_g(row, 'beam', '?')} (stream {_g(row, 'stream', '?')})",
-        f"DM {_f(row, 'dm') or 0:.1f}{NBSP}pc/cc",
-        (f"sigma {sigma:.1f}{NBSP}ms (FWHM {fwhm:.1f}{NBSP}ms)"
-         if sigma is not None else "sigma n/a"),
+        f"DM {_f(row, 'dm') or 0:.0f}",
+        f"FWHM {fwhm:.1f}{NBSP}ms" if fwhm is not None else "FWHM n/a",
         f"amp {_f(row, 'amp') or 0:.0f}{NBSP}counts",
-        (f"live std {sigma_n:.2f}" if sigma_n is not None else "live std n/a"),
-        (f"target reported S/N {target:.1f}" if target is not None
-         else "target reported S/N n/a"),
+        (f"expected S/N {'~' if approx else ''}{snr:.0f}" if snr is not None
+         else "expected S/N n/a"),
     ]
-    return " | ".join(parts) + "\n_awaiting recovery..._"
+    return (f"injection {_g(row, 'id', '?')} sent: " + ", ".join(bits)
+            + "\n_awaiting recovery..._")
 
 
 def outcome_text(row) -> str:
-    """One line describing how the shot resolved."""
+    """One line describing how the shot resolved.
+
+    The recovered width is the FWHM of hella's smoothing kernel for the
+    matched trial, not 2**ibox samples: the kernel is about 0.67 of the
+    trial label wide, so the raw label overstates the pulse by half.
+    """
     outcome = _g(row, "outcome")
+    if outcome == oc.FIRE_FAILED:
+        # Not a pipeline miss: the pulse never reached the stream.
+        return "injection not fired: " + oc.short_fire_reason(
+            _g(row, "fail_reason"))
     if outcome != oc.RECOVERED:
         return "NOT recovered: " + oc.explain(outcome)
 
     rec_snr = _f(row, "rec_snr")
     rec_dm = _f(row, "rec_dm")
-    dm = _f(row, "dm")
-    target = _f(row, "target_snr")
-    lead = _f(row, "rec_lead_s")
     ibox = _g(row, "rec_width")
-    beam = _g(row, "rec_beam")
-    inj_beam = _g(row, "beam")
 
     bits = [f"recovered: S/N {rec_snr:.1f}" if rec_snr is not None
             else "recovered: S/N n/a"]
     if rec_dm is not None:
-        delta = f" (delta {rec_dm - dm:+.1f})" if dm is not None else ""
-        bits[0] += f" at DM {rec_dm:.1f}{delta}"
+        bits.append(f"DM {rec_dm:.1f}")
     if ibox is not None:
-        nsamp, ms = width_ms(ibox)
-        bits.append(f"width 2^{int(ibox)} = {nsamp}{NBSP}samp = {ms:.1f}{NBSP}ms")
-    if beam is not None:
-        dbeam = (f" ({int(beam) - int(inj_beam):+d})"
-                 if inj_beam is not None else "")
-        bits.append(f"beam {int(beam)}{dbeam}")
-    if rec_snr is not None and target:
-        bits.append(f"ratio reported/target {rec_snr / target:.2f}")
-    if lead is not None:
-        bits.append(f"lead {lead:+.1f}{NBSP}s")
-    return " | ".join(bits)
+        bits.append(f"width {hella_kernel.kernel_fwhm_ms(int(ibox)):.1f}"
+                    f"{NBSP}ms (ibox {int(ibox)})")
+    return ", ".join(bits)
 
 
 def outcome_color(row) -> str:
-    """Attachment colour for the resolved message: green on, red off."""
-    return (COLOR_RECOVERED if _g(row, "outcome") == oc.RECOVERED
-            else COLOR_MISSED)
+    """Attachment colour: green recovered, grey never fired, red missed."""
+    outcome = _g(row, "outcome")
+    if outcome == oc.RECOVERED:
+        return COLOR_RECOVERED
+    if outcome == oc.FIRE_FAILED:
+        return COLOR_NEUTRAL
+    return COLOR_MISSED
 
 
 def streak_text(n: int, ids, why: str | None) -> str:
@@ -224,7 +242,7 @@ def summary_text(rows, day: str) -> str:
         and _f(r, "target_snr"))
     if ratios:
         med = ratios[len(ratios) // 2]
-        lines.append(f"reported/target S/N: median {med:.2f} "
+        lines.append(f"reported/expected S/N: median {med:.2f} "
                      f"(range {ratios[0]:.2f}-{ratios[-1]:.2f})")
     return "\n".join(lines)
 
@@ -309,7 +327,7 @@ def render_summary_figures(rows, out_dir) -> list[Path]:  # noqa: C901
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
 
-            # Figure 1: recovered vs target S/N against the 1:1 line. A miss
+            # Figure 1: recovered vs expected S/N against the 1:1 line. A miss
             # is the same DM marker, hollow, parked at recovered S/N = 0.
             fig = Figure(figsize=(6.3, 5.2))
             ax = fig.add_subplot(111)
@@ -343,12 +361,12 @@ def render_summary_figures(rows, out_dir) -> list[Path]:  # noqa: C901
             if not plotted:
                 # Shots taken before the solver recorded its target have no
                 # x coordinate. Say so rather than show a blank panel.
-                ax.annotate("no shots with a recorded target S/N",
+                ax.annotate("no shots with a recorded expected S/N",
                             (0.5, 0.5), xycoords="axes fraction", ha="center",
                             va="center", fontsize=11, color=COLOR_NEUTRAL)
             ax.set_xlim(lo, hi)
             ax.set_ylim(-1.0, hi)
-            ax.set_xlabel("target reported S/N")
+            ax.set_xlabel("expected S/N")
             ax.set_ylabel("recovered S/N")
             ax.set_title("Injection recovery", fontsize=11.5, color=_INK,
                          loc="left", pad=10)
@@ -389,9 +407,10 @@ def render_summary_figures(rows, out_dir) -> list[Path]:  # noqa: C901
                          pad=10)
             _save(fig, "outcomes.png")
 
-            # Figure 3: DM error against the recovered boxcar width. A wide
-            # boxcar smears the pulse, so DM error growing with width is the
-            # expected shape; anything else is a search-grid problem.
+            # Figure 3: DM error against the recovered width, as the FWHM of
+            # hella's smoothing kernel for the matched trial. A wider kernel
+            # smears the pulse, so DM error growing with width is the expected
+            # shape; anything else is a search-grid problem.
             fig = Figure(figsize=(6.6, 4.9))
             ax = fig.add_subplot(111)
             for r in rows:
@@ -399,12 +418,12 @@ def render_summary_figures(rows, out_dir) -> list[Path]:  # noqa: C901
                 if rdm is None or dm is None or ibox is None:
                     continue
                 _lab, fill, marker, edge = dm_bucket(dm)
-                ax.scatter([width_ms(ibox)[1]], [rdm - dm], s=70, marker=marker,
-                           facecolor=fill, edgecolor=edge, linewidth=0.9,
-                           alpha=0.9, zorder=3)
+                ax.scatter([hella_kernel.kernel_fwhm_ms(int(ibox))], [rdm - dm],
+                           s=70, marker=marker, facecolor=fill, edgecolor=edge,
+                           linewidth=0.9, alpha=0.9, zorder=3)
             ax.axhline(0.0, color=COLOR_NEUTRAL, lw=0.8, alpha=0.7, zorder=1)
             ax.set_xscale("log")
-            ax.set_xlabel(r"recovered width $2^{\mathrm{ibox}}$ [ms]")
+            ax.set_xlabel("recovered width, kernel FWHM [ms]")
             ax.set_ylabel("DM error (recovered $-$ injected) [pc cm$^{-3}$]")
             ax.set_title("DM accuracy against recovered width", fontsize=11.5,
                          color=_INK, loc="left", pad=10)
@@ -476,12 +495,16 @@ class SlackPoster:
     """
 
     def __init__(self, enabled: bool = False, dry_run_dir=None,
-                 channel: str | None = None, streak_every: int = 5):
+                 channel: str | None = None, streak_every: int = 5,
+                 icfg: dict | None = None):
         self.enabled = bool(enabled)
         self.dry_run_dir = Path(dry_run_dir) if dry_run_dir else None
         self.dry_run = self.dry_run_dir is not None
         self.channel = channel
         self.streak_every = int(streak_every)
+        # the `injection` config block, so the expected S/N in a sent message
+        # uses the same rec_per_true table the solver used
+        self.icfg = icfg
         self._seq = 0
 
     # ----- dry run ---------------------------------------------------------
@@ -603,7 +626,7 @@ class SlackPoster:
         """Post the "injection sent" message; returns its ts for the ledger."""
         if not self.enabled:
             return None
-        text = sent_text(row)
+        text = sent_text(row, self.icfg)
         if self.dry_run:
             return self._dry_write(f"sent_{_g(row, 'id', 'x')}", text)
         return self._post(text)
@@ -620,7 +643,8 @@ class SlackPoster:
         attachment = {"color": color, "text": line, "fallback": line}
         ts = _g(row, "slack_ts")
         if ts:
-            got = self._update(ts, sent_text(row), attachments=[attachment])
+            got = self._update(ts, sent_text(row, self.icfg),
+                               attachments=[attachment])
             if got:
                 return got
             logger.warning("slack edit of injection %s failed; posting fresh",
@@ -693,7 +717,8 @@ def poster_from_cfg(icfg: dict) -> SlackPoster:
     return SlackPoster(enabled=bool(scfg.get("enabled", False)),
                        dry_run_dir=scfg.get("dry_run_dir"),
                        channel=scfg.get("channel"),
-                       streak_every=int(scfg.get("streak_every", 5)))
+                       streak_every=int(scfg.get("streak_every", 5)),
+                       icfg=icfg)
 
 
 def utc_day(when: datetime | None = None) -> str:

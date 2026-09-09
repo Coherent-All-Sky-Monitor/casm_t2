@@ -31,24 +31,27 @@ ALL = (RECOVERED, MISSED_T1, MISSED_T2, MISSED_TRIGGER, FIRE_FAILED)
 #: Set by the daemon on a shot that never reached the stream.
 FIRE_FAILED_PREFIXES = ("fifo_write_failed", "file_generation_failed")
 
+#: Short, plain phrases. These are read at a skim in Slack, so they name the
+#: stage that lost the shot and nothing else - no mechanism, no tier names.
+#: The detail is already in the ledger (`fail_reason`, the gate columns).
 EXPLANATIONS = {
-    MISSED_T1: (
-        "lost at T1: hella reported no candidate in the reconcile window "
-        "matching the injected beam and DM"
-    ),
-    MISSED_T2: (
-        "lost at T2: candidates arrived but nothing clustered into an event "
-        "at the injected beam and DM"
-    ),
-    MISSED_TRIGGER: (
-        "clustered but below the trigger filters (S/N tier, DM floor, beam "
-        "count or beam veto) - it would not have produced a dump"
-    ),
-    FIRE_FAILED: (
-        "the injection never reached the stream: file generation or the FIFO "
-        "write failed, so this is an injector fault, not a pipeline miss"
-    ),
+    MISSED_T1: "not detected by hella (T1)",
+    MISSED_T2: "dropped by T2 clustering",
+    MISSED_TRIGGER: "dropped by T2 filter criteria",
+    FIRE_FAILED: "injection not fired",
 }
+
+#: `fail_reason` prefixes turned into a few words for the fire_failed line.
+FIRE_FAILED_REASONS = {
+    "fifo_write_failed": "FIFO write failed",
+    "file_generation_failed": "file generation failed",
+}
+
+
+def short_fire_reason(fail_reason: str | None) -> str:
+    """A few words for why a shot never reached the stream."""
+    head = str(fail_reason or "").split(":", 1)[0]
+    return FIRE_FAILED_REASONS.get(head, head or "unknown")
 
 
 def classify(gate_t1, gate_t2, gate_trigger,

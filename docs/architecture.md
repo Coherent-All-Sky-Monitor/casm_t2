@@ -267,13 +267,73 @@ match is probably not the injection.
 (`casm_t2.inject_outcome`) is the closed set that anything counting over
 injections uses, so a new failure string cannot invent a category:
 
-| outcome | when |
-| --- | --- |
-| recovered | all three gates passed |
-| missed_t1 | no cluster in the reconcile window at that beam and DM |
-| missed_t2 | candidates arrived but nothing clustered |
-| missed_trigger | clustered, but the trigger filters would have refused it |
-| fire_failed | the shot never reached the stream (file or FIFO failure) |
+| outcome | when | phrase in Slack |
+| --- | --- | --- |
+| recovered | all three gates passed | recovered |
+| missed_t1 | no cluster in the reconcile window at that beam and DM | not detected by hella (T1) |
+| missed_t2 | candidates arrived but nothing clustered | dropped by T2 clustering |
+| missed_trigger | clustered, but the trigger filters would have refused it | dropped by T2 filter criteria |
+| fire_failed | the shot never reached the stream (file or FIFO failure) | injection not fired: \<reason\> |
+
+The Slack phrases name the stage and stop there. Which filter refused a
+`missed_trigger`, and which gate a shot died at, stay in `fail_reason` and
+the gate columns, where an audit can read them.
 
 `fire_failed` is injector plumbing, not a sensitivity result, and is
 excluded from miss counts and streaks.
+
+### Width
+
+Widths are FWHM everywhere a human reads them. The ledger column is still
+`sigma_ms` (Gaussian sigma, FWHM/2.355) so old rows and old queries keep
+working, and the generator takes a sigma, but nothing else does.
+
+`fwhm_ms_range` is sampled log-uniformly, because the search trials are
+spaced in powers of two: a uniform draw would pile two thirds of the shots
+onto the two widest trials.
+
+Recovered widths are **not** `2**ibox` samples. hella smooths with a
+Gaussian-ish kernel (`smooth.cpp` lines 47-55), and that kernel's FWHM is
+about 0.67 of the trial label — 11.5 ms at ibox 4, not 16.8 ms. Quoting the
+label overstates the pulse by half, so `casm_t2.hella_kernel.kernel_fwhm_ms`
+computes the real thing from the same polynomial:
+
+| ibox | trial | kernel FWHM | equivalent boxcar |
+| --- | --- | --- | --- |
+| 0 | 1 samp | 1.0 ms | 1.1 ms |
+| 1 | 2 samp | 1.0 ms | 1.8 ms |
+| 2 | 4 samp | 3.1 ms | 3.9 ms |
+| 3 | 8 samp | 5.2 ms | 7.9 ms |
+| 4 | 16 samp | 11.5 ms | 15.7 ms |
+| 5 | 32 samp | 22.0 ms | 31.4 ms |
+| 6 | 64 samp | 45.1 ms | 62.7 ms |
+
+ibox 6 is dropped by t2d's width veto, so 30 ms is the sampling ceiling: it
+still sits nearest ibox 5.
+
+### Amplitude
+
+The amplitude is solved per shot so that the *reported* S/N is the thing
+being controlled, and does not drift with width:
+
+    amp = target_reported / rec_per_true(FWHM) * sigma_n
+          / (sqrt(nchan_usable) * sqrt(sigma_t * sqrt(pi)))
+
+The right-hand factor is the analytical Gaussian matched filter. It agrees
+with the offline injector's numerically computed matched filter
+(`casm_offline_frb_injector.SNRCalibrator`) to 1-3% above FWHM 4.7 ms, and
+runs about 10% high at 2.5 ms, so the formula is not where the error is.
+
+`rec_per_true` is hella's reported S/N divided by that analytical value, and
+it is a function of width, not a constant: hella's matched trial is the
+smoothing kernel above, over rows normalised to unit variance, so the ratio
+falls as the pulse widens (2.24 at FWHM 4.7 ms, 2.08 at 11.8, 1.22 at 23.5,
+measured 2026-09-09 with T1 subtraction off). `rec_per_true_table` holds
+those pairs and the daemon interpolates linearly in log FWHM, holding the
+end values flat.
+
+`target_rec_snr_max` caps the requested reported S/N, including a CLI
+`--target-snr`. Above about 45 reported, the injected pulse fills hella's
+10000-peak per-gulp candidate buffer and the gulp is no longer searched over
+the whole beam set (2026-09-09: reported 78 left 31/64 beams searched,
+reported 132 left 43/64; reported 43 left the gulp intact).

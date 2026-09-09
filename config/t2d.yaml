@@ -201,21 +201,38 @@ injection:
   # only if target_rec_snr_range is absent; its 25-45 counts predate Route Z
   # and would now give S/N of several hundred (casm-wiki injection-saturation.md).
   target_rec_snr_range: [18.0, 30.0]
-  # hella-reported / the injector's own matched-filter estimate. 1.30 from the
-  # ONE clean live shot (id 659, sigma 5 ms); id 657 gives 1.44 but its estimate
-  # used a noise read 1.2x lower than the solver's. Offline the same ratio is a
-  # flat 1.08 for FWHM 2-25 ms (casm-wiki injection-calibration.md width table).
+  # HARD CAP on the reported S/N, applied to --target-snr as well. Above about
+  # 45 reported, the injected pulse fills hella's 10000-peak per-gulp candidate
+  # buffer and the gulp stops being searched over the whole beam set: the
+  # 2026-09-09 shots reported 78 (id 663, 31/64 beams searched) and 132
+  # (id 664, 43/64). Reported 43 and below left the gulp intact.
+  target_rec_snr_max: 40.0
+  # hella-reported S/N / the ANALYTICAL matched-filter S/N the solver computes.
+  # Not a constant: hella's matched trial is a smoothing kernel of FWHM about
+  # 0.67 * 2**ibox samples over unit-variance rows, so the ratio falls as the
+  # pulse widens. Measured 2026-09-09 with the T1 subtraction OFF:
+  #   FWHM  4.7 ms -> 2.24                       (id 660)
+  #   FWHM 11.8 ms -> 1.85, 2.25, 2.15 -> 2.08   (ids 661, 663, 664)
+  #   FWHM 23.5 ms -> 1.22                       (id 662)
+  # Interpolated linearly in log FWHM, held flat outside the range. The two
+  # subtraction-ON shots the same day (657, 659, both FWHM 11.8 ms) gave 1.44
+  # and 1.30 instead; do not mix them into this table while subtraction is off.
+  rec_per_true_table:
+    - [4.7, 2.24]
+    - [11.8, 2.08]
+    - [23.5, 1.22]
+  # Fallback when rec_per_true_table is absent; the pre-table scalar.
   rec_per_true: 1.30
   nchan_usable: 2600            # 3072 minus the 472-channel 470-484 MHz mask
   amp_range: [25.0, 45.0]
-  # sigma is the Gaussian std; FWHM = 2.355 sigma. The cap is about PREDICTING
-  # the reported S/N, not about recovery: hella recovers to FWHM 148 ms, but
-  # the estimate-to-reported ratio is flat at 1.08 only to FWHM 25 ms
-  # (sigma 10.7) and then runs to 1.23, 1.63, 2.72. Wider injections need the
-  # per-width ratio from casm-wiki injection-calibration.md, not this constant.
-  # Also keep the rendered peak at 5 counts or more: the fil is u8, and 3
-  # counts gives 3 levels across the pulse (about 20% of the S/N).
-  sigma_ms_range: [1.0, 10.0]
+  # Injected width as FWHM, sampled LOG-uniformly so the powers-of-two trials
+  # are exercised evenly. Aim: hella trials ibox 0-5 (kernel FWHM 1.0, 1.0,
+  # 3.1, 5.2, 11.5, 22.0 ms; casm_t2.hella_kernel). ibox 6 (45.1 ms) is dropped
+  # by t2d's width veto, so 30 ms is the ceiling: it still sits nearest ibox 5.
+  # The floor is NOT a choice: make_noise_fil_with_frb_snr floors the rendered
+  # pulse at sigma = 1 sample with no argument to lower it, so nothing narrower
+  # than FWHM 2.469 ms can be generated and ibox 0 is out of reach.
+  fwhm_ms_range: [2.5, 30.0]
   scratch_dir: /mnt/nvme5/casm_pipeline/injections
   # Slack posting for injections. SHIPS DISABLED: with enabled false the
   # daemon posts nothing and behaves exactly as it did before. Set
