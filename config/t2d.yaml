@@ -137,8 +137,18 @@ injection:
   cadence_min: 120
   streams: [0, 1, 2, 3]
   dm_range: [100.0, 1000.0]
+  # 2026-09-09: amplitude is solved per shot from a target hella-reported S/N
+  # and the live beam std (Redis bf_proc_stat). amp_range is the fallback used
+  # only if target_rec_snr_range is absent; its 25-45 counts predate Route Z
+  # and would now give S/N of several hundred (casm-wiki injection-saturation.md).
+  target_rec_snr_range: [18.0, 30.0]
+  rec_per_true: 1.5             # hella reported / analytical true, 5 ms shots 657/659: 1.72, 1.29
+  nchan_usable: 2880            # 3072 minus the 192-channel DTV mask
   amp_range: [25.0, 45.0]
-  sigma_ms_range: [1.0, 67.0]   # up to hella's widest boxcar (64 samp ~ 67 ms)
+  # sigma is the Gaussian std; FWHM = 2.355 sigma. Above ~10 ms the pulse is
+  # wider than hella's boxcar grid reaches and the 3-count u8 amplitude is too
+  # coarse (shot 658: 30 ms, target 35, reported 15.8).
+  sigma_ms_range: [1.0, 10.0]
   scratch_dir: /mnt/nvme5/casm_pipeline/injections
 
 # Beam pointings for cluster rows and trigger cards come from the weights live

@@ -70,6 +70,28 @@ def make_injection_files(dm: float, amp: float, sigma_ms: float, local_beam: int
     return dada, est_snr
 
 
+def amp_for_target_snr(target_snr: float, sigma_ms: float, beam: int,
+                       nchan_usable: int = 2880) -> tuple[float, float]:
+    """Pulse amplitude in stream counts for a target matched-filter S/N.
+
+    Analytical Gaussian matched filter over nchan independent channels
+    (make_noise_fil_with_frb_snr.matched_filter_snr, "analytical" branch):
+    S/N = (A / sigma_n) * sqrt(nchan) * sqrt(sigma_t * sqrt(pi)), sigma_t in
+    samples. sigma_n is the live per-channel std of this beam from Redis
+    (bf_proc_stat). The pulse is rendered as integer u8 counts, so the result
+    is rounded and floored at 1 count. Returns (amp_counts, sigma_n).
+    """
+    import math
+    import sys
+    sys.path.insert(0, str(Path(MAKE_NOISE).parent))
+    import make_noise_fil_with_frb_snr as mn  # noqa: E402
+    _, sigma_n, _, _, _ = mn.query_live_noise_std(beam, "bf_proc_stat",
+                                                   force_refresh=True)
+    sigma_t = max(sigma_ms / 1.048576, 1.0)
+    amp = target_snr * sigma_n / (math.sqrt(nchan_usable) * math.sqrt(sigma_t * math.sqrt(math.pi)))
+    return float(max(1, round(amp))), float(sigma_n)
+
+
 def reconcile(conn, inj_id: int, cfg: dict) -> None:
     """Fill the gate columns for one injection from the clusters table."""
     row = conn.execute("SELECT inject_utc, beam, dm FROM injections WHERE id = ?",
@@ -78,7 +100,12 @@ def reconcile(conn, inj_id: int, cfg: dict) -> None:
         return
     inj_utc, beam, dm = row
     t0 = datetime.fromisoformat(inj_utc)
-    lo = (t0 - timedelta(seconds=10)).isoformat(timespec="milliseconds")
+    # The pulse lands in the data stream BEFORE inject_utc: the sidecar is
+    # added to the next assembled gulp, whose samples are already 5-18 s old
+    # (measured 2026-08-15 to 09-01, drifting later; casm-wiki
+    # injection-saturation.md). The old [-10, +90] window declared most
+    # late-August shots t1_no_detection although hella had found them.
+    lo = (t0 - timedelta(seconds=40)).isoformat(timespec="milliseconds")
     hi = (t0 + timedelta(seconds=90)).isoformat(timespec="milliseconds")
     dm_tol = max(0.15 * dm, 5.0)
     # Prefer the fast-triggered cluster: that is the one with the dump,
@@ -118,7 +145,8 @@ def reconcile(conn, inj_id: int, cfg: dict) -> None:
                 gates["fail_reason"] or "recovered")
 
 
-async def run(cfg: dict, once: bool) -> None:  # noqa: C901
+async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa: C901
+    force = force or {}
     icfg = cfg.get("injection", {})
     scratch = Path(icfg.get("scratch_dir", "/mnt/nvme5/casm_pipeline/injections"))
     scratch.mkdir(parents=True, exist_ok=True)
@@ -142,10 +170,30 @@ async def run(cfg: dict, once: bool) -> None:  # noqa: C901
                     await asyncio.sleep(wait)
         stream = streams[i % len(streams)]
         local_beam = random.randint(4, 59)
+        if force.get("beam") is not None:
+            local_beam = int(force["beam"]) % 64
+            stream = int(force["beam"]) // 64
         beam = stream * 64 + local_beam
-        dm = random.uniform(*icfg.get("dm_range", [100.0, 1000.0]))
-        amp = random.uniform(*icfg.get("amp_range", [25.0, 45.0]))
-        sigma_ms = random.uniform(*icfg.get("sigma_ms_range", [1.0, 10.0]))
+        dm = force.get("dm") or random.uniform(*icfg.get("dm_range", [100.0, 1000.0]))
+        sigma_ms = force.get("sigma_ms") or random.uniform(
+            *icfg.get("sigma_ms_range", [1.0, 10.0]))
+        if force.get("target_snr") is not None or "target_rec_snr_range" in icfg:
+            # Amplitude from a target hella-REPORTED S/N and the live beam std.
+            # The fixed count range assumed the pre-Route-Z beam scale (u8 rail,
+            # casm-wiki injection-saturation.md); counts are now fp16 units of
+            # a stream whose std is ~36-46. Calibration shots 2026-09-09 (5 ms
+            # pulses, ids 657/659): hella reports rec_per_true x the analytical
+            # matched-filter S/N, measured 1.72 and 1.29, so 1.5 +-15%.
+            target_rec = force.get("target_snr") or random.uniform(
+                *icfg.get("target_rec_snr_range", [18.0, 30.0]))
+            k = float(icfg.get("rec_per_true", 1.5))
+            amp, sigma_n = amp_for_target_snr(
+                target_rec / k, sigma_ms, beam, int(icfg.get("nchan_usable", 2880)))
+            logger.info("target reported S/N %.1f (true %.1f at rec_per_true %.2f), "
+                        "live std %.2f -> amp %.0f counts",
+                        target_rec, target_rec / k, k, sigma_n, amp)
+        else:
+            amp = random.uniform(*icfg.get("amp_range", [25.0, 45.0]))
         file_id = f"inj_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}_b{beam:03d}"
 
         try:
@@ -220,12 +268,20 @@ def main() -> None:
                    default="/home/casm/software/dev/casm_t2/config/t2d.yaml")
     p.add_argument("--once", action="store_true", help="single injection, then exit")
     p.add_argument("--log-file", default="/mnt/nvme5/casm_pipeline/logs/t2_inject.log")
+    p.add_argument("--beam", type=int, help="force the global beam (0-255) for a test shot")
+    p.add_argument("--dm", type=float, help="force the DM for a test shot")
+    p.add_argument("--sigma-ms", type=float, help="force the pulse sigma in ms for a test shot")
+    p.add_argument("--target-snr", type=float,
+                   help="force the target hella-reported S/N; amplitude solved from "
+                        "the live std and injection.rec_per_true")
     args = p.parse_args()
     logsetup.setup(args.log_file)
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
+    force = {"beam": args.beam, "dm": args.dm, "sigma_ms": args.sigma_ms,
+             "target_snr": args.target_snr}
     try:
-        asyncio.run(run(cfg, args.once))
+        asyncio.run(run(cfg, args.once, force))
     except KeyboardInterrupt:
         logger.info("stopped")
 
