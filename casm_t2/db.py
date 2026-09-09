@@ -123,7 +123,18 @@ CREATE TABLE IF NOT EXISTS injections (
     rec_snr       REAL,
     rec_dm        REAL,
     fail_reason   TEXT,              -- first failed gate, human-readable
-    created_utc   TEXT NOT NULL
+    created_utc   TEXT NOT NULL,
+    -- solver inputs recorded at insert time (2026-09-09)
+    target_snr    REAL,              -- target hella-REPORTED S/N for the shot
+    sigma_n       REAL,              -- live per-channel std the solver used
+    nchan_usable  INTEGER,           -- channels assumed unmasked by the solver
+    -- matched-cluster detail, filled by reconcile()
+    rec_width     INTEGER,           -- ibox: log2 boxcar length in samples
+    rec_beam      INTEGER,
+    rec_samp      INTEGER,
+    rec_lead_s    REAL,              -- cluster event_utc minus inject_utc, s
+    slack_ts      TEXT,              -- ts of the Slack "sent" message, if posted
+    outcome       TEXT               -- casm_t2.inject_outcome enum
 );
 CREATE INDEX IF NOT EXISTS idx_injections_utc ON injections(inject_utc);
 
@@ -169,6 +180,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
                       ("bytes_written", "INTEGER"), ("cleaned_utc", "TEXT")]:
         if tcols and col not in tcols:
             conn.execute(f"ALTER TABLE triggers ADD COLUMN {col} {decl}")
+    icols = {r[1] for r in conn.execute("PRAGMA table_info(injections)")}
+    for col, decl in [("target_snr", "REAL"), ("sigma_n", "REAL"),
+                      ("nchan_usable", "INTEGER"), ("rec_width", "INTEGER"),
+                      ("rec_beam", "INTEGER"), ("rec_samp", "INTEGER"),
+                      ("rec_lead_s", "REAL"), ("slack_ts", "TEXT"),
+                      ("outcome", "TEXT")]:
+        if icols and col not in icols:
+            conn.execute(f"ALTER TABLE injections ADD COLUMN {col} {decl}")
     gcols = {r[1] for r in conn.execute("PRAGMA table_info(gulp_stats)")}
     for col, decl in [("n_vetoed", "INTEGER NOT NULL DEFAULT 0"),
                       ("n_shed", "INTEGER NOT NULL DEFAULT 0"),

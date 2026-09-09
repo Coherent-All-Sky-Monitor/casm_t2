@@ -217,6 +217,19 @@ injection:
   # counts gives 3 levels across the pulse (about 20% of the S/N).
   sigma_ms_range: [1.0, 10.0]
   scratch_dir: /mnt/nvme5/casm_pipeline/injections
+  # Slack posting for injections. SHIPS DISABLED: with enabled false the
+  # daemon posts nothing and behaves exactly as it did before. Set
+  # dry_run_dir to a path to write every would-be message to a .txt there
+  # and never open a socket. Token and channel come from ~/.config/slack_api
+  # and ~/.config/slack_channel, with ~/.config/slack_channel_injections
+  # overriding the channel when it exists. `channel` here overrides both.
+  # streak_every: post one attention message at each multiple of that many
+  # consecutive missed shots. Preview it first: t2-inject-slack-preview.
+  slack:
+    enabled: false
+    dry_run_dir: null
+    channel: null
+    streak_every: 5
 
 # Beam pointings for cluster rows and trigger cards come from the weights live
 # at the event time (casm_t2.weights_registry), maintained by deploy_bf_weights

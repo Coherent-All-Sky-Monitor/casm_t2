@@ -115,6 +115,44 @@ minute later is tagged `injection`, and no dump fires:
 
     t2-inject config/t2d.yaml --once
 
+### Injection messages in Slack
+
+The daemon can post one Slack message per injection: a "sent" line when
+the pulse hits the FIFO, edited in place ~3 minutes later with a green or
+red bar carrying the outcome. A run of consecutive misses (default 5, and
+each multiple after that) posts one attention message; the streak is read
+straight off the ledger, so restarts cannot double-count it.
+
+**This ships disabled** — `injection.slack.enabled: false` in t2d.yaml.
+With it false the daemon posts nothing and behaves exactly as before.
+
+    injection:
+      slack:
+        enabled: false          # the only switch that turns posting on
+        dry_run_dir: null       # set a path: write .txt files, no network
+        channel: null           # overrides the dotfiles
+        streak_every: 5         # attention message at each multiple
+
+Token and channel come from the same dotfiles casm_t3 uses,
+`~/.config/slack_api` and `~/.config/slack_channel`, plus an optional
+`~/.config/slack_channel_injections` that overrides the channel when it
+exists, so injection chatter can be kept out of the candidate channel.
+Every Slack failure is logged and swallowed.
+
+Before enabling it, render the messages offline — no token, no network:
+
+    t2-inject-slack-preview --db /mnt/nvme5/casm_pipeline/db/t2.sqlite \
+        --out /tmp/inject_preview --ids 657,658,659
+
+That writes, per shot, the sent text, the outcome text and a PNG card of
+each (the colour bar is the attachment colour Slack would show), plus the
+daily summary text and three figures: recovered vs target S/N against the
+1:1 line with misses hollow at zero, outcome counts, and DM error against
+recovered width. With no `--ids` it takes a whole UTC day (`--day`).
+
+Rows written before these columns existed have no `target_snr`, so their
+preview shows `n/a` and they do not appear in the S/N figure.
+
 ## Voltage dumps (manual)
 
 `casm-voltage-dump` commands the antenna-side casm_cand_dump daemons

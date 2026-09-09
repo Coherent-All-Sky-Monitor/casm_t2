@@ -57,7 +57,15 @@ Python >= 3.10; numpy, scikit-learn, pyyaml.
 
 Also ships `t2-dump` (manual smoke dump), `t2-replay` (offline replay of
 a UTC slice), `t2-inject` / `t2-inject-report` (live injections and the
-daily recovery report), and `t2-transit-schedule`.
+daily recovery report), `t2-inject-slack-preview`, and
+`t2-transit-schedule`.
+
+The injection daemon can post one Slack message per shot, edited in place
+with the outcome when reconciliation finishes. It ships disabled
+(`injection.slack.enabled: false`); `t2-inject-slack-preview` renders the
+same messages and figures to a directory with no token and no network, so
+they can be reviewed before it is turned on. Columns, the outcome enum and
+the flags are in `docs/architecture.md` and `docs/operations.md`.
 
 `casm-voltage-dump` commands the antenna-side voltage daemons by hand. It
 talks to them directly, so it works with t2d stopped, and it is the only

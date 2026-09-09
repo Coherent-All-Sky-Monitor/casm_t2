@@ -242,3 +242,38 @@ injection FIFO. The ledger row goes in *before* the FIFO write, so a
 crash can't produce an unaccounted pulse in the data. Reconciliation a
 few minutes later fills the gate columns (seen at T1, clustered at T2,
 trigger-eligible), and the first failed gate is the failure reason.
+
+Alongside the gates the ledger records what the amplitude solver was
+working from and what the matched cluster looked like:
+
+| column | meaning |
+| --- | --- |
+| target_snr | target hella-*reported* S/N the amplitude was solved for |
+| sigma_n | live per-channel std of the beam the solver read from Redis |
+| nchan_usable | channels the solver assumed were unmasked |
+| rec_width | ibox of the matched cluster: log2 of the boxcar in samples |
+| rec_beam | peak beam of the matched cluster |
+| rec_samp | peak sample of the matched cluster |
+| rec_lead_s | cluster event time minus inject_utc, seconds |
+| slack_ts | ts of the Slack message for this shot, when posting is on |
+| outcome | closed enum, below |
+
+`rec_lead_s` is normally **negative**, by 10-20 s: the sidecar joins a
+gulp whose samples are already seconds old, so the pulse is in the search
+stream before the FIFO write that scheduled it. A positive lead means the
+match is probably not the injection.
+
+`fail_reason` stays free text naming the first failed gate.  `outcome`
+(`casm_t2.inject_outcome`) is the closed set that anything counting over
+injections uses, so a new failure string cannot invent a category:
+
+| outcome | when |
+| --- | --- |
+| recovered | all three gates passed |
+| missed_t1 | no cluster in the reconcile window at that beam and DM |
+| missed_t2 | candidates arrived but nothing clustered |
+| missed_trigger | clustered, but the trigger filters would have refused it |
+| fire_failed | the shot never reached the stream (file or FIFO failure) |
+
+`fire_failed` is injector plumbing, not a sensitivity result, and is
+excluded from miss counts and streaks.

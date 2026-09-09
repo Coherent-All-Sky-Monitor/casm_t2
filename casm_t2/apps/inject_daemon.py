@@ -38,7 +38,7 @@ from pathlib import Path
 
 import yaml
 
-from casm_t2 import db, inject_plot, logsetup
+from casm_t2 import db, inject_outcome, inject_plot, inject_slack, logsetup
 
 logger = logging.getLogger("t2.inject")
 
@@ -92,13 +92,23 @@ def amp_for_target_snr(target_snr: float, sigma_ms: float, beam: int,
     return float(max(1, round(amp))), float(sigma_n)
 
 
+def ledger_row(conn, inj_id: int) -> dict | None:
+    """One injections row as a plain dict, for the Slack text builders."""
+    cur = conn.execute("SELECT * FROM injections WHERE id = ?", (inj_id,))
+    row = cur.fetchone()
+    if row is None:
+        return None
+    return dict(zip([c[0] for c in cur.description], row))
+
+
 def reconcile(conn, inj_id: int, cfg: dict) -> None:
     """Fill the gate columns for one injection from the clusters table."""
-    row = conn.execute("SELECT inject_utc, beam, dm FROM injections WHERE id = ?",
-                       (inj_id,)).fetchone()
+    row = conn.execute(
+        "SELECT inject_utc, beam, dm, fail_reason FROM injections WHERE id = ?",
+        (inj_id,)).fetchone()
     if row is None:
         return
-    inj_utc, beam, dm = row
+    inj_utc, beam, dm, prior_fail = row
     t0 = datetime.fromisoformat(inj_utc)
     # The pulse lands in the data stream BEFORE inject_utc: the sidecar is
     # added to the next assembled gulp, whose samples are already 5-18 s old
@@ -111,7 +121,8 @@ def reconcile(conn, inj_id: int, cfg: dict) -> None:
     # Prefer the fast-triggered cluster: that is the one with the dump,
     # the plot, and the trigger audit attached.
     cand = conn.execute(
-        "SELECT id, snr, dm, tier, tags, n_beams, beam FROM clusters"
+        "SELECT id, snr, dm, tier, tags, n_beams, beam, width, samp, event_utc"
+        " FROM clusters"
         " WHERE event_utc BETWEEN ? AND ? AND beam_lo <= ? AND beam_hi >= ?"
         " AND dm_lo <= ? AND dm_hi >= ?"
         " ORDER BY (tags LIKE '%fast_triggered%') DESC, snr DESC LIMIT 1",
@@ -125,8 +136,9 @@ def reconcile(conn, inj_id: int, cfg: dict) -> None:
         gates = dict(gate_t1=0, gate_t2=0, gate_trigger=0,
                      fail_reason="t1_no_detection")
         rec = (None, None, None)
+        detail = (None, None, None, None)
     else:
-        cid, snr, rdm, tier, tags, n_beams, cbeam = cand
+        cid, snr, rdm, tier, tags, n_beams, cbeam, cwidth, csamp, cutc = cand
         would = (tier in ("A", "B") and rdm >= filt.get("dm_floor", 20.0)
                  and n_beams <= filt.get("max_nbeam", 32)
                  and cbeam not in set(filt.get("beam_veto", [])))
@@ -134,12 +146,24 @@ def reconcile(conn, inj_id: int, cfg: dict) -> None:
                      fail_reason=None if would else
                      f"trigger_filters(tier={tier},nbeam={n_beams})")
         rec = (cid, snr, rdm)
+        # Negative lead is the normal case: the sidecar joins a gulp whose
+        # samples are already seconds old, so the pulse arrives in the search
+        # stream BEFORE the FIFO write that scheduled it.
+        try:
+            lead = (datetime.fromisoformat(cutc) - t0).total_seconds()
+        except (TypeError, ValueError):
+            lead = None
+        detail = (cwidth, cbeam, csamp, lead)
+    outcome = inject_outcome.classify(gates["gate_t1"], gates["gate_t2"],
+                                      gates["gate_trigger"], prior_fail)
     with conn:
         conn.execute(
             "UPDATE injections SET gate_t1=?, gate_t2=?, gate_trigger=?,"
-            " fail_reason=?, matched_cluster=?, rec_snr=?, rec_dm=? WHERE id=?",
+            " fail_reason=?, matched_cluster=?, rec_snr=?, rec_dm=?,"
+            " rec_width=?, rec_beam=?, rec_samp=?, rec_lead_s=?, outcome=?"
+            " WHERE id=?",
             (gates["gate_t1"], gates["gate_t2"], gates["gate_trigger"],
-             gates["fail_reason"], *rec, inj_id))
+             gates["fail_reason"], *rec, *detail, outcome, inj_id))
     logger.info("reconciled injection %d: t1=%s t2=%s trigger=%s (%s)",
                 inj_id, gates["gate_t1"], gates["gate_t2"], gates["gate_trigger"],
                 gates["fail_reason"] or "recovered")
@@ -153,6 +177,9 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
     streams = icfg.get("streams", [0, 1, 2, 3])
     cadence_s = icfg.get("cadence_min", 30) * 60.0
     conn = db.connect(cfg.get("db", db.DEFAULT_PATH))
+    # Ships disabled: with injection.slack.enabled false every poster call is
+    # a no-op, so the deployed daemon behaves exactly as it did before.
+    poster = inject_slack.poster_from_cfg(icfg)
     i = 0
     first = True
     while True:
@@ -187,13 +214,15 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
             target_rec = force.get("target_snr") or random.uniform(
                 *icfg.get("target_rec_snr_range", [18.0, 30.0]))
             k = float(icfg.get("rec_per_true", 1.5))
+            nchan_usable = int(icfg.get("nchan_usable", 2880))
             amp, sigma_n = amp_for_target_snr(
-                target_rec / k, sigma_ms, beam, int(icfg.get("nchan_usable", 2880)))
+                target_rec / k, sigma_ms, beam, nchan_usable)
             logger.info("target reported S/N %.1f (true %.1f at rec_per_true %.2f), "
                         "live std %.2f -> amp %.0f counts",
                         target_rec, target_rec / k, k, sigma_n, amp)
         else:
             amp = random.uniform(*icfg.get("amp_range", [25.0, 45.0]))
+            target_rec = sigma_n = nchan_usable = None
         file_id = f"inj_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}_b{beam:03d}"
 
         try:
@@ -210,9 +239,11 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
         with conn:
             cur = conn.execute(
                 "INSERT INTO injections (inject_utc, stream, beam, dm, amp, sigma_ms,"
-                " est_snr, file_id, created_utc) VALUES (?,?,?,?,?,?,?,?,?)",
+                " est_snr, file_id, created_utc, target_snr, sigma_n, nchan_usable)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (now.isoformat(timespec="milliseconds"), stream, beam, dm, amp,
-                 sigma_ms, est_snr, file_id, now.isoformat(timespec="milliseconds")))
+                 sigma_ms, est_snr, file_id, now.isoformat(timespec="milliseconds"),
+                 target_rec, sigma_n, nchan_usable))
             inj_id = cur.lastrowid
         fifo = f"/tmp/beaminj.fifo.{stream}"
         try:
@@ -221,8 +252,10 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
         except OSError as exc:
             logger.error("FIFO write to %s failed: %s", fifo, exc)
             with conn:
-                conn.execute("UPDATE injections SET fail_reason=? WHERE id=?",
-                             (f"fifo_write_failed:{exc}", inj_id))
+                conn.execute(
+                    "UPDATE injections SET fail_reason=?, outcome=? WHERE id=?",
+                    (f"fifo_write_failed:{exc}", inject_outcome.FIRE_FAILED,
+                     inj_id))
             if once:
                 return
             await asyncio.sleep(cadence_s)
@@ -230,6 +263,15 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
         logger.info("injection %d: beam %d (stream %d) dm=%.1f amp=%.1f "
                     "sigma=%.1fms est_snr=%s", inj_id, beam, stream, dm, amp,
                     sigma_ms, f"{est_snr:.1f}" if est_snr else "?")
+
+        try:
+            ts = poster.post_sent(ledger_row(conn, inj_id))
+            if ts:
+                with conn:
+                    conn.execute("UPDATE injections SET slack_ts=? WHERE id=?",
+                                 (ts, inj_id))
+        except Exception:
+            logger.exception("slack sent-post for injection %d failed", inj_id)
 
         # truth plot for the web gallery, rendered from the injected .fil
         # (dumps tap upstream of the injection merge and cannot show it)
@@ -250,6 +292,13 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
             reconcile(conn, inj_id, cfg)
         except Exception:
             logger.exception("reconcile of injection %d failed", inj_id)
+        else:
+            try:
+                poster.post_outcome(ledger_row(conn, inj_id))
+                inject_slack.check_streak(conn, poster, inj_id)
+            except Exception:
+                logger.exception("slack outcome-post for injection %d failed",
+                                 inj_id)
 
         # rolling scratch cleanup: keep the last ~20 injections of work files
         work = sorted(scratch.glob("inj_*"), key=lambda p: p.stat().st_mtime)
