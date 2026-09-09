@@ -28,7 +28,79 @@ MIN_RENDERABLE_FWHM_MS = FWHM_PER_SIGMA * 1.048576  # 2.469 ms
 #: measured 2026-09-09 with T1 subtraction off.
 DEFAULT_REC_PER_TRUE_TABLE = [[4.7, 2.24], [11.8, 2.08], [23.5, 1.22]]
 
-DEFAULT_TARGET_SNR_MAX = 40.0
+#: Reported-S/N ceiling as a function of injected width, in the shape the
+#: config uses. Above the ceiling the injected pulse fills hella's 10000-peak
+#: per-gulp candidate buffer and the gulp stops being searched across the
+#: whole beam set. The footprint of a candidate grows with width, so a wide
+#: pulse saturates at a lower reported S/N than a narrow one.
+DEFAULT_REPORTED_SNR_CAP = {
+    "narrow": 50.0,        # FWHM below narrow_max_ms
+    "narrow_max_ms": 6.0,
+    "mid": 40.0,           # FWHM from narrow_max_ms to mid_max_ms
+    "mid_max_ms": 15.0,
+    "wide_base": 40.0,     # above mid_max_ms: wide_base * sqrt(wide_ref_ms/FWHM)
+    "wide_ref_ms": 12.0,
+}
+
+
+def reported_snr_cap(fwhm_ms: float, icfg: dict | None = None) -> float:
+    """Highest reported S/N this width may be injected at.
+
+    Extrapolated from 2026-09-09: reported 43 at FWHM 4.7 ms and 35.5 at
+    11.8 ms left the gulp intact; reported 78 at 11.8 ms filled the buffer
+    (31/64 beams searched) and 132 filled it harder (43/64). Flat below
+    15 ms, then falling as 1/sqrt(FWHM) because a wider candidate occupies
+    more of the buffer per detection: 25 at FWHM 30 ms.
+
+    A config carrying only the legacy flat `target_rec_snr_max` is honoured
+    as a width-independent cap.
+    """
+    icfg = icfg or {}
+    cfg = icfg.get("reported_snr_cap")
+    if not cfg:
+        legacy = icfg.get("target_rec_snr_max")
+        if legacy is not None:
+            return float(legacy)
+        cfg = DEFAULT_REPORTED_SNR_CAP
+    d = DEFAULT_REPORTED_SNR_CAP
+    fwhm = max(float(fwhm_ms), 1e-6)
+    if fwhm < float(cfg.get("narrow_max_ms", d["narrow_max_ms"])):
+        return float(cfg.get("narrow", d["narrow"]))
+    if fwhm <= float(cfg.get("mid_max_ms", d["mid_max_ms"])):
+        return float(cfg.get("mid", d["mid"]))
+    base = float(cfg.get("wide_base", d["wide_base"]))
+    ref = float(cfg.get("wide_ref_ms", d["wide_ref_ms"]))
+    return base * math.sqrt(ref / fwhm)
+
+
+def sample_inject_snr(rng, lo: float, hi: float) -> float:
+    """Draw an injected (true, analytic) S/N log-uniformly."""
+    lo, hi = float(lo), max(float(hi), float(lo))
+    return float(math.exp(rng.uniform(math.log(lo), math.log(hi))))
+
+
+def clamp_inject_snr(inject_snr: float, fwhm_ms: float,
+                     icfg: dict | None = None) -> tuple[float, float, bool]:
+    """Hold the PREDICTED reported S/N under the width's cap.
+
+    The sampled quantity is the injected (true) S/N, which is what the
+    amplitude solver needs. What saturates hella is the *reported* S/N, so
+    predict it with the rec_per_true table and, if it is over the ceiling,
+    scale the injected S/N down to sit exactly on it.
+
+    Returns (injected S/N, predicted reported S/N, whether it was clamped).
+    """
+    k = rec_per_true(fwhm_ms, icfg)
+    cap = reported_snr_cap(fwhm_ms, icfg)
+    predicted = inject_snr * k
+    if predicted <= cap:
+        return float(inject_snr), float(predicted), False
+    scaled = cap / k
+    logger.warning("injected S/N %.1f at FWHM %.1f ms would be reported at "
+                   "%.1f, over the %.1f cap for that width; scaled to %.1f "
+                   "(reported %.1f)", inject_snr, fwhm_ms, predicted, cap,
+                   scaled, cap)
+    return float(scaled), float(cap), True
 
 
 def sample_fwhm_ms(rng, lo_ms: float, hi_ms: float) -> float:
@@ -78,22 +150,3 @@ def rec_per_true(fwhm_ms: float, icfg: dict | None = None) -> float:
             f = (x - xs[i - 1]) / (xs[i] - xs[i - 1])
             return ys[i - 1] + f * (ys[i] - ys[i - 1])
     return ys[-1]
-
-
-def capped_target_snr(target: float, icfg: dict) -> float:
-    """Clamp the requested reported S/N to the saturation cap.
-
-    A bright enough injection fills hella's per-gulp candidate buffer: the
-    2026-09-09 shots at reported 78 (id 663) and 132 (id 664) each hit the
-    10000-peak cap for that gulp, with 31/64 and 43/64 beams searched, so
-    the injected gulp stopped being a fair sample of the sky. Reported 43
-    and below did not. The cap applies to CLI --target-snr too: a test shot
-    is not a reason to blind the search for a gulp.
-    """
-    cap = float((icfg or {}).get("target_rec_snr_max", DEFAULT_TARGET_SNR_MAX))
-    if target > cap:
-        logger.warning("target reported S/N %.1f exceeds target_rec_snr_max "
-                       "%.1f (hella saturates its gulp above ~45); clamped to %.1f",
-                       target, cap, cap)
-        return cap
-    return float(target)

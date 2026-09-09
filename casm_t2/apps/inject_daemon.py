@@ -95,13 +95,15 @@ def amp_for_target_snr(target_snr: float, sigma_ms: float, beam: int,
 
 
 # The width/amplitude calibration lives in casm_t2.inject_calib so the Slack
-# text can quote the same expected S/N the solver aimed at. Re-exported here
-# because this module is where they are used.
+# text can use the same numbers the solver used. Re-exported here because
+# this module is where they are applied.
 FWHM_PER_SIGMA = inject_calib.FWHM_PER_SIGMA
 MIN_RENDERABLE_FWHM_MS = inject_calib.MIN_RENDERABLE_FWHM_MS
 sample_fwhm_ms = inject_calib.sample_fwhm_ms
+sample_inject_snr = inject_calib.sample_inject_snr
 rec_per_true = inject_calib.rec_per_true
-capped_target_snr = inject_calib.capped_target_snr
+reported_snr_cap = inject_calib.reported_snr_cap
+clamp_inject_snr = inject_calib.clamp_inject_snr
 
 
 def ledger_row(conn, inj_id: int) -> dict | None:
@@ -219,26 +221,45 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
         fwhm_ms = force.get("fwhm_ms") or sample_fwhm_ms(
             random, *icfg.get("fwhm_ms_range", [2.5, 30.0]))
         sigma_ms = fwhm_ms / FWHM_PER_SIGMA
-        if force.get("target_snr") is not None or "target_rec_snr_range" in icfg:
-            # Amplitude from a target hella-REPORTED S/N and the live beam std.
-            # The fixed count range assumed the pre-Route-Z beam scale (u8 rail,
-            # casm-wiki injection-saturation.md); counts are now fp16 units of
-            # a stream whose std is ~36-46. The reported/analytical-true ratio
-            # is width-dependent (rec_per_true above), so the amplitude scales
-            # with the injected width and the target reported S/N does not.
-            target_rec = capped_target_snr(
-                force.get("target_snr") or random.uniform(
-                    *icfg.get("target_rec_snr_range", [18.0, 30.0])), icfg)
-            k = rec_per_true(fwhm_ms, icfg)
+        solve = (force.get("inject_snr") is not None
+                 or force.get("target_snr") is not None
+                 or "inject_snr_range" in icfg or "target_rec_snr_range" in icfg)
+        if solve:
+            # The sampled quantity is the INJECTED (true, analytic) S/N: that
+            # is what the amplitude solver needs and what the pulse actually
+            # is, independent of how hella chooses to report it. The fixed
+            # count range assumed the pre-Route-Z beam scale (u8 rail,
+            # casm-wiki injection-saturation.md); counts are now fp16 units
+            # of a stream whose std is ~36-46.
+            if force.get("inject_snr") is not None:
+                inject_snr = float(force["inject_snr"])
+            elif force.get("target_snr") is not None:
+                # manual shot given as a reported S/N: undo the table
+                inject_snr = float(force["target_snr"]) / rec_per_true(fwhm_ms, icfg)
+            elif "inject_snr_range" in icfg:
+                inject_snr = sample_inject_snr(random, *icfg["inject_snr_range"])
+            else:
+                # legacy config expressed as a reported-S/N range
+                inject_snr = random.uniform(
+                    *icfg["target_rec_snr_range"]) / rec_per_true(fwhm_ms, icfg)
+            # Only the REPORTED S/N saturates hella, so predict it from the
+            # per-width table and scale the injection down if it is over the
+            # ceiling for this width.
+            inject_snr, target_rec, clamped = clamp_inject_snr(
+                inject_snr, fwhm_ms, icfg)
             nchan_usable = int(icfg.get("nchan_usable", 2880))
             amp, sigma_n = amp_for_target_snr(
-                target_rec / k, sigma_ms, beam, nchan_usable)
-            logger.info("target reported S/N %.1f (true %.1f at rec_per_true %.2f "
-                        "for FWHM %.1f ms), live std %.2f -> amp %.0f counts",
-                        target_rec, target_rec / k, k, fwhm_ms, sigma_n, amp)
+                inject_snr, sigma_ms, beam, nchan_usable)
+            logger.info("injected S/N %.1f at FWHM %.1f ms (predicted reported "
+                        "%.1f at rec_per_true %.2f, cap %.1f%s), live std %.2f "
+                        "-> amp %.0f counts",
+                        inject_snr, fwhm_ms, target_rec,
+                        rec_per_true(fwhm_ms, icfg),
+                        reported_snr_cap(fwhm_ms, icfg),
+                        ", CLAMPED" if clamped else "", sigma_n, amp)
         else:
             amp = random.uniform(*icfg.get("amp_range", [25.0, 45.0]))
-            target_rec = sigma_n = nchan_usable = None
+            inject_snr = target_rec = sigma_n = nchan_usable = None
         file_id = f"inj_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}_b{beam:03d}"
 
         try:
@@ -255,11 +276,11 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
         with conn:
             cur = conn.execute(
                 "INSERT INTO injections (inject_utc, stream, beam, dm, amp, sigma_ms,"
-                " est_snr, file_id, created_utc, target_snr, sigma_n, nchan_usable)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                " est_snr, file_id, created_utc, target_snr, inject_snr, sigma_n,"
+                " nchan_usable) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (now.isoformat(timespec="milliseconds"), stream, beam, dm, amp,
                  sigma_ms, est_snr, file_id, now.isoformat(timespec="milliseconds"),
-                 target_rec, sigma_n, nchan_usable))
+                 target_rec, inject_snr, sigma_n, nchan_usable))
             inj_id = cur.lastrowid
         fifo = f"/tmp/beaminj.fifo.{stream}"
         try:
@@ -341,10 +362,12 @@ def main() -> None:
     p.add_argument("--sigma-ms", type=float,
                    help="deprecated spelling of --fwhm-ms, in Gaussian sigma "
                         "(FWHM = 2.355 sigma)")
+    p.add_argument("--inject-snr", type=float,
+                   help="force the injected (true, analytic) S/N; the amplitude "
+                        "is solved from it and the live beam std")
     p.add_argument("--target-snr", type=float,
-                   help="force the target hella-reported S/N; amplitude solved from "
-                        "the live std and the per-width rec_per_true table. Still "
-                        "clamped to injection.target_rec_snr_max")
+                   help="force the hella-REPORTED S/N instead; converted to an "
+                        "injected S/N through the per-width rec_per_true table")
     args = p.parse_args()
     logsetup.setup(args.log_file)
     with open(args.config) as f:
@@ -355,7 +378,7 @@ def main() -> None:
         logger.warning("--sigma-ms %.2f is deprecated; using FWHM %.2f ms",
                        args.sigma_ms, fwhm_ms)
     force = {"beam": args.beam, "dm": args.dm, "fwhm_ms": fwhm_ms,
-             "target_snr": args.target_snr}
+             "inject_snr": args.inject_snr, "target_snr": args.target_snr}
     try:
         asyncio.run(run(cfg, args.once, force))
     except KeyboardInterrupt:

@@ -196,17 +196,29 @@ injection:
   cadence_min: 120
   streams: [0, 1, 2, 3]
   dm_range: [100.0, 1000.0]
-  # 2026-09-09: amplitude is solved per shot from a target hella-reported S/N
-  # and the live beam std (Redis bf_proc_stat). amp_range is the fallback used
-  # only if target_rec_snr_range is absent; its 25-45 counts predate Route Z
-  # and would now give S/N of several hundred (casm-wiki injection-saturation.md).
-  target_rec_snr_range: [18.0, 30.0]
-  # HARD CAP on the reported S/N, applied to --target-snr as well. Above about
-  # 45 reported, the injected pulse fills hella's 10000-peak per-gulp candidate
-  # buffer and the gulp stops being searched over the whole beam set: the
-  # 2026-09-09 shots reported 78 (id 663, 31/64 beams searched) and 132
-  # (id 664, 43/64). Reported 43 and below left the gulp intact.
-  target_rec_snr_max: 40.0
+  # The sampled quantity is the INJECTED (true, analytic) S/N of the pulse:
+  # what it really is, not how hella chooses to report it. The amplitude is
+  # solved straight from it and the live beam std (Redis bf_proc_stat), with
+  # no table in the loop. Log-uniform. amp_range is the fallback used only if
+  # this is absent; its 25-45 counts predate Route Z and would now give S/N of
+  # several hundred (casm-wiki injection-saturation.md).
+  inject_snr_range: [12.0, 18.0]
+  # Ceiling on the PREDICTED reported S/N (injected * rec_per_true). Over it,
+  # the injected S/N is scaled down to sit on the cap and the clamp is logged.
+  # Above the ceiling the pulse fills hella's 10000-peak per-gulp candidate
+  # buffer and the gulp stops being searched across the whole beam set: the
+  # 2026-09-09 shots reported 78 (id 663, 31/64 beams searched) and 132 (id
+  # 664, 43/64). Reported 43 at FWHM 4.7 ms and 35.5 at 11.8 ms were fine.
+  # A candidate's footprint grows with width, so a wide pulse saturates
+  # sooner: flat to 15 ms, then wide_base*sqrt(wide_ref_ms/FWHM), i.e. 25 at
+  # FWHM 30 ms. The old flat `target_rec_snr_max` still works as an alias.
+  reported_snr_cap:
+    narrow: 50.0            # FWHM below narrow_max_ms
+    narrow_max_ms: 6.0
+    mid: 40.0               # FWHM from narrow_max_ms to mid_max_ms
+    mid_max_ms: 15.0
+    wide_base: 40.0
+    wide_ref_ms: 12.0
   # hella-reported S/N / the ANALYTICAL matched-filter S/N the solver computes.
   # Not a constant: hella's matched trial is a smoothing kernel of FWHM about
   # 0.67 * 2**ibox samples over unit-variance rows, so the ratio falls as the

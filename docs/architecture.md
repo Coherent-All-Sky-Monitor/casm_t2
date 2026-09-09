@@ -248,7 +248,8 @@ working from and what the matched cluster looked like:
 
 | column | meaning |
 | --- | --- |
-| target_snr | target hella-*reported* S/N the amplitude was solved for |
+| inject_snr | injected (true, analytic) S/N the amplitude was solved for |
+| target_snr | the reported S/N that injected value is predicted to give |
 | sigma_n | live per-channel std of the beam the solver read from Redis |
 | nchan_usable | channels the solver assumed were unmasked |
 | rec_width | ibox of the matched cluster: log2 of the boxcar in samples |
@@ -313,18 +314,23 @@ still sits nearest ibox 5.
 
 ### Amplitude
 
-The amplitude is solved per shot so that the *reported* S/N is the thing
-being controlled, and does not drift with width:
+The sampled quantity is the **injected** S/N: the true, analytic
+matched-filter S/N of the pulse being written. That is what the pulse is,
+independent of how hella chooses to report it, so it is what the amplitude
+solver takes directly, with no calibration table in the loop:
 
-    amp = target_reported / rec_per_true(FWHM) * sigma_n
-          / (sqrt(nchan_usable) * sqrt(sigma_t * sqrt(pi)))
+    amp = inject_snr * sigma_n / (sqrt(nchan_usable) * sqrt(sigma_t * sqrt(pi)))
 
-The right-hand factor is the analytical Gaussian matched filter. It agrees
-with the offline injector's numerically computed matched filter
-(`casm_offline_frb_injector.SNRCalibrator`) to 1-3% above FWHM 4.7 ms, and
-runs about 10% high at 2.5 ms, so the formula is not where the error is.
+`inject_snr_range` is sampled log-uniformly. The formula is the analytical
+Gaussian matched filter; it agrees with the offline injector's numerically
+computed matched filter (`casm_offline_frb_injector.SNRCalibrator`) to 1-3%
+above FWHM 4.7 ms, and runs about 10% high at 2.5 ms.
 
-`rec_per_true` is hella's reported S/N divided by that analytical value, and
+The table is still needed, but only to *predict* what hella will report:
+
+    predicted_reported = inject_snr * rec_per_true(FWHM)
+
+`rec_per_true` is hella's reported S/N divided by the analytical value, and
 it is a function of width, not a constant: hella's matched trial is the
 smoothing kernel above, over rows normalised to unit variance, so the ratio
 falls as the pulse widens (2.24 at FWHM 4.7 ms, 2.08 at 11.8, 1.22 at 23.5,
@@ -332,8 +338,34 @@ measured 2026-09-09 with T1 subtraction off). `rec_per_true_table` holds
 those pairs and the daemon interpolates linearly in log FWHM, holding the
 end values flat.
 
-`target_rec_snr_max` caps the requested reported S/N, including a CLI
-`--target-snr`. Above about 45 reported, the injected pulse fills hella's
-10000-peak per-gulp candidate buffer and the gulp is no longer searched over
-the whole beam set (2026-09-09: reported 78 left 31/64 beams searched,
-reported 132 left 43/64; reported 43 left the gulp intact).
+### The saturation cap
+
+Only the *reported* S/N saturates hella, so the prediction is what gets
+capped. When `predicted_reported` exceeds `reported_snr_cap(FWHM)`, the
+injected S/N is scaled down to land exactly on the cap and the clamp is
+logged.
+
+Above the ceiling the injected pulse fills hella's 10000-peak per-gulp
+candidate buffer and the gulp stops being searched across the whole beam
+set (2026-09-09: reported 78 left 31/64 beams searched, reported 132 left
+43/64; reported 43 at FWHM 4.7 ms and 35.5 at 11.8 ms left the gulp
+intact). A candidate's footprint grows with width, so a wide pulse
+saturates at a lower reported S/N:
+
+| FWHM | cap |
+| --- | --- |
+| below 6 ms | 50 |
+| 6 to 15 ms | 40 |
+| above 15 ms | 40 * sqrt(12 / FWHM), so 25 at 30 ms |
+
+The wide branch is an extrapolation from two clean points, not a measured
+curve; it errs low on purpose. A config carrying only the old flat
+`target_rec_snr_max` is still honoured as a width-independent cap.
+
+`inject_snr_range` is chosen so the cap never bites inside it: at 18, the
+top of the range, the predicted reported S/N stays under the cap at every
+width from 2.5 to 30 ms. The tightest point is FWHM 6.0 ms, where the cap
+steps from 50 to 40 and the prediction is 39.6 - about 1% of headroom. So
+the clamp is a safety net for manual shots and for a future change to
+either number, not something scheduled shots run into. A test sweeps the
+whole width range and fails if that stops being true.

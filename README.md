@@ -62,8 +62,10 @@ daily recovery report), `t2-inject-slack-preview`, and
 
 Injected widths are FWHM, drawn log-uniformly so hella's power-of-two
 boxcar trials get exercised evenly, and the amplitude is solved per shot
-from a target *reported* S/N so that target is independent of width.
-Recovered widths are quoted as the FWHM of hella's smoothing kernel
+from a log-uniform *injected* (true) S/N and the live beam noise. What
+hella will report is predicted from a per-width table and capped, so a
+bright injection can never fill the candidate buffer and blind the search
+for that gulp. Recovered widths are quoted as the FWHM of hella's kernel
 (`casm_t2.hella_kernel`), which is about two thirds of the `2**ibox` trial
 label.
 

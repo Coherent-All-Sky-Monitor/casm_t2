@@ -37,8 +37,9 @@ def test_migration_is_idempotent_and_keeps_rows(tmp_path):
     old.commit()
     old.close()
 
-    new_cols = {"target_snr", "sigma_n", "nchan_usable", "rec_width",
-                "rec_beam", "rec_samp", "rec_lead_s", "slack_ts", "outcome"}
+    new_cols = {"target_snr", "inject_snr", "sigma_n", "nchan_usable",
+                "rec_width", "rec_beam", "rec_samp", "rec_lead_s", "slack_ts",
+                "outcome"}
 
     conn = db.connect(path)
     cols = {r[1] for r in conn.execute("PRAGMA table_info(injections)")}
@@ -85,7 +86,8 @@ def test_every_outcome_has_an_explanation():
 RECOVERED_ROW = {
     "id": 661, "inject_utc": "2026-09-09T22:17:55.642+00:00", "stream": 1,
     "beam": 90, "dm": 300.0, "amp": 8.0, "sigma_ms": 5.0, "est_snr": 19.662,
-    "target_snr": 25.0, "sigma_n": 62.39, "nchan_usable": 2600,
+    "target_snr": 25.0, "inject_snr": 12.0, "sigma_n": 62.39,
+    "nchan_usable": 2600,
     "gate_t1": 1, "gate_t2": 1, "gate_trigger": 1, "rec_snr": 35.5246,
     "rec_dm": 299.818, "rec_width": 4, "rec_beam": 90, "rec_samp": 12345,
     "rec_lead_s": -19.32, "outcome": oc.RECOVERED, "fail_reason": None,
@@ -105,37 +107,33 @@ NBSP = inject_slack.NBSP
 def test_sent_text_is_the_short_form():
     text = inject_slack.sent_text(RECOVERED_ROW)
     assert text.split("\n")[0] == (
-        f"injection 661 sent: beam 90 (stream 1), DM 300, "
-        f"FWHM 11.8{NBSP}ms, amp 8{NBSP}counts, expected S/N 25")
+        f"injection 661 sent: beam 90, DM 300, "
+        f"FWHM 11.8{NBSP}ms, injected S/N 20")
     assert text.endswith("_awaiting recovery..._")
-    # sigma and the live std are deliberately gone from user-facing text
+    # sigma, the live std, the stream and the raw counts are all gone
     assert "sigma" not in text
     assert "std" not in text
+    assert "stream" not in text
+    assert "counts" not in text
 
 
-def test_expected_snr_falls_back_to_est_snr_with_a_tilde():
-    """Legacy amp_range rows have no target_snr: scale est_snr by the ratio."""
-    text = inject_slack.sent_text(MISSED_ROW)
-    # est_snr 333.7 at FWHM 23.44 ms -> ratio 1.22 -> ~407
-    ratio = inject_calib.rec_per_true(9.955 * 2.355)
-    assert f"expected S/N ~{333.7 * ratio:.0f}" in text
-    snr, approx = inject_slack.expected_snr(MISSED_ROW)
-    assert approx is True and snr == pytest.approx(333.7 * ratio)
+def test_injected_snr_prefers_the_generator_estimate():
+    """est_snr describes the pulse as WRITTEN; inject_snr is what was asked for."""
+    assert inject_slack.injected_snr(RECOVERED_ROW) == pytest.approx(19.662)
+    assert inject_slack.injected_snr(
+        dict(RECOVERED_ROW, est_snr=None)) == pytest.approx(12.0)
+    assert inject_slack.injected_snr({"est_snr": None}) is None
 
 
-def test_expected_snr_is_the_target_when_the_solver_set_one():
-    snr, approx = inject_slack.expected_snr(RECOVERED_ROW)
-    assert snr == 25.0 and approx is False
-
-
-def test_no_slack_text_says_target():
+def test_no_slack_text_says_target_or_expected():
     for text in (inject_slack.sent_text(RECOVERED_ROW),
                  inject_slack.summary_text([RECOVERED_ROW], "2026-09-09")):
         assert "target" not in text.lower()
+        assert "expected" not in text.lower()
 
 
 def test_sent_text_says_n_a_with_nothing_to_go_on():
-    assert "expected S/N n/a" in inject_slack.sent_text(
+    assert "injected S/N n/a" in inject_slack.sent_text(
         {"id": 1, "beam": 4, "stream": 0, "dm": 100.0, "amp": 5.0,
          "sigma_ms": 5.0})
 
@@ -200,10 +198,28 @@ def test_streak_and_summary_text():
     text = inject_slack.summary_text([RECOVERED_ROW, MISSED_ROW], "2026-09-09")
     assert "2 injected, 1 recovered" in text
     assert "1 missed_t1" in text
-    assert "reported/expected S/N: median 1.42" in text   # 35.5246 / 25.0
+    assert "reported/injected S/N: median 1.81" in text   # 35.5246 / 19.662
 
 
 # --- figures ----------------------------------------------------------------
+
+def test_saturated_rows_are_flagged():
+    """Reported above the width's cap: plotted, but out of the trend fit."""
+    # FWHM 11.8 ms, cap 40: id 664 reported 132
+    assert inject_slack.is_saturated(
+        dict(RECOVERED_ROW, rec_snr=132.372)) is True
+    assert inject_slack.is_saturated(RECOVERED_ROW) is False   # 35.5
+    # a wide shot saturates sooner: cap is 25.3 at FWHM 30 ms
+    wide = dict(RECOVERED_ROW, sigma_ms=30.0 / 2.355, rec_snr=30.0)
+    assert inject_slack.is_saturated(wide) is True
+    assert inject_slack.is_saturated({"rec_snr": None}) is False
+
+
+def test_fit_slope_through_the_origin():
+    assert inject_slack.fit_slope([1.0, 2.0], [2.0, 4.0]) == pytest.approx(2.0)
+    assert inject_slack.fit_slope([], []) is None
+    assert inject_slack.fit_slope([0.0], [5.0]) is None
+
 
 def test_summary_figures_written(tmp_path):
     paths = inject_slack.render_summary_figures(

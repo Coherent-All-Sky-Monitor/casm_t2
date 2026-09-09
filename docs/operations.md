@@ -118,12 +118,15 @@ minute later is tagged `injection`, and no dump fires:
 Force one shot's parameters:
 
     t2-inject config/t2d.yaml --once --beam 90 --dm 300 \
-        --fwhm-ms 11.8 --target-snr 25
+        --fwhm-ms 11.8 --inject-snr 20
 
 `--fwhm-ms` is the width argument. `--sigma-ms` still works and is
 converted (FWHM = 2.355 sigma), but it logs a deprecation line.
-`--target-snr` is still clamped to `injection.target_rec_snr_max`; a test
-shot is not a reason to blind the search for a gulp.
+`--inject-snr` is the injected (true) S/N, the same quantity the daemon
+samples. `--target-snr` is still accepted and means a hella-*reported* S/N;
+it is converted through the per-width `rec_per_true` table. Either way the
+shot is clamped to `injection.reported_snr_cap` for its width: a test shot
+is not a reason to blind the search for a gulp.
 
 The narrowest pulse that can be injected is **FWHM 2.47 ms**. That is not a
 policy choice: `make_noise_fil_with_frb_snr.py` renders with
@@ -165,22 +168,29 @@ Before enabling it, render the messages offline — no token, no network:
 
 That writes, per shot, the sent text, the outcome text and a PNG card of
 each (the colour bar is the attachment colour Slack would show), plus the
-daily summary text and three figures: recovered vs expected S/N against the
-1:1 line with misses hollow at zero, outcome counts, and DM error against
+daily summary text and three figures: recovered vs injected S/N with the
+1:1 line, a dashed least-squares fit through the origin labelled with its
+slope, and misses hollow at zero; outcome counts; and DM error against
 the recovered kernel FWHM. With no `--ids` it takes a whole UTC day
 (`--day`).
 
 The messages are deliberately short:
 
-    injection 661 sent: beam 90 (stream 1), DM 300, FWHM 11.8 ms,
-        amp 8 counts, expected S/N 25
-    recovered: S/N 35.5, DM 299.8, width 11.5 ms (ibox 4)
+    injection 660 sent: beam 150, DM 300, FWHM 4.7 ms, injected S/N 28
+    recovered: S/N 43.0, DM 299.8, width 3.1 ms (ibox 2)
+
+A shot whose reported S/N came out above the cap for its width saturated
+hella's candidate buffer, so its reported value measures the buffer rather
+than the pipeline. Those points stay on the recovery figure with an "x"
+through them and are left out of the trend fit.
 
 The recovered width is the kernel FWHM for that trial, not `2**ibox`
-samples. The expected S/N is the reported S/N the solver aimed at, which is
-known at fire time from the live beam std; a legacy row fired in the fixed
-`amp_range` mode has no target, so its expectation is estimated from
-`est_snr` and shown with a tilde ("expected S/N ~407").
+samples. The injected S/N is the generator's own matched-filter estimate of
+the pulse that was actually written (`est_snr`, its
+`INJECTED_SNR_ESTIMATE`), falling back to the value the solver aimed at
+(`inject_snr`) when the generator printed nothing. Slack never quotes a
+predicted reported S/N: that lives in `target_snr` in the ledger, where the
+cap logic uses it.
 
 A shot that resolves badly says only which stage lost it:
 
@@ -192,9 +202,8 @@ A shot that resolves badly says only which stage lost it:
 The last is injector plumbing, not a pipeline miss: it gets a grey bar
 rather than a red one and never counts toward a miss streak.
 
-Rows written before these columns existed have no `target_snr`, so their
-preview shows an estimated expectation with a tilde and they do not appear
-in the S/N figure.
+Rows written before these columns existed still have `est_snr`, so they
+show a real injected S/N and do appear in the recovery figure.
 
 ## Voltage dumps (manual)
 

@@ -114,44 +114,33 @@ def injected_fwhm_ms(row) -> float | None:
     return None if sigma is None else sigma * FWHM_PER_SIGMA
 
 
-def expected_snr(row, icfg: dict | None = None) -> tuple[float | None, bool]:
-    """The S/N this shot is expected to be reported at, and whether it is a guess.
+def injected_snr(row) -> float | None:
+    """The S/N of the pulse that was actually written into the stream.
 
-    Known at fire time: the solver picked the amplitude from the live beam
-    std so that hella would report `target_snr`, so that number IS the
-    expectation. Legacy rows fired in the fixed-amplitude `amp_range` mode
-    have no target; for those, scale the generator's own true-S/N estimate
-    by the measured reported/true ratio for that width and mark it a guess.
-    (`est_snr` may come from the generator's numerical matched filter rather
-    than the analytical one the ratio is defined against; they agree to a
-    few percent above FWHM 5 ms, which is well inside a "~".)
+    `est_snr` is the generator's own INJECTED_SNR_ESTIMATE for the rendered
+    filterbank (its canonical matched filter), so it describes the pulse as
+    written rather than as requested. `inject_snr` is the value the solver
+    aimed at and stands in when the generator printed nothing.
     """
-    target = _f(row, "target_snr")
-    if target is not None:
-        return target, False
     est = _f(row, "est_snr")
-    fwhm = injected_fwhm_ms(row)
-    if est is None or fwhm is None:
-        return None, True
-    return est * inject_calib.rec_per_true(fwhm, icfg), True
+    return est if est is not None else _f(row, "inject_snr")
 
 
 def sent_text(row, icfg: dict | None = None) -> str:
     """The message posted the moment the injection hits the FIFO.
 
-    Deliberately short: id, where, and the three numbers that describe the
-    shot. Non-breaking spaces join every number to its unit so Slack's
-    wrapping can never split "11.8 ms" across two lines.
+    Deliberately short: id, where it went, and what was put there. Non-
+    breaking spaces join every number to its unit so Slack's wrapping can
+    never split "4.7 ms" across two lines. `icfg` is accepted and unused;
+    the line no longer depends on any calibration table.
     """
     fwhm = injected_fwhm_ms(row)
-    snr, approx = expected_snr(row, icfg)
+    snr = injected_snr(row)
     bits = [
-        f"beam {_g(row, 'beam', '?')} (stream {_g(row, 'stream', '?')})",
+        f"beam {_g(row, 'beam', '?')}",
         f"DM {_f(row, 'dm') or 0:.0f}",
         f"FWHM {fwhm:.1f}{NBSP}ms" if fwhm is not None else "FWHM n/a",
-        f"amp {_f(row, 'amp') or 0:.0f}{NBSP}counts",
-        (f"expected S/N {'~' if approx else ''}{snr:.0f}" if snr is not None
-         else "expected S/N n/a"),
+        f"injected S/N {snr:.0f}" if snr is not None else "injected S/N n/a",
     ]
     return (f"injection {_g(row, 'id', '?')} sent: " + ", ".join(bits)
             + "\n_awaiting recovery..._")
@@ -237,12 +226,12 @@ def summary_text(rows, day: str) -> str:
                      "(injector plumbing, not a pipeline miss)")
 
     ratios = sorted(
-        (_f(r, "rec_snr") / _f(r, "target_snr")) for r in rows
+        (_f(r, "rec_snr") / injected_snr(r)) for r in rows
         if _g(r, "outcome") == oc.RECOVERED and _f(r, "rec_snr") is not None
-        and _f(r, "target_snr"))
+        and injected_snr(r))
     if ratios:
         med = ratios[len(ratios) // 2]
-        lines.append(f"reported/expected S/N: median {med:.2f} "
+        lines.append(f"reported/injected S/N: median {med:.2f} "
                      f"(range {ratios[0]:.2f}-{ratios[-1]:.2f})")
     return "\n".join(lines)
 
@@ -250,6 +239,36 @@ def summary_text(rows, day: str) -> str:
 # ---------------------------------------------------------------------------
 # figures
 # ---------------------------------------------------------------------------
+
+def is_saturated(row, icfg: dict | None = None) -> bool:
+    """True when the reported S/N is above the cap for that injected width.
+
+    Such a shot filled hella's per-gulp candidate buffer, so its reported
+    S/N says more about the buffer than about the pipeline's sensitivity.
+    It stays on the plot, but it must not steer the trend fit.
+    """
+    rec = _f(row, "rec_snr")
+    fwhm = injected_fwhm_ms(row)
+    if rec is None or fwhm is None:
+        return False
+    return rec > inject_calib.reported_snr_cap(fwhm, icfg)
+
+
+def fit_slope(xs, ys) -> float | None:
+    """Least-squares slope through the origin, sum(xy)/sum(x^2).
+
+    Forced through the origin because a zero-amplitude injection is a
+    zero-S/N detection: an intercept would be fitting noise. The slope is
+    the day's reported/injected ratio, the same quantity `rec_per_true`
+    tabulates per width.
+    """
+    xs = [float(x) for x in xs]
+    ys = [float(y) for y in ys]
+    denom = sum(x * x for x in xs)
+    if not xs or denom <= 0:
+        return None
+    return sum(x * y for x, y in zip(xs, ys)) / denom
+
 
 def _pub_rc() -> dict:
     """Publication rcParams, applied through rc_context so nothing leaks."""
@@ -327,15 +346,19 @@ def render_summary_figures(rows, out_dir) -> list[Path]:  # noqa: C901
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
 
-            # Figure 1: recovered vs expected S/N against the 1:1 line. A miss
-            # is the same DM marker, hollow, parked at recovered S/N = 0.
+            # Figure 1: recovered vs injected S/N. The 1:1 line is the
+            # reference; the dashed fit through the origin is what hella
+            # actually does, and its slope is the reported/injected ratio
+            # averaged over the day. A miss is the same DM marker, hollow,
+            # parked at recovered S/N = 0.
             fig = Figure(figsize=(6.3, 5.2))
             ax = fig.add_subplot(111)
-            targets = [t for t in (_f(r, "target_snr") for r in rows)
-                       if t is not None]
+            injected = [v for v in (injected_snr(r) for r in rows)
+                        if v is not None]
             recs = [s for s in (_f(r, "rec_snr") for r in rows) if s is not None]
-            lo = min(targets) - 2 if targets else 10.0
-            hi = (max(targets + recs) + 2) if (targets or recs) else 30.0
+            lo = min(injected) - 2 if injected else 10.0
+            hi = (max(injected + recs) + 2) if (injected or recs) else 30.0
+            lo = min(lo, 0.0) if not injected else lo
             ax.plot([lo, hi], [lo, hi], color=COLOR_NEUTRAL, lw=0.9,
                     ls=(0, (5, 3)), zorder=1)
             lbl = lo + 0.93 * (hi - lo)
@@ -343,8 +366,10 @@ def render_summary_figures(rows, out_dir) -> list[Path]:  # noqa: C901
                         textcoords="offset points", fontsize=9.5,
                         color=COLOR_NEUTRAL, ha="left", va="top")
             plotted = 0
+            fit_x, fit_y = [], []
+            n_saturated = 0
             for r in rows:
-                t = _f(r, "target_snr")
+                t = injected_snr(r)
                 if t is None:
                     continue
                 plotted += 1
@@ -354,24 +379,48 @@ def render_summary_figures(rows, out_dir) -> list[Path]:  # noqa: C901
                     ax.scatter([t], [s], s=70, marker=marker, facecolor=fill,
                                edgecolor=edge, linewidth=0.9, alpha=0.9,
                                zorder=3)
+                    if is_saturated(r):
+                        # Reported above the cap for its width means the shot
+                        # filled hella's candidate buffer, so its reported S/N
+                        # is not a measurement of the pipeline's response.
+                        # Still shown, struck through, but out of the fit.
+                        n_saturated += 1
+                        ax.scatter([t], [s], s=100, marker="x", color=_INK,
+                                   linewidth=1.4, zorder=4)
+                    else:
+                        fit_x.append(t)
+                        fit_y.append(s)
                 else:
                     ax.scatter([t], [0.0], s=70, marker=marker,
                                facecolor="none", edgecolor=edge,
                                linewidth=1.4, zorder=3)
+            slope = fit_slope(fit_x, fit_y)
+            if slope is not None:
+                ax.plot([0.0, hi], [0.0, slope * hi], color=_INK, lw=1.1,
+                        ls=(0, (2, 2)), zorder=2)
+                # label on the fit, at the right-hand edge, clipped into view
+                x_lab = min(hi * 0.93, hi if slope * hi <= hi else hi / slope * 0.93)
+                ax.annotate(f"fit: {slope:.2f}x", (x_lab, slope * x_lab),
+                            xytext=(8, -12), textcoords="offset points",
+                            fontsize=9.5, color=_INK, ha="left", va="top")
             if not plotted:
-                # Shots taken before the solver recorded its target have no
-                # x coordinate. Say so rather than show a blank panel.
-                ax.annotate("no shots with a recorded expected S/N",
+                # Rows with neither est_snr nor inject_snr have no x
+                # coordinate. Say so rather than show a blank panel.
+                ax.annotate("no shots with a recorded injected S/N",
                             (0.5, 0.5), xycoords="axes fraction", ha="center",
                             va="center", fontsize=11, color=COLOR_NEUTRAL)
             ax.set_xlim(lo, hi)
             ax.set_ylim(-1.0, hi)
-            ax.set_xlabel("expected S/N")
+            ax.set_xlabel("injected S/N")
             ax.set_ylabel("recovered S/N")
             ax.set_title("Injection recovery", fontsize=11.5, color=_INK,
                          loc="left", pad=10)
-            fig.legend(handles=_dm_legend_handles(Line2D, True),
-                       loc="outside center right", ncol=1,
+            handles = _dm_legend_handles(Line2D, True)
+            if n_saturated:
+                handles.append(Line2D(
+                    [], [], marker="x", color=_INK, ls="none", ms=9, mew=1.4,
+                    label="saturated hella (excluded from fit)"))
+            fig.legend(handles=handles, loc="outside center right", ncol=1,
                        handletextpad=0.3, labelspacing=0.6, fontsize=9.5)
             _despine(ax)
             _save(fig, "snr_recovery.png")

@@ -125,7 +125,8 @@ CREATE TABLE IF NOT EXISTS injections (
     fail_reason   TEXT,              -- first failed gate, human-readable
     created_utc   TEXT NOT NULL,
     -- solver inputs recorded at insert time (2026-09-09)
-    target_snr    REAL,              -- target hella-REPORTED S/N for the shot
+    target_snr    REAL,              -- PREDICTED hella-reported S/N for the shot
+    inject_snr    REAL,              -- injected (true, analytic) S/N the amp solved for
     sigma_n       REAL,              -- live per-channel std the solver used
     nchan_usable  INTEGER,           -- channels assumed unmasked by the solver
     -- matched-cluster detail, filled by reconcile()
@@ -181,7 +182,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         if tcols and col not in tcols:
             conn.execute(f"ALTER TABLE triggers ADD COLUMN {col} {decl}")
     icols = {r[1] for r in conn.execute("PRAGMA table_info(injections)")}
-    for col, decl in [("target_snr", "REAL"), ("sigma_n", "REAL"),
+    for col, decl in [("target_snr", "REAL"), ("inject_snr", "REAL"),
+                      ("sigma_n", "REAL"),
                       ("nchan_usable", "INTEGER"), ("rec_width", "INTEGER"),
                       ("rec_beam", "INTEGER"), ("rec_samp", "INTEGER"),
                       ("rec_lead_s", "REAL"), ("slack_ts", "TEXT"),
