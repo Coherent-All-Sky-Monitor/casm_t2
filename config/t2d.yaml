@@ -142,12 +142,20 @@ injection:
   # only if target_rec_snr_range is absent; its 25-45 counts predate Route Z
   # and would now give S/N of several hundred (casm-wiki injection-saturation.md).
   target_rec_snr_range: [18.0, 30.0]
-  rec_per_true: 1.5             # hella reported / analytical true, 5 ms shots 657/659: 1.72, 1.29
-  nchan_usable: 2880            # 3072 minus the 192-channel DTV mask
+  # hella-reported / the injector's own matched-filter estimate. 1.30 from the
+  # ONE clean live shot (id 659, sigma 5 ms); id 657 gives 1.44 but its estimate
+  # used a noise read 1.2x lower than the solver's. Offline the same ratio is a
+  # flat 1.08 for FWHM 2-25 ms (casm-wiki injection-calibration.md width table).
+  rec_per_true: 1.30
+  nchan_usable: 2600            # 3072 minus the 472-channel 470-484 MHz mask
   amp_range: [25.0, 45.0]
-  # sigma is the Gaussian std; FWHM = 2.355 sigma. Above ~10 ms the pulse is
-  # wider than hella's boxcar grid reaches and the 3-count u8 amplitude is too
-  # coarse (shot 658: 30 ms, target 35, reported 15.8).
+  # sigma is the Gaussian std; FWHM = 2.355 sigma. The cap is about PREDICTING
+  # the reported S/N, not about recovery: hella recovers to FWHM 148 ms, but
+  # the estimate-to-reported ratio is flat at 1.08 only to FWHM 25 ms
+  # (sigma 10.7) and then runs to 1.23, 1.63, 2.72. Wider injections need the
+  # per-width ratio from casm-wiki injection-calibration.md, not this constant.
+  # Also keep the rendered peak at 5 counts or more: the fil is u8, and 3
+  # counts gives 3 levels across the pulse (about 20% of the S/N).
   sigma_ms_range: [1.0, 10.0]
   scratch_dir: /mnt/nvme5/casm_pipeline/injections
 
