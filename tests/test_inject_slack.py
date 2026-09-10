@@ -258,11 +258,37 @@ def test_streak_and_summary_text():
 
     text = inject_slack.summary_text([RECOVERED_ROW, MISSED_ROW], "2026-09-09")
     assert "2 injected, 1 recovered" in text
-    assert "1 missed_t1" in text
+    assert "missed: 1 missed by hella (T1)" in text
     assert "recovered/injected S/N: median 1.81" in text  # 35.5246 / 19.662
 
 
 # --- figures ----------------------------------------------------------------
+
+def test_every_outcome_has_a_plain_label():
+    """The enum values stay the DB/wire strings; these are display only."""
+    assert oc.LABELS == {
+        oc.RECOVERED: "recovered",
+        oc.MISSED_T1: "missed by hella (T1)",
+        oc.MISSED_T2: "T2 miss (no cluster formed)",
+        oc.MISSED_TRIGGER: "T2 miss (filter criteria)",
+        oc.FIRE_FAILED: "not fired",
+    }
+    assert set(oc.LABELS) == set(oc.ALL)
+    for outcome in oc.ALL:
+        assert "_" not in oc.label(outcome)
+    assert oc.label("something_new") == "something_new"
+
+
+def test_summary_missed_line_uses_the_plain_labels():
+    rows = [dict(MISSED_ROW, outcome=oc.MISSED_T1),
+            dict(MISSED_ROW, outcome=oc.MISSED_TRIGGER),
+            dict(MISSED_ROW, outcome=oc.MISSED_T2)]
+    text = inject_slack.summary_text(rows, "2026-09-09")
+    assert ("missed: 1 missed by hella (T1); 1 T2 miss (no cluster formed); "
+            "1 T2 miss (filter criteria)") in text
+    for enum_name in ("missed_t1", "missed_t2", "missed_trigger"):
+        assert enum_name not in text
+
 
 def test_summary_figures_written(tmp_path):
     paths = inject_slack.render_summary_figures(

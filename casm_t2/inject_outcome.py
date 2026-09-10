@@ -31,6 +31,23 @@ ALL = (RECOVERED, MISSED_T1, MISSED_T2, MISSED_TRIGGER, FIRE_FAILED)
 #: Set by the daemon on a shot that never reached the stream.
 FIRE_FAILED_PREFIXES = ("fifo_write_failed", "file_generation_failed")
 
+#: Plain labels for anywhere a human reads the outcome as a category - the
+#: summary's "missed:" line and the outcome bar chart. The enum strings stay
+#: the wire/DB values; these are only ever display text.
+LABELS = {
+    RECOVERED: "recovered",
+    MISSED_T1: "missed by hella (T1)",
+    MISSED_T2: "T2 miss (no cluster formed)",
+    MISSED_TRIGGER: "T2 miss (filter criteria)",
+    FIRE_FAILED: "not fired",
+}
+
+
+def label(outcome: str | None) -> str:
+    """Display label for an outcome, falling back to the raw value."""
+    return LABELS.get(str(outcome), str(outcome))
+
+
 #: Fallback phrases, used only when reconcile() left no detail in
 #: `fail_reason`. The real message is the detail: it names the stage AND what
 #: the evidence at that stage actually was, DSA style. Anything counting over

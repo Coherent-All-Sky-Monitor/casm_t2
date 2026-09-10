@@ -272,7 +272,8 @@ def summary_text(rows, day: str) -> str:
 
     misses = [(k, counts[k]) for k in oc.MISSES if counts[k]]
     if misses:
-        lines.append("missed: " + "; ".join(f"{v} {k}" for k, v in misses))
+        lines.append("missed: " + "; ".join(
+            f"{v} {oc.label(k)}" for k, v in misses))
     if counts[oc.FIRE_FAILED]:
         lines.append(f"{counts[oc.FIRE_FAILED]} fire failures "
                      "(injector plumbing, not a pipeline miss)")
@@ -437,7 +438,7 @@ def render_summary_figures(rows, out_dir) -> list[Path]:  # noqa: C901
                 ax.annotate(f" {v}", (v, rect.get_y() + rect.get_height() / 2),
                             ha="left", va="center", fontsize=11, color=_INK)
             ax.set_yticks(range(len(labels)))
-            ax.set_yticklabels([o.replace("_", " ") for o in labels])
+            ax.set_yticklabels([oc.label(o) for o in labels])
             ax.set_xlim(0, max(vals) * 1.15 if max(vals) else 1)
             ax.xaxis.set_visible(False)
             ax.minorticks_off()
