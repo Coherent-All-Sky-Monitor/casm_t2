@@ -256,7 +256,7 @@ working from and what the matched cluster looked like:
 | rec_beam | peak beam of the matched cluster |
 | rec_samp | peak sample of the matched cluster |
 | rec_lead_s | cluster event time minus inject_utc, seconds |
-| rec_offset_arcsec | sky separation of the injected and recovered beams |
+| rec_offset_arcsec | sky separation of the injected and recovered beams; shown only when they differ |
 | slack_ts | ts of the Slack message for this shot, when posting is on |
 | outcome | closed enum, below |
 

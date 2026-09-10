@@ -168,14 +168,14 @@ Before enabling it, render the messages offline — no token, no network:
 
 That writes, per shot, the sent text, the outcome text and a PNG card of
 each (the colour bar is the attachment colour Slack would show), plus the
-daily summary text and two figures: recovered vs injected S/N with the 1:1
-line and misses hollow at zero, and outcome counts. With no `--ids` it takes
+daily summary text and two untitled figures: recovered vs injected S/N
+with the 1:1 line and misses hollow at zero, and outcome counts. With no `--ids` it takes
 a whole UTC day (`--day`). `--web-base` sets the host the links point at.
 
 The messages:
 
     injection 660 sent: beam 150, DM 300, FWHM 4.7 ms, injected S/N 28
-    recovered -> <.../injections/plot/inj_..._b150|inj_..._b150> | SNR 43.0 (ratio 1.54) | DM 299.8 (delta -0.2) | offset 0 arcsec | width 3.1 ms (ibox 2)
+    recovered -> <.../injections/plot/inj_..._b150|inj_..._b150> | SNR 43.0 (ratio 1.54) | DM 299.8 (delta -0.2) | beam 150 | width 3.1 ms (ibox 2)
 
 The link goes to the shot's truth plot on the T3 web app; a shot whose
 cluster triggered a dump links to its event page instead, which carries the
@@ -183,12 +183,17 @@ dump, the plot and the trigger audit. `injection.slack.web_base` sets the
 base URL, defaulting to `http://127.0.0.1:8050` like t3-collect's
 `--web-base`.
 
-`ratio` is recovered over injected S/N. `offset` is the great-circle
-separation between the injected beam's pointing and the recovered beam's,
-from the pointing table live at the injection time, so it answers "how far
-from where we put it did it come back"; the same beam is 0, and with no
-pointing table it reads `offset n/a`. The width is last so it is easy to
-drop, and is the kernel FWHM for that trial, not `2**ibox` samples.
+`ratio` is recovered over injected S/N. The beam is where it came back:
+recovered in the injected beam it is a bare `beam 150`, and in any other
+beam it carries the sky separation of the two pointings, `beam 152 (offset
+3600 arcsec)`, taken from the pointing table live at the injection time
+(neighbouring beam indices are not a fixed angle apart, so the index alone
+would not say how far). With no pointing table it reads `beam 152 (offset
+n/a)`. The width is last so it is easy to drop, and is the kernel FWHM for
+that trial, not `2**ibox` samples.
+
+The daily summary is one top-level message with the two figures as replies
+in its thread.
 
 The injected S/N is the generator's own matched-filter estimate of the pulse
 that was actually written (`est_snr`, its `INJECTED_SNR_ESTIMATE`), falling

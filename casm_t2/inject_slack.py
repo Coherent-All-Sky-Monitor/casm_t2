@@ -167,6 +167,27 @@ def outcome_link(row, web_base: str = DEFAULT_WEB_BASE) -> str:
     return f"`{_g(row, 'id', '?')}`"
 
 
+def recovered_beam_text(row) -> str:
+    """Which beam it came back in, and how far that is from where it went.
+
+    Landing in the injected beam is the ordinary case and needs no number,
+    so it reads as a bare "beam 150". A different beam carries the sky
+    separation of the two pointings, which is the quantity that matters -
+    neighbouring beam indices are not a fixed angle apart.
+    """
+    rec_beam = _g(row, "rec_beam")
+    if rec_beam is None:
+        return "beam n/a"
+    rec_beam = int(rec_beam)
+    inj_beam = _g(row, "beam")
+    if inj_beam is not None and int(inj_beam) == rec_beam:
+        return f"beam {rec_beam}"
+    offset = _f(row, "rec_offset_arcsec")
+    if offset is None:
+        return f"beam {rec_beam} (offset n/a)"
+    return f"beam {rec_beam} (offset {offset:.0f}{NBSP}arcsec)"
+
+
 def outcome_text(row, web_base: str = DEFAULT_WEB_BASE) -> str:
     """One line describing how the shot resolved.
 
@@ -188,7 +209,6 @@ def outcome_text(row, web_base: str = DEFAULT_WEB_BASE) -> str:
     rec_dm = _f(row, "rec_dm")
     dm = _f(row, "dm")
     inj = injected_snr(row)
-    offset = _f(row, "rec_offset_arcsec")
     ibox = _g(row, "rec_width")
 
     snr_bit = "SNR n/a"
@@ -199,11 +219,8 @@ def outcome_text(row, web_base: str = DEFAULT_WEB_BASE) -> str:
     if rec_dm is not None:
         delta = f" (delta {rec_dm - dm:+.1f})" if dm is not None else ""
         dm_bit = f"DM {rec_dm:.1f}{delta}"
-    off_bit = ("offset n/a" if offset is None
-               else f"offset {offset:.0f}{NBSP}arcsec")
-
     bits = [f"recovered -> {outcome_link(row, web_base)}", snr_bit, dm_bit,
-            off_bit]
+            recovered_beam_text(row)]
     if ibox is not None:
         bits.append(f"width {hella_kernel.kernel_fwhm_ms(int(ibox)):.1f}"
                     f"{NBSP}ms (ibox {int(ibox)})")
@@ -396,8 +413,6 @@ def render_summary_figures(rows, out_dir) -> list[Path]:  # noqa: C901
             ax.set_ylim(-1.0, hi)
             ax.set_xlabel("injected S/N")
             ax.set_ylabel("recovered S/N")
-            ax.set_title("Injection recovery", fontsize=11.5, color=_INK,
-                         loc="left", pad=10)
             fig.legend(handles=_dm_legend_handles(Line2D, True),
                        loc="outside center right", ncol=1,
                        handletextpad=0.3, labelspacing=0.6, fontsize=9.5)
@@ -431,8 +446,6 @@ def render_summary_figures(rows, out_dir) -> list[Path]:  # noqa: C901
                 ax.spines[side].set_visible(False)
             ax.spines["left"].set_color(_INK)
             ax.tick_params(colors=_INK, labelsize=10.5)
-            ax.set_title("Outcomes", fontsize=11.5, color=_INK, loc="left",
-                         pad=10)
             _save(fig, "outcomes.png")
 
         except Exception as exc:  # noqa: BLE001
@@ -667,7 +680,7 @@ class SlackPoster:
                                               "text": "", "fallback": text}])
 
     def post_summary(self, rows, day: str, fig_dir) -> str | None:
-        """Summary text plus the three figures threaded under it."""
+        """Summary text as one top-level message, figures as replies in its thread."""
         if not self.enabled:
             return None
         text = summary_text(rows, day)

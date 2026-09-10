@@ -151,7 +151,7 @@ def test_outcome_text_recovered_is_the_dsa_shape():
         "recovered -> <http://host:8050/injections/plot/"
         "inj_20260909_221751_b090|inj_20260909_221751_b090> | "
         "SNR 35.5 (ratio 1.81) | DM 299.8 (delta -0.2) | "
-        f"offset 15{NBSP}arcsec | width 11.5{NBSP}ms (ibox 4)")
+        f"beam 90 | width 11.5{NBSP}ms (ibox 4)")
     assert inject_slack.outcome_color(RECOVERED_ROW) == inject_slack.COLOR_RECOVERED
 
 
@@ -170,14 +170,27 @@ def test_outcome_link_defaults_to_the_local_web_base():
         "<http://127.0.0.1:8050/injections/plot/")
 
 
-def test_offset_reads_n_a_without_a_pointing_table():
-    row = dict(RECOVERED_ROW, rec_offset_arcsec=None)
-    assert "offset n/a" in inject_slack.outcome_text(row)
+def test_same_beam_needs_no_offset():
+    """Landing where it was put is the ordinary case: no number needed."""
+    assert inject_slack.recovered_beam_text(RECOVERED_ROW) == "beam 90"
+    assert "offset" not in inject_slack.outcome_text(RECOVERED_ROW)
 
 
-def test_same_beam_offset_is_zero():
-    row = dict(RECOVERED_ROW, rec_offset_arcsec=0.0)
-    assert f"offset 0{NBSP}arcsec" in inject_slack.outcome_text(row)
+def test_a_different_beam_carries_the_offset():
+    row = dict(RECOVERED_ROW, rec_beam=92, rec_offset_arcsec=3600.0)
+    assert inject_slack.recovered_beam_text(row) == (
+        f"beam 92 (offset 3600{NBSP}arcsec)")
+    assert f"beam 92 (offset 3600{NBSP}arcsec)" in inject_slack.outcome_text(row)
+
+
+def test_a_different_beam_without_a_pointing_table():
+    row = dict(RECOVERED_ROW, rec_beam=92, rec_offset_arcsec=None)
+    assert inject_slack.recovered_beam_text(row) == "beam 92 (offset n/a)"
+
+
+def test_no_recovered_beam_at_all():
+    row = dict(RECOVERED_ROW, rec_beam=None)
+    assert inject_slack.recovered_beam_text(row) == "beam n/a"
 
 
 def test_kernel_width_is_last_so_it_is_easy_to_drop():
@@ -329,3 +342,31 @@ def test_check_streak_posts_at_multiples(tmp_path, conn, no_network):
                                       streak_every=5)
     assert inject_slack.check_streak(conn, poster) == 5
     assert list(tmp_path.glob("*streak_5.txt"))
+
+
+def test_summary_posts_one_message_with_the_figures_in_its_thread(tmp_path,
+                                                                  monkeypatch):
+    """One top-level text message; each figure a reply carrying its ts."""
+    poster = inject_slack.SlackPoster(enabled=True)
+    calls = {"posts": [], "files": []}
+
+    def fake_post(text, attachments=None, thread_ts=None):
+        calls["posts"].append((text, thread_ts))
+        return "1757000000.001"
+
+    def fake_post_file(png, title, thread_ts=None):
+        calls["files"].append((png.name, thread_ts))
+        return True
+
+    monkeypatch.setattr(poster, "_post", fake_post)
+    monkeypatch.setattr(poster, "_post_file", fake_post_file)
+    ts = poster.post_summary([RECOVERED_ROW, MISSED_ROW], "2026-09-09", tmp_path)
+
+    assert ts == "1757000000.001"
+    # exactly one top-level message, itself not a reply
+    assert len(calls["posts"]) == 1
+    assert calls["posts"][0][1] is None
+    assert calls["posts"][0][0].startswith("test injections: 24 h summary")
+    # both figures replied into that message's thread
+    assert [n for n, _ in calls["files"]] == ["snr_recovery.png", "outcomes.png"]
+    assert all(t == ts for _, t in calls["files"])
