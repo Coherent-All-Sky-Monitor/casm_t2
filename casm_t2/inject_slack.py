@@ -53,13 +53,16 @@ _INK = "#262626"
 #: Marker identity per DM bin, in bin order. Identity rides on colour AND
 #: marker shape, so the figures survive greyscale printing and colour-blind
 #: readers. Bin EDGES come from `injection.summary_dm_bins`; these are just
-#: the styles they are drawn with, reused cyclically if there are more bins.
+#: the styles they are drawn with. There are six, which covers the default
+#: five edges (four bins plus the two open ends) without repeating; a longer
+#: bin list cycles, and two bins then share a style.
 DM_STYLES = [
     ("#4C6EF5", "o", "#364FC7"),
     ("#F59F00", "s", "#E67700"),
     ("#12B886", "^", "#087F5B"),
     ("#BE4BDB", "D", "#9C36B5"),
     ("#E8590C", "v", "#D9480F"),
+    ("#0CA678", "P", "#087F5B"),
 ]
 
 #: Default bin edges, matching the shipped `injection.sample.dm` range.
@@ -82,12 +85,6 @@ def dm_bin_labels(icfg: dict | None = None) -> list[str]:
     return labels
 
 
-OUTCOME_COLORS = {
-    oc.RECOVERED: COLOR_RECOVERED,
-    oc.MISSED_T1: COLOR_MISSED,
-    oc.MISSED_T2: "#E65100",
-    oc.FIRE_FAILED: COLOR_NEUTRAL,
-}
 
 
 # ---------------------------------------------------------------------------
@@ -406,7 +403,10 @@ def _dm_legend_handles(line2d, with_miss: bool,
 
 def render_summary_figures(rows, out_dir,
                            icfg: dict | None = None) -> list[Path]:  # noqa: C901
-    """Three figures for the daily summary; returns the paths written.
+    """The daily summary figure; returns the paths written.
+
+    One figure: injected against recovered S/N. The outcome counts are in
+    the summary text, where they read as well and cost no attention.
 
     Never raises: a matplotlib problem logs a warning and returns whatever
     rendered, so the summary text still posts.
@@ -485,34 +485,6 @@ def render_summary_figures(rows, out_dir,
             _despine(ax)
             _save(fig, "snr_recovery.png")
 
-            # Figure 2: outcome counts, horizontal, direct-labeled.
-            fig = Figure(figsize=(6.2, 3.2))
-            ax = fig.add_subplot(111)
-            counts = {o: 0 for o in oc.ALL}
-            for r in rows:
-                o = str(_g(r, "outcome") or "")
-                if o in counts:
-                    counts[o] += 1
-            labels = [o for o in oc.ALL if counts[o] > 0] or [oc.RECOVERED]
-            labels = labels[::-1]          # recovered on top
-            vals = [counts[o] for o in labels]
-            bars = ax.barh(range(len(labels)), vals,
-                           color=[OUTCOME_COLORS[o] for o in labels],
-                           height=0.6, zorder=3)
-            for rect, v in zip(bars, vals):
-                ax.annotate(f" {v}", (v, rect.get_y() + rect.get_height() / 2),
-                            ha="left", va="center", fontsize=11, color=_INK)
-            ax.set_yticks(range(len(labels)))
-            ax.set_yticklabels([oc.label(o) for o in labels])
-            ax.set_xlim(0, max(vals) * 1.15 if max(vals) else 1)
-            ax.xaxis.set_visible(False)
-            ax.minorticks_off()
-            ax.tick_params(axis="y", length=0)
-            for side in ("top", "right", "bottom"):
-                ax.spines[side].set_visible(False)
-            ax.spines["left"].set_color(_INK)
-            ax.tick_params(colors=_INK, labelsize=10.5)
-            _save(fig, "outcomes.png")
 
         except Exception as exc:  # noqa: BLE001
             logger.warning("summary figure render failed: %s", exc,
@@ -771,7 +743,7 @@ class SlackPoster:
                                               "text": "", "fallback": text}])
 
     def post_summary(self, rows, day: str, fig_dir) -> str | None:
-        """Summary text as one top-level message, figures as replies in its thread."""
+        """Summary text as one top-level message, the figure as a reply in its thread."""
         if not self.enabled:
             return None
         text = summary_text(rows, day, self.icfg)

@@ -222,8 +222,8 @@ Before enabling it, render the messages offline — no token, no network:
 
 That writes, per shot, the sent text, the outcome text and a PNG card of
 each (the colour bar is the attachment colour Slack would show), plus the
-daily summary text and two untitled figures: recovered vs injected S/N
-with the 1:1 line and misses hollow at zero, and outcome counts. With no `--ids` it takes
+daily summary text and one untitled figure: injected vs recovered S/N with
+the 1:1 line and misses hollow at zero, coloured by DM bin. With no `--ids` it takes
 a whole UTC day (`--day`). `--web-base` sets the host the links point at.
 
 The messages:
@@ -249,8 +249,8 @@ would not say how far). With no pointing table it reads `beam 152 (offset
 n/a)`. The width is last so it is easy to drop, and is the kernel FWHM for
 that trial, not `2**ibox` samples.
 
-The daily summary is one top-level message with the two figures as replies
-in its thread.
+The daily summary is one top-level message with the figure as a reply in
+its thread. The outcome counts live in the text, not in a chart.
 
 The injected S/N is the generator's own matched-filter estimate of the pulse
 that was actually written (`est_snr`, its `INJECTED_SNR_ESTIMATE`), falling

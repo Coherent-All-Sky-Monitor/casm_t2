@@ -298,7 +298,7 @@ def test_summary_missed_line_uses_the_plain_labels():
 def test_summary_figures_written(tmp_path):
     paths = inject_slack.render_summary_figures(
         [RECOVERED_ROW, MISSED_ROW], tmp_path / "figs")
-    assert [p.name for p in paths] == ["snr_recovery.png", "outcomes.png"]
+    assert [p.name for p in paths] == ["snr_recovery.png"]
     assert all(p.is_file() and p.stat().st_size > 0 for p in paths)
 
 
@@ -375,9 +375,9 @@ def test_check_streak_posts_at_multiples(tmp_path, conn, no_network):
     assert list(tmp_path.glob("*streak_5.txt"))
 
 
-def test_summary_posts_one_message_with_the_figures_in_its_thread(tmp_path,
-                                                                  monkeypatch):
-    """One top-level text message; each figure a reply carrying its ts."""
+def test_summary_posts_one_message_with_the_figure_in_its_thread(tmp_path,
+                                                                 monkeypatch):
+    """One top-level text message; the figure a reply carrying its ts."""
     poster = inject_slack.SlackPoster(enabled=True)
     calls = {"posts": [], "files": []}
 
@@ -398,8 +398,8 @@ def test_summary_posts_one_message_with_the_figures_in_its_thread(tmp_path,
     assert len(calls["posts"]) == 1
     assert calls["posts"][0][1] is None
     assert calls["posts"][0][0].startswith("test injections: 24 h summary")
-    # both figures replied into that message's thread
-    assert [n for n, _ in calls["files"]] == ["snr_recovery.png", "outcomes.png"]
+    # the figure replied into that message's thread
+    assert [n for n, _ in calls["files"]] == ["snr_recovery.png"]
     assert all(t == ts for _, t in calls["files"])
 
 
@@ -462,3 +462,11 @@ def test_summary_per_dm_line_uses_the_configured_bins():
     rows = [dict(RECOVERED_ROW, dm=150.0), dict(RECOVERED_ROW, dm=850.0)]
     text = inject_slack.summary_text(rows, "2026-09-10")
     assert "per DM: DM 100-300: 1/1 | DM 700-900: 1/1" in text
+
+
+def test_the_default_dm_bins_all_get_distinct_styles():
+    """Colour AND marker carry identity, so two bins must not share a style."""
+    labels = inject_slack.dm_bin_labels()
+    styles = [inject_slack.DM_STYLES[i % len(inject_slack.DM_STYLES)]
+              for i in range(len(labels))]
+    assert len(set(styles)) == len(labels)
