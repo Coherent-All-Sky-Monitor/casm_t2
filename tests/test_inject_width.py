@@ -287,42 +287,257 @@ def test_offset_is_none_without_a_pointing_table():
                                      0, 400) is None
 
 
-# --- the counterfactual trigger refusal -------------------------------------
+# --- raw T1 trials behind a shot with no cluster ----------------------------
 
-FILT = {"dm_floor": 20.0, "max_nbeam": 32, "beam_veto": []}
-TIERS = {"A": 30.0, "B": 18.0, "C": 12.0}
-
-
-def _refuse(tier="B", tags="injection", snr=25.0, dm=300.0, n_beams=1, beam=90):
-    return d.trigger_refusal(tier, tags, snr, dm, n_beams, beam, FILT, TIERS)
+HEADER = "SNR SAMP_START TIME_START WIDTH DM_IDX DM BEAM_IDX\n"
 
 
-def test_a_clean_injection_would_have_triggered():
-    """The `injection` tag is on every shot by design and is not a reason."""
-    assert _refuse() is None
+def _cands(tmp_path, rows, obs="2026-09-09-21:12:15", stream=3):
+    """Write a hella-format candidate file and return its path."""
+    path = tmp_path / f"cands_{obs}.dat.{stream}"
+    with path.open("w") as fh:
+        fh.write(HEADER)
+        for snr, samp, dm, beam in rows:
+            fh.write(f"{snr} {samp} 0.0 4 100 {dm} {beam}\n")
+    return path
 
 
-@pytest.mark.parametrize("tags,expect", [
-    ("injection,veto", "cluster peaked in vetoed beam 90"),
-    ("injection,rfi_wide", "cluster tagged rfi_wide, spanning 1 beams (max 32)"),
-    ("injection,dm_floor",
-     "cluster tagged dm_floor by the low-DM storm veto"),
-    ("injection,occupancy:34",
-     "cluster tagged occupancy:34 by the beam-occupancy veto"),
-])
-def test_each_veto_tag_names_itself(tags, expect):
-    assert _refuse(tags=tags) == expect
+def test_matching_trials_are_counted(tmp_path):
+    path = _cands(tmp_path, [
+        (9.2, 1000, 500.0, 200),      # matches
+        (8.1, 1010, 505.0, 201),      # matches: beam +1, DM inside tolerance
+        (7.5, 1020, 500.0, 198),      # matches: beam -2 is the edge
+        (30.0, 1005, 500.0, 210),     # wrong beam
+        (30.0, 1005, 900.0, 200),     # wrong DM
+        (30.0, 90000, 500.0, 200),    # outside the sample window
+    ])
+    n, best = d.count_t1_trials(path, beams={198, 199, 200, 201, 202},
+                                dm=500.0, samp_lo=900, samp_hi=1100)
+    assert n == 3
+    assert best == pytest.approx(9.2)
 
 
-def test_below_tier_b_names_the_threshold():
-    assert _refuse(tier="C", snr=15.8) == "cluster at S/N 15.8 below tier B (18)"
+def test_no_matching_trials(tmp_path):
+    path = _cands(tmp_path, [(30.0, 1005, 900.0, 210)])
+    assert d.count_t1_trials(path, beams={200}, dm=500.0,
+                             samp_lo=900, samp_hi=1100) == (0, None)
 
 
-def test_below_the_dm_floor():
-    assert _refuse(dm=12.4) == "cluster at DM 12.4 below the floor (20)"
+def test_a_missing_file_is_not_the_same_as_no_trials(tmp_path):
+    """None means 'cannot tell', which must never read as 'hella saw nothing'."""
+    assert d.count_t1_trials(tmp_path / "nope.dat.3", {200}, 500.0, 0, 1) is None
 
 
-def test_veto_order_matches_t2d():
-    """t2d drops on the tag before it ever looks at tier, so so do we."""
-    assert _refuse(tags="injection,dm_floor", tier="-", snr=3.0) == (
-        "cluster tagged dm_floor by the low-DM storm veto")
+def test_the_header_line_is_not_a_trial(tmp_path):
+    path = _cands(tmp_path, [])
+    assert d.count_t1_trials(path, beams={200}, dm=500.0,
+                             samp_lo=0, samp_hi=1e9) == (0, None)
+
+
+def test_dm_tolerance_matches_the_cluster_rule():
+    assert d.dm_tolerance(500.0) == pytest.approx(75.0)
+    assert d.dm_tolerance(10.0) == pytest.approx(5.0)      # floor
+
+
+def test_cands_path_shape():
+    assert d.cands_path("2026-09-09-21:12:15", 3, "/tmp/x").name == (
+        "cands_2026-09-09-21:12:15.dat.3")
+
+
+def test_obs_utc_start_at(conn, cluster_row):
+    from datetime import datetime, timezone
+    from casm_t2 import db as _db
+    _db.insert_clusters(conn, [cluster_row("260731aaaaaa")])
+    conn.execute("UPDATE clusters SET obs_utc_start='2026-07-31-00:00:00',"
+                 " event_utc='2026-07-31T00:00:10.000+00:00'")
+    conn.commit()
+    got = d.obs_utc_start_at(
+        conn, datetime(2026, 7, 31, 0, 5, tzinfo=timezone.utc))
+    assert got == "2026-07-31-00:00:00"
+    # nothing that old
+    assert d.obs_utc_start_at(
+        conn, datetime(2026, 7, 30, tzinfo=timezone.utc)) is None
+
+
+# --- reconcile end to end ---------------------------------------------------
+
+def _inject(conn, inj_id=1, utc="2026-07-31T00:05:00.000+00:00",
+            stream=3, beam=200, dm=500.0):
+    conn.execute(
+        "INSERT INTO injections (id, inject_utc, stream, beam, dm, amp,"
+        " sigma_ms, file_id, created_utc) VALUES (?,?,?,?,?,5.0,5.0,'f',?)",
+        (inj_id, utc, stream, beam, dm, utc))
+    conn.commit()
+
+
+def _observation(conn, cluster_row, obs="2026-07-31-00:00:00"):
+    """One cluster, only so obs_utc_start_at has an observation to find."""
+    from casm_t2 import db as _db
+    _db.insert_clusters(conn, [cluster_row("260731zzzzzz")])
+    conn.execute("UPDATE clusters SET obs_utc_start=?,"
+                 " event_utc='2026-07-31T00:00:10.000+00:00'", (obs,))
+    conn.commit()
+
+
+def _outcome(conn, inj_id=1):
+    return conn.execute(
+        "SELECT outcome, fail_reason, n_t1_trials FROM injections WHERE id=?",
+        (inj_id,)).fetchone()
+
+
+def test_reconcile_missed_t2_when_trials_are_there(conn, cluster_row, tmp_path):
+    _observation(conn, cluster_row)
+    _inject(conn)
+    # inject_utc is 300 s after UTC_START, so the window centre is sample
+    # 300/0.001048576 = 286102
+    _cands(tmp_path, [(9.2, 286102, 500.0, 200), (8.0, 286200, 498.0, 201)],
+           obs="2026-07-31-00:00:00", stream=3)
+    d.reconcile(conn, 1, {"injection": {"hella_cands_dir": str(tmp_path)}})
+    outcome, reason, n = _outcome(conn)
+    assert outcome == "missed_t2"
+    assert n == 2
+    assert reason == ("lost at T2: 2 matching T1 trials (best S/N 9.2) "
+                      "but no cluster formed (min 5 members)")
+
+
+def test_reconcile_missed_t1_when_the_file_has_nothing(conn, cluster_row,
+                                                       tmp_path):
+    _observation(conn, cluster_row)
+    _inject(conn)
+    _cands(tmp_path, [(30.0, 286102, 900.0, 210)],
+           obs="2026-07-31-00:00:00", stream=3)
+    d.reconcile(conn, 1, {"injection": {"hella_cands_dir": str(tmp_path)}})
+    outcome, reason, n = _outcome(conn)
+    assert outcome == "missed_t1"
+    assert n == 0
+    assert reason.startswith("lost at T1: no matching trial in beam 200")
+
+
+def test_reconcile_missed_t1_when_the_file_is_missing(conn, cluster_row,
+                                                      tmp_path):
+    _observation(conn, cluster_row)
+    _inject(conn)
+    d.reconcile(conn, 1, {"injection": {"hella_cands_dir": str(tmp_path)}})
+    outcome, reason, n = _outcome(conn)
+    assert outcome == "missed_t1"
+    assert n is None                      # unknown, not zero
+    assert "T1 file unavailable" in reason
+    assert "not found" in reason
+
+
+def test_a_low_snr_cluster_is_recovered(conn, make_cluster, tmp_path):
+    """S/N 15.8, below tier B: found by the search, so recovered."""
+    from casm_t2 import db as _db
+    cl = make_cluster(snr=15.8, beam=200)
+    _db.insert_clusters(conn, [(cl, "2026-07-31-00:00:00", 1,
+                                "2026-07-31T00:05:05.000+00:00", "C",
+                                "injection", "260731cccccc")])
+    conn.execute("UPDATE clusters SET dm=500.0, dm_lo=499.0, dm_hi=501.0")
+    conn.commit()
+    _inject(conn)
+    d.reconcile(conn, 1, {"injection": {"hella_cands_dir": str(tmp_path)}})
+    outcome, reason, n = _outcome(conn)
+    assert outcome == "recovered"
+    assert reason is None
+    assert n is None                      # no need to look at raw trials
+    # the trigger gate is still recorded, it just does not decide
+    gate = conn.execute(
+        "SELECT gate_trigger FROM injections WHERE id=1").fetchone()[0]
+    assert gate == 0
+
+
+# --- sky neighbours, not beam index -----------------------------------------
+
+def _sky_with_neighbours():
+    """A 512-beam table where beam 5's sky neighbours are 200 and 301.
+
+    Beam 6 - its index neighbour - is parked far away, which is the whole
+    point: index adjacency says nothing about the sky.
+    """
+    from casm_t2 import cluster as cl
+    import numpy as np
+    alt = np.full(512, 80.0)
+    az = np.arange(512, dtype=float) * 0.7 % 360.0   # scattered
+    # put 5, 200, 301 essentially on top of each other, and 6 far off
+    for b in (5, 200, 301):
+        alt[b], az[b] = 80.0, 10.0
+    alt[200], az[200] = 80.05, 10.0        # a few arcmin away
+    alt[301], az[301] = 79.95, 10.0
+    alt[6], az[6] = 40.0, 200.0            # nowhere near
+    return cl.SkyTable(alt, az, weights_id="wtest")
+
+
+def test_neighbour_beams_is_a_sky_test_not_an_index_one():
+    from casm_t2 import cluster as cl
+    sky = _sky_with_neighbours()
+    got = cl.neighbour_beams(sky, 5, fwhm_x_deg=1.0, fwhm_y_deg=1.0)
+    assert 5 in got and 200 in got and 301 in got
+    assert 6 not in got                    # the index neighbour is far away
+
+
+def test_neighbour_beams_without_a_table_is_just_the_beam():
+    """No pointing table must never silently look like a sky answer."""
+    from casm_t2 import cluster as cl
+    assert cl.neighbour_beams(None, 5, 1.0, 1.0) == {5}
+    sky = _sky_with_neighbours()
+    assert cl.neighbour_beams(sky, 9999, 1.0, 1.0) == {9999}
+    assert cl.neighbour_beams(sky, 5, 0.0, 1.0) == {5}
+
+
+def test_neighbour_beams_is_cached():
+    from casm_t2 import cluster as cl
+    sky = _sky_with_neighbours()
+    a = cl.neighbour_beams(sky, 5, 1.0, 1.0)
+    b = cl.neighbour_beams(sky, 5, 1.0, 1.0)
+    assert a == b
+    assert (sky.weights_id, 5, 1.0, 1.0, 1.0) in cl._NEIGHBOUR_CACHE
+
+
+def test_reconcile_matches_a_sky_neighbour_and_rejects_an_index_neighbour(
+        conn, make_cluster, monkeypatch, tmp_path):
+    """Injected in beam 5; the cluster is in beam 200, a sky neighbour."""
+    from casm_t2 import db as _db
+    from casm_t2.apps import inject_daemon as dd
+    sky = _sky_with_neighbours()
+    monkeypatch.setattr(dd, "injection_neighbours",
+                        lambda cfg, utc, beam: ({5, 200, 301}, True))
+    for beam, name, ok in ((200, "260731nnnnnn", True), (6, "260731iiiiii", False)):
+        conn.execute("DELETE FROM clusters")
+        conn.execute("DELETE FROM injections")
+        cl = make_cluster(snr=25.0, beam=beam)
+        _db.insert_clusters(conn, [(cl, "2026-07-31-00:00:00", 1,
+                                    "2026-07-31T00:05:05.000+00:00", "B",
+                                    "injection", name)])
+        conn.execute("UPDATE clusters SET dm=500.0, dm_lo=499.0, dm_hi=501.0")
+        _inject(conn, beam=5)
+        dd.reconcile(conn, 1, {"injection": {"hella_cands_dir": str(tmp_path)}})
+        outcome = conn.execute(
+            "SELECT outcome FROM injections WHERE id=1").fetchone()[0]
+        assert (outcome == "recovered") is ok, f"beam {beam}"
+
+
+def test_t2d_tags_a_sky_neighbour_and_not_an_index_neighbour(daemon,
+                                                             make_cluster):
+    """t2d's injection tag follows the same sky rule."""
+    d_ = daemon()
+    sky = _sky_with_neighbours()
+    d_._sky_params[sky.weights_id] = d_.params
+    d_._inj_cache = [(1000.0, 5, 500.0)]        # epoch, beam, dm
+    for beam, tagged in ((301, True), (6, False)):
+        cl = make_cluster(snr=25.0, beam=beam)
+        object.__setattr__(cl, "dm_lo", 499.0)
+        object.__setattr__(cl, "dm_hi", 501.0)
+        assert d_._injection_match(cl, 1000.0, sky) is tagged, f"beam {beam}"
+        assert d_._cand_injection_match(1000.0, beam, 500.0, sky) is tagged
+
+
+def test_t2d_falls_back_to_the_index_window_without_a_table(daemon,
+                                                            make_cluster):
+    d_ = daemon()
+    d_._inj_cache = [(1000.0, 5, 500.0)]
+    cl = make_cluster(snr=25.0, beam=6)
+    object.__setattr__(cl, "dm_lo", 499.0)
+    object.__setattr__(cl, "dm_hi", 501.0)
+    # index +-2 catches beam 6, and the daemon says so once
+    assert d_._injection_match(cl, 1000.0, None) is True
+    assert d_._inj_index_warned is True

@@ -257,6 +257,7 @@ working from and what the matched cluster looked like:
 | rec_samp | peak sample of the matched cluster |
 | rec_lead_s | cluster event time minus inject_utc, seconds |
 | rec_offset_arcsec | sky separation of the injected and recovered beams; shown only when they differ |
+| n_t1_trials | raw T1 trials matching the shot, counted only when no cluster did (NULL = not looked at, or the file was unreadable) |
 | slack_ts | ts of the Slack message for this shot, when posting is on |
 | outcome | closed enum, below |
 
@@ -269,39 +270,60 @@ match is probably not the injection.
 (`casm_t2.inject_outcome`) is the closed set that anything counting over
 injections uses, so a new failure string cannot invent a category:
 
-| outcome | when | phrase in Slack |
-| --- | --- | --- |
-| recovered | all three gates passed |
-| missed_t1 | no cluster in the reconcile window at that beam and DM |
-| missed_t2 | trials arrived but nothing clustered |
-| missed_trigger | clustered, but the trigger filters would have refused it |
+| outcome | when |
+| --- | --- |
+| recovered | a matching cluster, at ANY S/N |
+| missed_t2 | no cluster, but matching raw T1 trials |
+| missed_t1 | no cluster and no matching trial |
 | fire_failed | the shot never reached the stream (file or FIFO failure) |
 
-`reconcile()` writes a full sentence into `fail_reason` naming the stage and
-what the evidence there was, and the Slack line prints it verbatim:
+An outcome answers one question: did the search see the pulse? The trigger
+gates are deliberately not part of it. Whether a recovered injection would
+also have earned a dump is policy - tiers, DM floor, beam vetoes, occupancy
+- and policy changes week to week; a shot recorded as a miss because the
+tier floor moved would make the injection record unreadable over time.
+`gate_trigger` still records the counterfactual for anyone who wants it, so
+a shot found at S/N 15.8 is recovered and reads like any other.
 
-    lost at T1: no cluster in the window [-40 s, +90 s] in beam 200 (+-2) at DM 500 (+-75)
-    lost at T2 filters: cluster at S/N 15.8 below tier B (18)
-    lost at T2 filters: cluster tagged dm_floor by the low-DM storm veto
-    lost at T2 filters: cluster tagged occupancy:34 by the beam-occupancy veto
-    lost at T2 filters: cluster peaked in vetoed beam 200
-    lost at T2 filters: cluster at DM 12.4 below the floor (20)
+"The injected beam" means the injected beam **and its neighbours on the
+sky**, never a beam-index window. Beam numbers are not sky-ordered: on the
+deployed grid consecutive indices are a median 16 degrees apart, and for
+beam 150 on the 2026-09-09 pointing table the old `+-2` index window
+contained no true sky neighbour at all - only the beam itself - while the
+twelve beams actually within one beam ellipse are scattered from 43 to 322.
+`cluster.neighbour_beams(sky, beam, fwhm_x, fwhm_y, scale)` returns the beam
+plus every beam satisfying `(dx/fwhm_x)^2 + (dy/fwhm_y)^2 <= scale^2` on the
+tangent-plane axes - the same ellipse the clustering uses, with the FWHMs
+from the registry product and the config as fallback - cached per weights
+product and beam. It is used for the cluster match and the raw-trial scan in
+`reconcile()`, and for t2d's `injection` tagging on both the slow and fast
+paths, so a shot can never be tagged on one path and missed on the other.
+With no pointing table the callers fall back to the index window and say so
+in the log, because that is a guess about hardware ordering rather than a
+statement about the sky.
 
-The T2-filters reason is a counterfactual replay of `_wants_trigger` against
-the stored cluster row, in the order t2d applies the checks. Every injection
-carries the `injection` tag by design, so that tag is skipped: reporting it
-would hide the real reason.
+Telling `missed_t1` from `missed_t2` needs the raw trials, which T2 never
+stores. `reconcile()` therefore reads hella's own candidate file for the
+observation and stream,
+`/mnt/nvme4/data/casm/hella_cands/cands_<UTC_START>.dat.<stream>`
+(`snr samp time_days width dm_idx dm beam`, samp absolute from UTC_START at
+1.048576 ms). `obs_utc_start_at()` finds UTC_START from the most recent
+cluster at or before the injection. Trials match on the same beam window
+(+-2), the same DM tolerance and the same time window as the cluster match,
+and the count goes into `n_t1_trials`.
 
-Two honest limits. **`missed_t2` is currently unreachable**: only clusters
-are stored, raw T1 trials stay in hella's `.dat` files, so a missing cluster
-cannot be separated into "hella saw nothing" and "hella saw trials that did
-not cluster". Everything with no cluster is `missed_t1`, and its sentence
-says "no cluster", not "no candidate". The enum keeps `missed_t2` for when
-the trials are available. Second, the counterfactual reads the tags t2d
-stored at the time; a later change to the filters does not retro-fit them.
+Injections only ever go to streams 0-3, which are corr1-local, so the file
+is always readable in principle. When it is not there, that is recorded as
+such - `n_t1_trials` stays NULL and the reason carries
+`(T1 file unavailable ...)` - and the shot falls back to `missed_t1`. NULL
+means "not asked", never "hella saw nothing".
 
-`fire_failed` is injector plumbing, not a sensitivity result, and is
-excluded from miss counts and streaks.
+`reconcile()` writes a full sentence into `fail_reason` and the Slack line
+prints it verbatim:
+
+    lost at T2: 7 matching T1 trials (best S/N 9.2) but no cluster formed (min 5 members)
+    lost at T1: no matching trial in beam 200 (+-2) within the window at DM 500 (+-75)
+    lost at T1: no cluster in the window in beam 200 (+-2) at DM 500 (+-75) (T1 file unavailable (cands_....dat.3 not found))
 
 ### Width
 

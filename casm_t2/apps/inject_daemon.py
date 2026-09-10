@@ -39,8 +39,8 @@ from pathlib import Path
 
 import yaml
 
-from casm_t2 import (db, inject_calib, inject_outcome, inject_plot,
-                     inject_slack, logsetup, weights_registry)
+from casm_t2 import (cluster, db, inject_calib, inject_outcome, inject_plot,
+                     inject_slack, logsetup, timing, weights_registry)
 
 logger = logging.getLogger("t2.inject")
 
@@ -124,32 +124,147 @@ def ledger_row(conn, inj_id: int) -> dict | None:
     return dict(zip([c[0] for c in cur.description], row))
 
 
-def trigger_refusal(tier, tags, snr, dm, n_beams, beam, filt, tiers) -> str | None:
-    """Why t2d would NOT have dumped this cluster, or None if it would have.
+#: hella writes one candidate file per observation per stream. Injections go
+#: to streams 0-3, which are corr1-local, so reconcile can always read them.
+HELLA_CANDS_DIR = "/mnt/nvme4/data/casm/hella_cands"
 
-    Mirrors T2Daemon._wants_trigger against the stored cluster row, in the
-    order t2d applies the checks. The `injection` tag is excluded on purpose:
-    every injection carries it by design, and reporting it as the reason
-    would hide the real one.
+#: Reconcile window around inject_utc. The pulse lands in the data stream
+#: BEFORE inject_utc: the sidecar is added to the next assembled gulp, whose
+#: samples are already 5-18 s old (measured 2026-08-15 to 09-01, drifting
+#: later; casm-wiki injection-saturation.md). The old [-10, +90] window
+#: declared most late-August shots t1_no_detection although hella had found
+#: them. The same window is used for the cluster match and the T1 trial scan.
+WINDOW_LO_S = -40.0
+WINDOW_HI_S = 90.0
+
+
+def dm_tolerance(dm: float) -> float:
+    """DM half-width for a match, for clusters and raw trials alike."""
+    return max(0.15 * dm, 5.0)
+
+
+def injection_neighbours(cfg: dict, utc: datetime, beam: int) -> tuple[set[int], bool]:
+    """Beams that count as "the injected beam" on the sky, and whether the
+    answer is a sky answer.
+
+    Returns (beams, from_sky). `from_sky` False means there was no pointing
+    table and the caller must fall back to an index window - which is not a
+    statement about the sky, so it is logged.
     """
-    tagset = [t.strip() for t in str(tags or "").split(",") if t.strip()]
-    if "veto" in tagset:
-        return f"cluster peaked in vetoed beam {beam}"
-    if "rfi_wide" in tagset:
-        return (f"cluster tagged rfi_wide, spanning {n_beams} beams "
-                f"(max {filt.get('max_nbeam', 32)})")
-    if "dm_floor" in tagset:
-        return "cluster tagged dm_floor by the low-DM storm veto"
-    occ = next((t for t in tagset if t.startswith("occupancy:")), None)
-    if occ:
-        return f"cluster tagged {occ} by the beam-occupancy veto"
-    tier_b = tiers.get("B", 15.0)
-    if tier not in ("A", "B"):
-        return f"cluster at S/N {snr:.1f} below tier B ({tier_b:.0f})"
-    floor = filt.get("dm_floor", 20.0)
-    if dm < floor:
-        return f"cluster at DM {dm:.1f} below the floor ({floor:.0f})"
-    return None
+    try:
+        reg = (weights_registry.Registry(cfg["weights_registry"])
+               if cfg.get("weights_registry") else weights_registry.Registry())
+        pointings = reg.pointings_for(utc)
+        sky = cluster.SkyTable.from_pointings(pointings)
+    except Exception as exc:  # noqa: BLE001 - never break reconcile on this
+        logger.debug("pointing table unavailable for neighbours: %s", exc)
+        sky, pointings = None, None
+    if sky is None:
+        return {int(beam)}, False
+    cc = cfg.get("clustering", {}) or {}
+    fx = (pointings or {}).get("beam_fwhm_x_deg") or cc.get("beam_fwhm_x_deg", 18.1)
+    fy = (pointings or {}).get("beam_fwhm_y_deg") or cc.get("beam_fwhm_y_deg", 3.9)
+    scale = float(cc.get("injection_match_scale", 1.0))
+    return cluster.neighbour_beams(sky, int(beam), float(fx), float(fy),
+                                   scale), True
+
+
+def obs_utc_start_at(conn, utc: datetime) -> str | None:
+    """UTC_START of the observation live at `utc`, as a PSRDADA string.
+
+    Taken from the most recent cluster at or before that time: clusters carry
+    the obs they came from, and one is written every few seconds in any
+    normal sky, so this is the cheapest reliable answer. Returns None when
+    the database has no cluster that old (a fresh database, or a gap).
+
+    Caveat worth knowing: if an observation restarted and has not yet
+    produced a cluster, this still names the previous one. The caller
+    notices, because the candidate file it points at will not contain the
+    injection window.
+    """
+    row = conn.execute(
+        "SELECT obs_utc_start FROM clusters WHERE event_utc <= ?"
+        " ORDER BY event_utc DESC LIMIT 1",
+        (utc.isoformat(timespec="milliseconds"),)).fetchone()
+    return row[0] if row else None
+
+
+def cands_path(obs_utc_start: str, stream: int, cands_dir: str | Path = HELLA_CANDS_DIR) -> Path:
+    """Path of hella's raw candidate file for one observation and stream."""
+    return Path(cands_dir) / f"cands_{obs_utc_start}.dat.{stream}"
+
+
+def count_t1_trials(path, beams, dm: float, samp_lo: float, samp_hi: float
+                    ) -> tuple[int, float | None] | None:
+    """Raw T1 trials matching an injection: (count, best S/N).
+
+    Returns None when the file does not exist - that is "we cannot tell",
+    which the caller must not confuse with "hella saw nothing".
+
+    `beams` is the set of beams that count as the injected one - its sky
+    neighbours, from `neighbour_beams`, not an index window.
+
+    The file is hella's own output: a header line then
+    ``snr samp time_days width dm_idx dm beam``, beam global, samp absolute
+    from the observation's UTC_START. Streamed rather than read whole: a
+    long observation's file runs to hundreds of MB.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return None
+    tol = dm_tolerance(dm)
+    dm_lo, dm_hi = dm - tol, dm + tol
+    beams = {int(b) for b in beams}
+    n, best = 0, None
+    with path.open() as fh:
+        for line in fh:
+            fields = line.split()
+            if len(fields) != 7:
+                continue
+            try:
+                snr = float(fields[0])
+                samp = float(fields[1])
+                cdm = float(fields[5])
+                cbeam = int(fields[6])
+            except ValueError:
+                continue          # the header line, or a torn write
+            if not (samp_lo <= samp <= samp_hi):
+                continue
+            if cbeam not in beams:
+                continue
+            if not (dm_lo <= cdm <= dm_hi):
+                continue
+            n += 1
+            if best is None or snr > best:
+                best = snr
+    return n, best
+
+
+def scan_t1_trials(conn, cfg: dict, t0: datetime, stream: int, beams,
+                   dm: float) -> tuple[int | None, float | None, str | None]:
+    """Look for raw T1 trials behind a shot that produced no cluster.
+
+    Returns (n_trials, best_snr, note). `n_trials` is None when the question
+    could not be asked - no observation known, or the file is not there - and
+    `note` says which, for the ledger.
+    """
+    obs = obs_utc_start_at(conn, t0)
+    if obs is None:
+        return None, None, "T1 file unavailable (no observation known at that time)"
+    try:
+        utc_start = timing.parse_dada_utc(obs)
+    except ValueError:
+        return None, None, f"T1 file unavailable (unparseable obs_utc_start {obs!r})"
+    path = cands_path(obs, stream, cfg.get("injection", {}).get(
+        "hella_cands_dir", HELLA_CANDS_DIR))
+    samp_lo = (t0 - utc_start).total_seconds() + WINDOW_LO_S
+    samp_hi = (t0 - utc_start).total_seconds() + WINDOW_HI_S
+    got = count_t1_trials(path, beams, dm,
+                          samp_lo / timing.TSAMP_S, samp_hi / timing.TSAMP_S)
+    if got is None:
+        return None, None, f"T1 file unavailable ({path.name} not found)"
+    n, best = got
+    return n, best, None
 
 
 def beam_offset_arcsec(cfg: dict, utc, inj_beam: int, rec_beam: int):
@@ -174,51 +289,77 @@ def beam_offset_arcsec(cfg: dict, utc, inj_beam: int, rec_beam: int):
 
 
 def reconcile(conn, inj_id: int, cfg: dict) -> None:
-    """Fill the gate columns for one injection from the clusters table."""
+    """Decide whether the search saw this injection, and record the evidence.
+
+    Recovered means a matching cluster, at ANY S/N: the gates stay recorded
+    for information, but whether the cluster would also have earned a dump
+    is trigger policy, not detection. With no cluster, hella's raw candidate
+    file separates "no cluster formed" from "hella never saw it".
+    """
     row = conn.execute(
-        "SELECT inject_utc, beam, dm, fail_reason FROM injections WHERE id = ?",
-        (inj_id,)).fetchone()
+        "SELECT inject_utc, stream, beam, dm, fail_reason FROM injections"
+        " WHERE id = ?", (inj_id,)).fetchone()
     if row is None:
         return
-    inj_utc, beam, dm, prior_fail = row
+    inj_utc, stream, beam, dm, prior_fail = row
     t0 = datetime.fromisoformat(inj_utc)
-    # The pulse lands in the data stream BEFORE inject_utc: the sidecar is
-    # added to the next assembled gulp, whose samples are already 5-18 s old
-    # (measured 2026-08-15 to 09-01, drifting later; casm-wiki
-    # injection-saturation.md). The old [-10, +90] window declared most
-    # late-August shots t1_no_detection although hella had found them.
-    lo = (t0 - timedelta(seconds=40)).isoformat(timespec="milliseconds")
-    hi = (t0 + timedelta(seconds=90)).isoformat(timespec="milliseconds")
-    dm_tol = max(0.15 * dm, 5.0)
+    lo = (t0 + timedelta(seconds=WINDOW_LO_S)).isoformat(timespec="milliseconds")
+    hi = (t0 + timedelta(seconds=WINDOW_HI_S)).isoformat(timespec="milliseconds")
+    dm_tol = dm_tolerance(dm)
+    # "The injected beam" means its neighbours ON THE SKY. Beam indices are
+    # not sky-ordered - consecutive indices are a median 16 deg apart - so an
+    # index window is not a statement about the sky at all.
+    beams, from_sky = injection_neighbours(cfg, t0, beam)
+    if not from_sky:
+        beams = set(range(beam - 2, beam + 3))
+        logger.warning("injection %d: no pointing table at %s, falling back to "
+                       "the beam-INDEX window %d+-2, which is not a sky match",
+                       inj_id, inj_utc, beam)
     # Prefer the fast-triggered cluster: that is the one with the dump,
     # the plot, and the trigger audit attached.
+    marks = ",".join("?" for _ in beams)
     cand = conn.execute(
         "SELECT id, snr, dm, tier, tags, n_beams, beam, width, samp, event_utc"
         " FROM clusters"
-        " WHERE event_utc BETWEEN ? AND ? AND beam_lo <= ? AND beam_hi >= ?"
+        f" WHERE event_utc BETWEEN ? AND ? AND beam IN ({marks})"
         " AND dm_lo <= ? AND dm_hi >= ?"
         " ORDER BY (tags LIKE '%fast_triggered%') DESC, snr DESC LIMIT 1",
-        (lo, hi, beam + 2, beam - 2, dm + dm_tol, dm - dm_tol)).fetchone()
+        (lo, hi, *sorted(beams), dm + dm_tol, dm - dm_tol)).fetchone()
 
     filt = cfg.get("filters", {})
     tiers = cfg.get("tiers", {})
+    n_trials = None
     if cand is None:
-        # No cluster at all. Only clusters are stored - raw T1 trials live in
-        # hella's .dat files - so this cannot separate "hella saw nothing"
-        # from "hella saw trials that did not cluster"; say what is known.
-        gates = dict(gate_t1=0, gate_t2=0, gate_trigger=0,
-                     fail_reason=f"lost at T1: no cluster in the window "
-                                 f"[-40 s, +90 s] in beam {beam} (+-2) "
-                                 f"at DM {dm:.0f} (+-{dm_tol:.0f})")
+        # No cluster. Ask hella's own candidate file whether the trials were
+        # there, which is the only way to tell a clustering loss from a
+        # detection loss - T2 stores clusters, never raw trials.
+        n_trials, best_snr, note = scan_t1_trials(conn, cfg, t0, stream,
+                                                  beams, dm)
+        if n_trials is None:
+            reason = (f"lost at T1: no cluster in the window in beam {beam} "
+                      f"or its {len(beams) - 1} sky neighbours at DM "
+                      f"{dm:.0f} (+-{dm_tol:.0f}) ({note})")
+        elif n_trials > 0:
+            best = f"{best_snr:.1f}" if best_snr is not None else "?"
+            reason = (f"lost at T2: {n_trials} matching T1 trials "
+                      f"(best S/N {best}) but no cluster formed "
+                      f"(min {cfg.get('clustering', {}).get('min_samples', 5)} "
+                      f"members)")
+        else:
+            reason = (f"lost at T1: no matching trial in beam {beam} or its "
+                      f"{len(beams) - 1} sky neighbours within the window "
+                      f"at DM {dm:.0f} (+-{dm_tol:.0f})")
+        gates = dict(gate_t1=0, gate_t2=0, gate_trigger=0, fail_reason=reason)
         rec = (None, None, None)
         detail = (None, None, None, None, None)
     else:
         cid, snr, rdm, tier, tags, n_beams, cbeam, cwidth, csamp, cutc = cand
-        refusal = trigger_refusal(tier, tags, snr, rdm, n_beams, cbeam,
-                                  filt, tiers)
-        gates = dict(gate_t1=1, gate_t2=1, gate_trigger=int(refusal is None),
-                     fail_reason=None if refusal is None
-                     else f"lost at T2 filters: {refusal}")
+        # Recorded for information only; it no longer decides the outcome.
+        would = (tier in ("A", "B") and rdm >= filt.get("dm_floor", 20.0)
+                 and n_beams <= filt.get("max_nbeam", 32)
+                 and cbeam not in set(filt.get("beam_veto", [])))
+        gates = dict(gate_t1=1, gate_t2=1, gate_trigger=int(would),
+                     fail_reason=None)
         rec = (cid, snr, rdm)
         # Negative lead is the normal case: the sidecar joins a gulp whose
         # samples are already seconds old, so the pulse arrives in the search
@@ -230,18 +371,20 @@ def reconcile(conn, inj_id: int, cfg: dict) -> None:
         offset = beam_offset_arcsec(cfg, t0, beam, cbeam)
         detail = (cwidth, cbeam, csamp, lead, offset)
     outcome = inject_outcome.classify(gates["gate_t1"], gates["gate_t2"],
-                                      gates["gate_trigger"], prior_fail)
+                                      gates["gate_trigger"], prior_fail,
+                                      n_trials)
     with conn:
         conn.execute(
             "UPDATE injections SET gate_t1=?, gate_t2=?, gate_trigger=?,"
             " fail_reason=?, matched_cluster=?, rec_snr=?, rec_dm=?,"
             " rec_width=?, rec_beam=?, rec_samp=?, rec_lead_s=?,"
-            " rec_offset_arcsec=?, outcome=? WHERE id=?",
+            " rec_offset_arcsec=?, n_t1_trials=?, outcome=? WHERE id=?",
             (gates["gate_t1"], gates["gate_t2"], gates["gate_trigger"],
-             gates["fail_reason"], *rec, *detail, outcome, inj_id))
-    logger.info("reconciled injection %d: t1=%s t2=%s trigger=%s (%s)",
-                inj_id, gates["gate_t1"], gates["gate_t2"], gates["gate_trigger"],
-                gates["fail_reason"] or "recovered")
+             gates["fail_reason"], *rec, *detail, n_trials, outcome, inj_id))
+    logger.info("reconciled injection %d: %s (t1=%s t2=%s trigger=%s%s)",
+                inj_id, outcome, gates["gate_t1"], gates["gate_t2"],
+                gates["gate_trigger"],
+                "" if n_trials is None else f" t1_trials={n_trials}")
 
 
 async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa: C901

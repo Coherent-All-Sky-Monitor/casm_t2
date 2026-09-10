@@ -184,6 +184,46 @@ class SkyTable:
         return float(np.degrees(np.arccos(dots.min())))
 
 
+#: neighbour_beams results, keyed by (weights_id, beam, fwhm_x, fwhm_y, scale).
+#: One weights product is live for hours and the same handful of injection
+#: beams is asked about repeatedly, so this is a few entries in practice.
+_NEIGHBOUR_CACHE: dict[tuple, frozenset] = {}
+
+
+def neighbour_beams(sky: "SkyTable | None", beam: int, fwhm_x_deg: float,
+                    fwhm_y_deg: float, scale: float = 1.0) -> set[int]:
+    """Beams within one beam ellipse of `beam` on the SKY, plus `beam` itself.
+
+    Beam *indices* are not sky-ordered: consecutive indices on the deployed
+    grid are a median 16 degrees apart, so "beam +-2" as an index window is
+    not a statement about the sky at all. It can miss the beam a pulse
+    actually landed in and admit beams most of a horizon away.
+
+    The test is the same ellipse the clustering uses::
+
+        (dx / fwhm_x)^2 + (dy / fwhm_y)^2 <= scale^2
+
+    on the tangent-plane axes, with the FWHMs coming from the registry
+    product (config fallback). Returns ``{beam}`` when there is no pointing
+    table or the beam is off the table: callers that need an index window
+    must ask for one explicitly, so a missing table can never silently look
+    like a sky answer.
+    """
+    if sky is None or not sky.has(beam) or fwhm_x_deg <= 0 or fwhm_y_deg <= 0:
+        return {int(beam)}
+    key = (sky.weights_id, int(beam), float(fwhm_x_deg), float(fwhm_y_deg),
+           float(scale))
+    hit = _NEIGHBOUR_CACHE.get(key)
+    if hit is None:
+        x0, y0 = sky.xy(beam)
+        dx = (sky.x - x0) / float(fwhm_x_deg)
+        dy = (sky.y - y0) / float(fwhm_y_deg)
+        inside = np.nonzero(dx * dx + dy * dy <= float(scale) ** 2)[0]
+        hit = frozenset(int(b) for b in inside) | {int(beam)}
+        _NEIGHBOUR_CACHE[key] = hit
+    return set(hit)
+
+
 def unproject(x_deg: float, y_deg: float) -> tuple[float, float]:
     """Inverse of the SkyTable projection: (x, y) degrees -> (alt, az) degrees.
 

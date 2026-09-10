@@ -5,13 +5,19 @@ first failed gate. `outcome` is the small closed set the Slack poster, the
 streak logic and the summary figures count over, so a new failure string
 never silently invents a new category.
 
-Mapping from the gate columns (see casm_t2.apps.inject_daemon.reconcile):
+An outcome answers one question only: did the search see the pulse? (see
+casm_t2.apps.inject_daemon.reconcile)
 
-    gate_t1=1, gate_t2=1, gate_trigger=1      -> recovered
-    no matching cluster at all                -> missed_t1
-    cluster found but gate_t2 = 0             -> missed_t2
-    gate_t1 and gate_t2 set, gate_trigger = 0 -> missed_trigger
-    the shot never reached the stream         -> fire_failed
+    a matching cluster, at ANY S/N        -> recovered
+    no cluster, but matching T1 trials    -> missed_t2
+    no cluster and no matching T1 trial   -> missed_t1
+    the shot never reached the stream     -> fire_failed
+
+The trigger gates are deliberately NOT part of this. Whether a recovered
+injection would also have earned a dump is a policy question - tiers, DM
+floor, beam vetoes, occupancy - and policy changes week to week. It stays
+recorded in `gate_trigger` for anyone who wants it, but a shot the search
+found is recovered even at S/N 15.8.
 """
 
 from __future__ import annotations
@@ -19,14 +25,13 @@ from __future__ import annotations
 RECOVERED = "recovered"
 MISSED_T1 = "missed_t1"
 MISSED_T2 = "missed_t2"
-MISSED_TRIGGER = "missed_trigger"
 FIRE_FAILED = "fire_failed"
 
 #: Outcomes that say something about pipeline sensitivity. `fire_failed` is
 #: injector plumbing and is deliberately not one of them.
-MISSES = (MISSED_T1, MISSED_T2, MISSED_TRIGGER)
+MISSES = (MISSED_T1, MISSED_T2)
 
-ALL = (RECOVERED, MISSED_T1, MISSED_T2, MISSED_TRIGGER, FIRE_FAILED)
+ALL = (RECOVERED, MISSED_T1, MISSED_T2, FIRE_FAILED)
 
 #: Set by the daemon on a shot that never reached the stream.
 FIRE_FAILED_PREFIXES = ("fifo_write_failed", "file_generation_failed")
@@ -38,7 +43,6 @@ LABELS = {
     RECOVERED: "recovered",
     MISSED_T1: "missed by hella (T1)",
     MISSED_T2: "T2 miss (no cluster formed)",
-    MISSED_TRIGGER: "T2 miss (filter criteria)",
     FIRE_FAILED: "not fired",
 }
 
@@ -54,8 +58,7 @@ def label(outcome: str | None) -> str:
 #: injections still counts over the closed enum above, never over the text.
 EXPLANATIONS = {
     MISSED_T1: "lost at T1: no cluster in the reconcile window",
-    MISSED_T2: "lost at T2 clustering: no cluster formed",
-    MISSED_TRIGGER: "lost at T2 filters: the cluster would not have triggered",
+    MISSED_T2: "lost at T2: matching T1 trials but no cluster formed",
     FIRE_FAILED: "injection not fired",
 }
 
@@ -72,6 +75,11 @@ LEGACY_REASONS = {
     "t1_no_detection": EXPLANATIONS[MISSED_T1],
 }
 
+#: Rows written while `missed_trigger` existed: the shot WAS found by the
+#: search, so under the current definition it is recovered. Re-reconciling
+#: rewrites them; this only keeps an un-migrated row from reading as a miss.
+RETIRED = ("missed_trigger",)
+
 
 def detail_or_explain(fail_reason: str | None, outcome: str | None) -> str:
     """What to print after "NOT recovered: ".
@@ -85,9 +93,6 @@ def detail_or_explain(fail_reason: str | None, outcome: str | None) -> str:
         return LEGACY_REASONS[text]
     if text.startswith("lost at ") or text.startswith("injection not fired"):
         return text
-    if text.startswith("trigger_filters("):
-        # pre-detail rows: the parenthesised gate dump is not a sentence
-        return EXPLANATIONS[MISSED_TRIGGER] + f" ({text})"
     return explain(outcome)
 
 
@@ -97,21 +102,21 @@ def short_fire_reason(fail_reason: str | None) -> str:
     return FIRE_FAILED_REASONS.get(head, head or "unknown")
 
 
-def classify(gate_t1, gate_t2, gate_trigger,
-             fail_reason: str | None = None) -> str:
+def classify(gate_t1, gate_t2, gate_trigger=None,
+             fail_reason: str | None = None, n_t1_trials=None) -> str:
     """Outcome for one reconciled injection.
 
-    `fail_reason` is consulted only for the fire_failed case, which is set
-    before any gate is known (the gates stay NULL for a shot that never
-    reached the stream).
+    `gate_trigger` is accepted and ignored: the trigger filters are policy,
+    not detection. A matching cluster (gate_t2) is `recovered` at any S/N.
+    Without one, `n_t1_trials` decides where it was lost - reconcile() counts
+    raw T1 trials in hella's candidate file. `fail_reason` is consulted only
+    for fire_failed, which is set before any gate is known.
     """
     if fail_reason and str(fail_reason).startswith(FIRE_FAILED_PREFIXES):
         return FIRE_FAILED
-    if gate_t1 and gate_t2 and gate_trigger:
+    if gate_t2:
         return RECOVERED
-    if gate_t1 and gate_t2:
-        return MISSED_TRIGGER
-    if gate_t1:
+    if n_t1_trials:
         return MISSED_T2
     return MISSED_T1
 

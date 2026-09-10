@@ -247,6 +247,10 @@ class T2Daemon:
         # ellipse of the weights that were live, taken from the registry product
         # when it carries one and from config otherwise (2026-09-09).
         self._sky_params: dict[str, cluster.ClusterParams] = {}
+        # injection matching uses sky neighbours; warn once if it cannot
+        self._inj_index_warned = False
+        self.injection_match_scale = float(
+            (cfg.get('clustering', {}) or {}).get('injection_match_scale', 1.0))
 
         tiers = cfg.get("tiers", {})
         self.tier_a = tiers.get("A", 30.0)
@@ -606,9 +610,32 @@ class T2Daemon:
 
     # ------------------------------------------------------------ fast path
 
-    def _cand_injection_match(self, epoch: float, beam: int, dm: float) -> bool:
+    def _inj_beams(self, inj_beam: int, sky: cluster.SkyTable | None) -> set[int]:
+        """Beams that count as the injected one, on the SKY.
+
+        Beam indices are not sky-ordered - consecutive indices are a median
+        16 deg apart - so the old index window was not a sky test. Falls back
+        to the index window only when there is no pointing table, and says so
+        once per weights product.
+        """
+        if sky is None:
+            if not self._inj_index_warned:
+                self._inj_index_warned = True
+                logger.warning("no beam pointing table: injection matching "
+                               "falls back to a beam-INDEX window (+-2), "
+                               "which is not a sky match")
+            return set(range(inj_beam - 2, inj_beam + 3))
+        params = self._sky_params.get(sky.weights_id or "", self.params)
+        return cluster.neighbour_beams(sky, int(inj_beam),
+                                       params.beam_fwhm_x_deg,
+                                       params.beam_fwhm_y_deg,
+                                       self.injection_match_scale)
+
+    def _cand_injection_match(self, epoch: float, beam: int, dm: float,
+                              sky: cluster.SkyTable | None = None) -> bool:
         for inj_epoch, inj_beam, inj_dm in self._inj_cache:
-            if (abs(epoch - inj_epoch) <= 60 and abs(beam - inj_beam) <= 2
+            if (abs(epoch - inj_epoch) <= 60
+                    and beam in self._inj_beams(inj_beam, sky)
                     and abs(dm - inj_dm) <= max(0.1 * inj_dm, 5)):
                 return True
         return False
@@ -620,6 +647,9 @@ class T2Daemon:
         utc_start = timing.parse_dada_utc(batch.utc_start)
         tsamp = batch.tsamp_s or timing.TSAMP_S
         self._refresh_injections()
+        # same sky neighbours the slow path uses, so a fast trigger cannot
+        # fire on an injection the slow path would have tagged
+        sky = self._sky_table((batch.utc_start, batch.gulp))
 
         best = None
         for c in batch.cands:
@@ -640,7 +670,8 @@ class T2Daemon:
             # injections are never dumped: CAND_DUMP_BLOCK 0 is upstream of
             # the injection merge, so a dump cannot contain the pulse anyway;
             # the gallery renders truth plots from the generated .fil instead
-            if self._cand_injection_match(event_utc.timestamp(), c.beam, c.dm):
+            if self._cand_injection_match(event_utc.timestamp(), c.beam,
+                                          c.dm, sky):
                 continue
             if best is None or c.snr > best[0].snr:
                 best = (c, event_utc, reason)
@@ -687,10 +718,11 @@ class T2Daemon:
                 "SELECT inject_utc, beam, dm FROM injections WHERE inject_utc >= ?",
                 (since,))]
 
-    def _injection_match(self, cl: cluster.Cluster, event_epoch: float) -> bool:
+    def _injection_match(self, cl: cluster.Cluster, event_epoch: float,
+                         sky: cluster.SkyTable | None = None) -> bool:
         for inj_epoch, inj_beam, inj_dm in self._inj_cache:
             if (abs(event_epoch - inj_epoch) <= 60
-                    and cl.beam_lo - 2 <= inj_beam <= cl.beam_hi + 2
+                    and cl.peak.beam in self._inj_beams(inj_beam, sky)
                     and cl.dm_lo - max(0.1 * inj_dm, 5) <= inj_dm
                     and inj_dm <= cl.dm_hi + max(0.1 * inj_dm, 5)):
                 return True
@@ -702,9 +734,11 @@ class T2Daemon:
                 and cl.dm_lo <= self.dm_floor_veto_max_dm_lo
                 and cl.peak.width >= self.dm_floor_veto_min_width)
 
-    def _classify(self, cl: cluster.Cluster, event_utc: datetime | None) -> tuple[str, list[str]]:
+    def _classify(self, cl: cluster.Cluster, event_utc: datetime | None,
+                  sky: cluster.SkyTable | None = None) -> tuple[str, list[str]]:
         tags = []
-        if event_utc is not None and self._injection_match(cl, event_utc.timestamp()):
+        if event_utc is not None and self._injection_match(
+                cl, event_utc.timestamp(), sky):
             tags.append("injection")
         if cl.peak.beam in self.veto:
             tags.append("veto")
@@ -761,11 +795,14 @@ class T2Daemon:
         # clusters up the bowtie, and only the lowest fragment touches the
         # floor. Tag every cluster within the occupancy window of a floor
         # fragment in this gulp, so the next fragment up does not trigger.
+        # Cached by weights id, so this is a dict hit: the same table the
+        # clustering used for this gulp.
+        sky = self._sky_table(key)
         floor_samps = [cl.peak.samp for cl in clusters if self._is_dm_floor_leak(cl)]
         for cl in clusters:
             event_utc = (timing.samp_to_utc(cl.peak.samp, utc_start)
                          if utc_start else None)
-            tier, tags = self._classify(cl, event_utc)
+            tier, tags = self._classify(cl, event_utc, sky)
             if ("dm_floor" not in tags and floor_samps
                     and any(abs(cl.peak.samp - s) <= self.occ_window_samp
                             for s in floor_samps)):

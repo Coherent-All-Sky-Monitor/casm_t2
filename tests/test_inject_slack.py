@@ -61,15 +61,24 @@ def test_migration_is_idempotent_and_keeps_rows(tmp_path):
 
 # --- outcome classification -------------------------------------------------
 
-@pytest.mark.parametrize("gates,fail,expect", [
-    ((1, 1, 1), None, oc.RECOVERED),
-    ((0, 0, 0), "t1_no_detection", oc.MISSED_T1),
-    ((1, 0, 0), None, oc.MISSED_T2),
-    ((1, 1, 0), "trigger_filters(tier=C,nbeam=1)", oc.MISSED_TRIGGER),
-    ((None, None, None), "fifo_write_failed:[Errno 6]", oc.FIRE_FAILED),
+@pytest.mark.parametrize("gates,fail,trials,expect", [
+    ((1, 1, 1), None, None, oc.RECOVERED),
+    # a matching cluster is recovered at ANY S/N: the trigger gate is policy
+    ((1, 1, 0), None, None, oc.RECOVERED),
+    ((0, 0, 0), None, 0, oc.MISSED_T1),
+    ((0, 0, 0), None, None, oc.MISSED_T1),        # file unavailable
+    ((0, 0, 0), None, 7, oc.MISSED_T2),
+    ((None, None, None), "fifo_write_failed:[Errno 6]", None, oc.FIRE_FAILED),
 ])
-def test_classify(gates, fail, expect):
-    assert oc.classify(*gates, fail) == expect
+def test_classify(gates, fail, trials, expect):
+    assert oc.classify(*gates, fail, trials) == expect
+
+
+def test_the_trigger_gate_never_makes_an_outcome():
+    """S/N 15.8 below tier B, found by the search: recovered."""
+    assert oc.classify(1, 1, 0, None, None) == oc.RECOVERED
+    assert "missed_trigger" not in oc.ALL
+    assert not hasattr(oc, "MISSED_TRIGGER")
 
 
 def test_every_outcome_has_an_explanation():
@@ -208,11 +217,9 @@ def test_outcome_text_missed_prints_the_detail_reconcile_wrote():
 
 @pytest.mark.parametrize("detail", [
     "lost at T1: no cluster in the window [-40 s, +90 s] in beam 200 (+-2) at DM 500 (+-75)",
-    "lost at T2 filters: cluster at S/N 15.8 below tier B (18)",
-    "lost at T2 filters: cluster tagged dm_floor by the low-DM storm veto",
-    "lost at T2 filters: cluster tagged occupancy:34 by the beam-occupancy veto",
-    "lost at T2 filters: cluster peaked in vetoed beam 200",
-    "lost at T2 filters: cluster at DM 12.4 below the floor (20)",
+    "lost at T1: no matching trial in beam 200 (+-2) within the window at DM 500 (+-75)",
+    "lost at T2: 7 matching T1 trials (best S/N 9.2) but no cluster formed (min 5 members)",
+    "lost at T1: no cluster in the window in beam 200 (+-2) at DM 500 (+-75) (T1 file unavailable (cands_x.dat.3 not found))",
 ])
 def test_each_miss_reason_is_printed_verbatim(detail):
     row = dict(MISSED_ROW, fail_reason=detail)
@@ -226,9 +233,9 @@ def test_legacy_rows_still_read_sensibly():
     row = dict(MISSED_ROW, fail_reason="t1_no_detection")
     assert inject_slack.outcome_text(row) == (
         "NOT recovered: lost at T1: no cluster in the reconcile window")
-    row = dict(MISSED_ROW, outcome=oc.MISSED_TRIGGER,
-               fail_reason="trigger_filters(tier=C,nbeam=1)")
-    assert "trigger_filters(tier=C,nbeam=1)" in inject_slack.outcome_text(row)
+    row = dict(MISSED_ROW, outcome=oc.MISSED_T2, fail_reason=None)
+    assert inject_slack.outcome_text(row) == (
+        "NOT recovered: " + oc.EXPLANATIONS[oc.MISSED_T2])
 
 
 def test_missing_detail_falls_back_to_the_enum_phrase():
@@ -246,9 +253,9 @@ def test_fire_failed_is_not_phrased_as_a_miss():
 
 
 def test_streak_uses_the_same_phrases():
-    text = inject_slack.streak_text(5, [656], oc.MISSED_TRIGGER)
+    text = inject_slack.streak_text(5, [656], oc.MISSED_T2)
     assert text.endswith(
-        "latest loss stage: " + oc.EXPLANATIONS[oc.MISSED_TRIGGER])
+        "latest loss stage: " + oc.EXPLANATIONS[oc.MISSED_T2])
 
 
 def test_streak_and_summary_text():
@@ -270,7 +277,6 @@ def test_every_outcome_has_a_plain_label():
         oc.RECOVERED: "recovered",
         oc.MISSED_T1: "missed by hella (T1)",
         oc.MISSED_T2: "T2 miss (no cluster formed)",
-        oc.MISSED_TRIGGER: "T2 miss (filter criteria)",
         oc.FIRE_FAILED: "not fired",
     }
     assert set(oc.LABELS) == set(oc.ALL)
@@ -281,12 +287,11 @@ def test_every_outcome_has_a_plain_label():
 
 def test_summary_missed_line_uses_the_plain_labels():
     rows = [dict(MISSED_ROW, outcome=oc.MISSED_T1),
-            dict(MISSED_ROW, outcome=oc.MISSED_TRIGGER),
             dict(MISSED_ROW, outcome=oc.MISSED_T2)]
     text = inject_slack.summary_text(rows, "2026-09-09")
-    assert ("missed: 1 missed by hella (T1); 1 T2 miss (no cluster formed); "
-            "1 T2 miss (filter criteria)") in text
-    for enum_name in ("missed_t1", "missed_t2", "missed_trigger"):
+    assert ("missed: 1 missed by hella (T1); "
+            "1 T2 miss (no cluster formed)") in text
+    for enum_name in ("missed_t1", "missed_t2"):
         assert enum_name not in text
 
 
@@ -343,7 +348,7 @@ def test_dry_run_writes_files_and_never_posts(tmp_path, no_network):
 def test_miss_streak_reads_the_ledger(conn):
     now = "2026-09-09T00:00:00.000+00:00"
     for rid, outcome in [(1, oc.RECOVERED), (2, oc.MISSED_T1),
-                         (3, oc.MISSED_TRIGGER), (4, oc.MISSED_T1)]:
+                         (3, oc.MISSED_T2), (4, oc.MISSED_T1)]:
         conn.execute(
             "INSERT INTO injections (id, inject_utc, stream, beam, dm, amp,"
             " sigma_ms, file_id, created_utc, outcome)"

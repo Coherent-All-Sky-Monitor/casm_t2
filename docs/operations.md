@@ -203,10 +203,15 @@ printed nothing. Slack never quotes a predicted reported S/N: that lives in
 
 A shot that resolves badly names the stage and what the evidence there was:
 
-    NOT recovered: lost at T1: no cluster in the window [-40 s, +90 s] in beam 200 (+-2) at DM 500 (+-75)
-    NOT recovered: lost at T2 filters: cluster at S/N 15.8 below tier B (18)
-    NOT recovered: lost at T2 filters: cluster tagged dm_floor by the low-DM storm veto
+    NOT recovered: lost at T1: no matching trial in beam 200 (+-2) within the window at DM 500 (+-75)
+    NOT recovered: lost at T2: 7 matching T1 trials (best S/N 9.2) but no cluster formed (min 5 members)
     injection not fired: FIFO write failed
+
+Recovered means the search found it, at any S/N: an injection recovered at
+S/N 15.8 reads like any other. The trigger filters no longer make an
+outcome - `gate_trigger` still records whether it would also have earned a
+dump. Separating a T1 miss from a T2 clustering miss reads hella's raw
+candidate file; see `docs/architecture.md`.
 
 The last is injector plumbing, not a pipeline miss: it gets a grey bar
 rather than a red one and never counts toward a miss streak.
