@@ -11,13 +11,22 @@ Distance is Euclidean over five scaled axes::
 
     sqrt( (d_samp / samp_scale)^2 + (d_dm_idx / dm_idx_scale)^2
           + (d_log2(width) / width_scale)^2
-          + (dx^2 + dy^2) / sky_scale_deg^2 )  <=  eps
+          + (dx / beam_fwhm_x_deg)^2 + (dy / beam_fwhm_y_deg)^2 )  <=  eps
 
 where (x, y) is the beam's position on a tangent plane about the zenith,
-in degrees. Each scale keeps its meaning: an offset on one axis alone of
-exactly one scale is a distance of exactly 1, so eps 1.0 still reads as
-"one scale on any single axis". The time/DM/width scales were tuned with
-t2-replay on live data (2026-06-10, see casm_t2 MEMORY.md).
+in degrees, x East-West and y North-South. Each scale keeps its meaning:
+an offset on one axis alone of exactly one scale is a distance of exactly
+1, so eps 1.0 still reads as "one scale on any single axis". The
+time/DM/width scales were tuned with t2-replay on live data (2026-06-10,
+see casm_t2 MEMORY.md).
+
+The sky link on each axis is the beam's own FWHM on that axis
+(2026-09-09), so two trials are linked when they fall within one beam width
+of each other. The beam is treated as a standard ellipse aligned with
+alt/az, from ``bf_weights_generator.compute_beam_fwhm``: 18.1 deg E-W by
+3.9 deg N-S, pointing independent. It is very much wider E-W than N-S, so
+one source lights up a row of beams rather than a circle of them, and an
+isotropic link either splits that row or merges unrelated sky.
 
 The metric was cityblock (L1) until 2026-09-09. Two things forced the
 change, both about the sky pair. The sky axes are two coordinates of ONE
@@ -79,8 +88,11 @@ class ClusterParams:
     samp_scale: float = 64.0     # samples, ~67 ms at 1.048576 ms/sample
     dm_idx_scale: float = 32.0   # DM trial steps
     width_scale: float = 2.0     # steps of the width column (already log2 samples)
-    sky_scale_deg: float = 4.4   # degrees on sky; the tangent-plane separation
-                                 # two beams may have and still be one event
+    # Beam FWHM per axis, degrees. This IS the sky link scale: two trials
+    # within one beam width of each other on both axes are one event.
+    # Standard alt/az-aligned ellipse from compute_beam_fwhm.
+    beam_fwhm_x_deg: float = 18.1   # E-W
+    beam_fwhm_y_deg: float = 3.9    # N-S
     beam_scale: float = 4.0      # FALLBACK ONLY: beam-index axis, no pointings
 
 
@@ -218,8 +230,8 @@ def _features(cands: list[Candidate], p: ClusterParams,
         x[i] = (c.samp / p.samp_scale,
                 c.dm_idx / p.dm_idx_scale,
                 c.width / p.width_scale,
-                bx / p.sky_scale_deg,
-                by / p.sky_scale_deg)
+                bx / p.beam_fwhm_x_deg,
+                by / p.beam_fwhm_y_deg)
     return x
 
 
@@ -234,19 +246,20 @@ def _dedup_grid(cands: list[Candidate], p: ClusterParams,
     representatives (highest SNR) and each cell's raw trial count.
 
     The spatial part of the key uses the same axes DBSCAN sees — half-scale
-    cells of the tangent plane — plus the beam index itself. Beams are 3.1
-    deg apart and a half-scale cell is 2 deg, so cells alone would sometimes
-    merge two distinct beams, and ``n_beams``/``sky_extent_deg`` would then
-    understate the real footprint. Keeping the beam in the key makes the
-    grid strictly finer than the sky axes, which is the invariant that
-    matters.
+    cells of the tangent plane, one cell size per axis — plus the beam index
+    itself. Cells alone would merge distinct beams (a half-scale x cell is
+    far wider than the 3.1 deg beam spacing), and ``n_beams`` /
+    ``sky_extent_deg`` would then understate the real footprint. Keeping the
+    beam in the key makes the grid strictly finer than the sky axes, which
+    is the invariant that matters.
     """
-    half_sky = max(p.sky_scale_deg / 2, 1e-6)
+    half_x = max(p.beam_fwhm_x_deg / 2, 1e-6)
+    half_y = max(p.beam_fwhm_y_deg / 2, 1e-6)
     cells: dict[tuple, list] = {}
     for c in cands:
         if sky is not None:
             bx, by = (sky.xy(c.beam) if sky.has(c.beam) else (0.0, 0.0))
-            spatial = (math.floor(bx / half_sky), math.floor(by / half_sky), c.beam)
+            spatial = (math.floor(bx / half_x), math.floor(by / half_y), c.beam)
         else:
             spatial = (c.beam,)
         key = (c.samp // max(int(p.samp_scale / 2), 1),
@@ -290,7 +303,8 @@ def cluster_candidates(cands: list[Candidate],
 
     ``sky`` is the beam pointing table live at the time of these
     candidates (see :class:`SkyTable`). With it, beams enter as two
-    tangent-plane degree axes scaled by ``sky_scale_deg`` and every cluster
+    tangent-plane degree axes scaled by ``beam_fwhm_x_deg`` and
+    ``beam_fwhm_y_deg`` — one beam width per axis — and every cluster
     carries a real ``sky_extent_deg``. Without it, clustering falls back to
     the beam-index axis and ``beam_scale``, which is a poor similarity
     measure on the deployed non-sky-ordered grid — the fallback warns once

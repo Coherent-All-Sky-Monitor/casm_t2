@@ -236,7 +236,8 @@ class T2Daemon:
             samp_scale=cc.get("samp_scale", 64.0),
             dm_idx_scale=cc.get("dm_idx_scale", 32.0),
             width_scale=cc.get("width_scale", 2.0),
-            sky_scale_deg=cc.get("sky_scale_deg", 4.4),
+            beam_fwhm_x_deg=cc.get("beam_fwhm_x_deg", 18.1),
+            beam_fwhm_y_deg=cc.get("beam_fwhm_y_deg", 3.9),
             beam_scale=cc.get("beam_scale", 4.0))
         # Pointing tables, one per weights product, built lazily and reused:
         # the table only changes when weights are uploaded (days apart), so a
@@ -255,8 +256,8 @@ class T2Daemon:
         # Sky-extent RFI cut (2026-09-09). n_beams alone is a count, not a
         # footprint: on the non-sky-ordered beam grid a broadband burst lighting
         # up 20 beams all over the sky never reached max_nbeam. A real source
-        # spans at most ~2 beam spacings (8 deg), so anything wider than this is
-        # not one source. 0 disables.
+        # spans about one E-W beam width plus a beam spacing; anything wider
+        # is not one source. 0 disables.
         self.max_sky_extent_deg = float(filt.get("max_sky_extent_deg", 25.0))
         self.dm_floor = filt.get("dm_floor", 20.0)
         # DM-floor veto (2026-09-09): a bright zero-DM impulse of 10-20 ms

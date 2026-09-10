@@ -21,6 +21,22 @@ from conftest import SKY_COLS, _synthetic_pointings
 PARAMS = ClusterParams()
 
 
+def table_at(offsets) -> SkyTable:
+    """A SkyTable whose beams sit at exactly these tangent-plane (x, y) deg.
+
+    ``unproject`` is the inverse of the projection SkyTable applies, so the
+    beams land where asked to floating-point precision. Used where a test
+    needs a specific separation on a specific axis rather than whatever the
+    real grid happens to offer.
+    """
+    alt, az = [], []
+    for x, y in offsets:
+        a, z = unproject(x, y)
+        alt.append(a)
+        az.append(z)
+    return SkyTable(alt, az, weights_id="offsets")
+
+
 def trials(beams, samp=1000, dm_idxs=(100, 116), widths=(2, 3), snr=20.0):
     """Four trials per beam: two DM cells x two boxcar widths.
 
@@ -79,16 +95,26 @@ def test_bad_pointings_give_no_table():
 # ---------------------------------------------------- merging and splitting
 
 def _pick_sky_adjacent_far_in_index(table, beam_at):
-    """Two beams 3.1 deg apart on sky whose indices are nowhere near."""
+    """Two E-W-adjacent beams (3.1 deg) whose indices are nowhere near."""
     pairs = [(beam_at[(0, c)], beam_at[(0, c + 1)]) for c in range(SKY_COLS - 1)]
     a, b = max(pairs, key=lambda p: abs(p[0] - p[1]))
     assert abs(a - b) > 4 and table.separation_deg(a, b) < 4.0
     return a, b
 
 
-def _pick_index_adjacent_far_on_sky(table):
-    """Two consecutive beam indices that are far apart on the sky."""
-    b = max(range(table.n - 1), key=lambda i: table.separation_deg(i, i + 1))
+def _pick_index_adjacent_far_on_sky(table, params=PARAMS):
+    """Two consecutive beam indices far apart on sky on BOTH scaled axes.
+
+    "Far" has to be measured in the metric DBSCAN uses: 30 deg of pure E-W
+    separation is well under two beam widths on the 18.1 deg x axis, so a
+    pair is only safely unlinkable when the scaled distance exceeds eps.
+    """
+    def scaled(i, j):
+        return math.hypot((table.x[i] - table.x[j]) / params.beam_fwhm_x_deg,
+                          (table.y[i] - table.y[j]) / params.beam_fwhm_y_deg)
+
+    b = max(range(table.n - 1), key=lambda i: scaled(i, i + 1))
+    assert scaled(b, b + 1) > params.eps
     assert table.separation_deg(b, b + 1) > 25.0
     return b, b + 1
 
@@ -118,6 +144,48 @@ def test_index_adjacent_but_sky_far_do_not_merge(sky):
     # the old beam-index axis merged them, which is the bug
     old = cluster_candidates(trials([a, b]), PARAMS, None)
     assert any(c.n_beams == 2 for c in old)
+
+
+def test_east_west_pair_merges_north_south_pair_does_not():
+    """8 deg apart E-W is inside one beam; 8 deg apart N-S is two sources.
+
+    The beam is 18.1 deg E-W and 3.9 deg N-S, so the same separation means
+    opposite things depending on which way it points. An isotropic link
+    cannot express that; this is the whole reason the two axes differ.
+    """
+    ew = table_at([(0.0, 0.0), (8.0, 0.0)])
+    ns = table_at([(0.0, 0.0), (0.0, 8.0)])
+
+    merged = cluster_candidates(trials([0, 1]), PARAMS, ew)
+    real = [c for c in merged if c.n_beams > 1]
+    assert len(real) == 1, "E-W pair 8 deg apart must be one cluster"
+    assert real[0].n_members == 8
+    assert real[0].sky_extent_deg == pytest.approx(8.0, abs=0.05)
+
+    split = cluster_candidates(trials([0, 1]), PARAMS, ns)
+    assert all(c.n_beams == 1 for c in split), \
+        "N-S pair 8 deg apart must not be one cluster"
+
+
+def test_link_scale_is_the_configured_beam_fwhm():
+    """The link scale on each axis is that axis's beam FWHM, nothing else."""
+    p = ClusterParams()
+    assert (p.beam_fwhm_x_deg, p.beam_fwhm_y_deg) == (18.1, 3.9)
+    # one beam width out on a single axis is exactly eps: just inside links,
+    # comfortably outside does not
+    inside = table_at([(0.0, 0.0), (p.beam_fwhm_x_deg - 0.2, 0.0)])
+    assert any(c.n_beams == 2 for c in cluster_candidates(
+        trials([0, 1]), p, inside))
+    outside = table_at([(0.0, 0.0), (p.beam_fwhm_x_deg + 2.0, 0.0)])
+    assert all(c.n_beams == 1 for c in cluster_candidates(
+        trials([0, 1]), p, outside))
+    # and the same holds on the much narrower N-S axis
+    inside_y = table_at([(0.0, 0.0), (0.0, p.beam_fwhm_y_deg - 0.2)])
+    assert any(c.n_beams == 2 for c in cluster_candidates(
+        trials([0, 1]), p, inside_y))
+    outside_y = table_at([(0.0, 0.0), (0.0, p.beam_fwhm_y_deg + 2.0)])
+    assert all(c.n_beams == 1 for c in cluster_candidates(
+        trials([0, 1]), p, outside_y))
 
 
 # ------------------------------------------------------------- rfi_wide
@@ -156,7 +224,7 @@ def test_sky_extent_catches_what_max_nbeam_misses(sky, daemon):
     cls = cluster_candidates(trials(beams), PARAMS, table)
     wide = max(cls, key=lambda c: c.n_beams)
     assert wide.n_beams == 12
-    assert 25.0 < wide.sky_extent_deg < 60.0
+    assert 25.0 < wide.sky_extent_deg < 60.0   # over the cut, under a full row
 
     d = daemon()
     assert wide.n_beams <= d.max_nbeam            # the old cut does not fire
@@ -174,7 +242,7 @@ def test_compact_source_is_not_tagged(sky, daemon):
     a, b = _pick_sky_adjacent_far_in_index(table, beam_at)
     cls = cluster_candidates(trials([a, b], dm_idxs=(700, 716)), PARAMS, table)
     src = max(cls, key=lambda c: c.n_beams)
-    assert src.sky_extent_deg < 8.0
+    assert src.sky_extent_deg < 18.1           # inside one beam width
     d = daemon()
     tier, tags = d._classify(src, None)
     assert "rfi_wide" not in tags

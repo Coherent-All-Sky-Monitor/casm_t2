@@ -96,7 +96,8 @@ single-beam FRB this daemon exists to catch. Worst case kept is
 
 DBSCAN, Euclidean metric, over scaled (samp, dm_idx, log2(width), x, y)
 where (x, y) is the beam's position in degrees on a tangent plane about
-the zenith, scaled by `sky_scale_deg`. An offset of exactly one scale on
+the zenith, x East-West and y North-South, scaled by `beam_fwhm_x_deg`
+and `beam_fwhm_y_deg`. An offset of exactly one scale on
 any single axis is a distance of exactly 1, so eps 1.0 keeps its meaning;
 offsets on several axes now add in quadrature rather than linearly.
 
@@ -117,12 +118,17 @@ understated every footprint in `n_beams`, and left `rfi_wide` (n_beams >
 The metric was cityblock until 2026-09-09. The sky pair is two
 coordinates of one physical quantity, so under L1 a cross-beam link cost
 `|dx| + |dy|` — up to sqrt(2) times the real separation, and dependent on
-how the pair happened to lie against the projection axes. At a 4 deg scale
-only 61% of beams could reach their own nearest neighbour even for two
-otherwise identical trials. Under Euclidean the sky term is the
-tangent-plane separation itself, and `sky_scale_deg` ships at 4.4 — the
-smallest 0.1 step at which 95% of beams reach their nearest neighbour
-(96.7%; 4.0 reaches only 90.4%, because the grid's spacing is not uniform).
+how the pair happened to lie against the projection axes. Under Euclidean
+the sky term is the tangent-plane separation itself.
+
+The link scale on each axis is the beam's own FWHM on that axis, so two
+trials are linked when they fall within one beam width of each other. The
+beam is taken as a standard ellipse aligned with alt/az, from
+`bf_weights_generator.compute_beam_fwhm`: 18.1 deg E-W by 3.9 deg N-S,
+pointing independent. Because it is far wider E-W than N-S, one source
+lights up a row of beams rather than a circle of them, and an isotropic
+link either splits that row or merges unrelated sky. Change the two config
+values when the weights change the beam.
 
 The pointing table comes from the weights live at the gulp's own time
 (`weights_registry.pointings_for`), fetched once per gulp and cached by
@@ -133,8 +139,8 @@ to the beam-index axis and `beam_scale`, warns once, and leaves
 measured. Fail-safe, never fail-shut.
 
 Sky extent, not beam count, is now the primary RFI discriminator: a real
-source spans at most about two beam spacings (8 deg), so anything wider
-than `filters.max_sky_extent_deg` is not one source.
+source spans about one E-W beam width plus a beam spacing, so anything
+wider than `filters.max_sky_extent_deg` (25 deg) is not one source.
 
 ## Decision chain
 

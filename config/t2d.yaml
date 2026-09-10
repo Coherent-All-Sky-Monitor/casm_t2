@@ -84,13 +84,12 @@ cluster:
   # neighbours 3.1 deg, and only 11% of a beam's six sky-nearest neighbours lie
   # within +-4 index).
   #
-  # 4.4 deg (2026-09-09): the distance metric is Euclidean, so the cost of a
-  # cross-beam link is the tangent-plane separation itself. 4.4 is the smallest
-  # 0.1 step at which >= 95% of beams can reach their own sky-nearest neighbour
-  # within one eps (96.7%; the 95th percentile of that distance is 4.29 deg, and
-  # 4.3 gives 94.9%). The obvious "one beam spacing" value of 4.0 reaches only
-  # 90.4% -- the grid's nearest-neighbour spacing is not uniform.
-  sky_scale_deg: 4.4
+  # The beam FWHM per axis IS the link scale: two trials within one beam width
+  # of each other are one event. The beam is assumed to be a standard ellipse
+  # aligned with alt/az. Standard ellipse from compute_beam_fwhm; change when
+  # the weights change the beam.
+  beam_fwhm_x_deg: 18.1   # E-W
+  beam_fwhm_y_deg: 3.9    # N-S
   # FALLBACK ONLY: the old beam-index axis, used when the weights registry
   # cannot name a pointing table for the gulp. Logs a warning; sky_extent_deg
   # is then left unmeasured (0) and nothing is tagged on it.
@@ -113,9 +112,9 @@ filters:
                         # weights — the first-beam artifact died with it)
   max_nbeam: 32         # more distinct beams than this: rfi_wide, never triggers
   # Sky-extent cut (2026-09-09): a cluster whose member beams span more than
-  # this on the sky is not one source (a real one spans at most ~2 beam
-  # spacings, 8 deg), so it is tagged rfi_wide too. This is the cut n_beams
-  # could not make on a non-sky-ordered grid. 0 disables.
+  # this on the sky is not one source -- about one E-W FWHM plus a beam
+  # spacing -- so it is tagged rfi_wide too. This is the cut n_beams could
+  # not make on a non-sky-ordered grid. 0 disables.
   max_sky_extent_deg: 25.0
   dm_floor: 20.0        # blind (tier) triggers require peak DM >= this
   # DM-floor veto (2026-09-09, Vishnu): clusters whose lowest member DM sits

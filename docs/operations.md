@@ -21,13 +21,15 @@ DB.
 `config/t2d.yaml` is the only user config. The blocks you'll actually
 touch:
 
-`cluster` sets the DBSCAN axis scales. `sky_scale_deg` (4.0, one beam
-spacing) is the sky axis: beams enter clustering as their position on the
-sky, not as a beam index, because the beam grid is not sky-ordered.
-4.4 is the smallest 0.1 step at which 95% of beams reach their
-own sky-nearest neighbour within one eps under the Euclidean metric (96.7%;
-4.0 would reach 90.4%). `beam_scale` is the fallback used only when the
-weights registry cannot name a pointing table for the gulp — the log says so when that happens,
+`cluster` sets the DBSCAN axis scales. Beams enter clustering as their
+position on the sky, not as a beam index, because the beam grid is not
+sky-ordered. The link scale on each axis is the beam FWHM on that axis:
+`beam_fwhm_x_deg` 18.1 (East-West) and `beam_fwhm_y_deg` 3.9
+(North-South), the standard alt/az-aligned ellipse from
+`compute_beam_fwhm`. Two trials within one beam width of each other are one
+event. These are a description of the beam, not tuning knobs — change them
+when the weights change the beam. `beam_scale` is the fallback used only
+when the weights registry cannot name a pointing table for the gulp — the log says so when that happens,
 and `sky_extent_deg` is then left at 0 and nothing is tagged on it.
 
 `coalesce_jobs` (8), `coalesce_max_s` (8.0) and `coalesce_s` (0.25)
@@ -46,9 +48,9 @@ cautious — find the job before assuming the sky was quiet.
 `tiers` and `filters` (S/N thresholds, `beam_veto`, `max_nbeam`,
 `max_sky_extent_deg`, `dm_floor`, `dm_floor_veto`) shape what counts as an
 event. `max_sky_extent_deg` (25.0) tags a cluster `rfi_wide` when its
-member beams span more than that on the sky; a real source spans at most
-about two beam spacings, 8 deg, so a wider cluster is broadband RFI no
-matter how few beams it happens to occupy. The DM-floor
+member beams span more than that on the sky; a real source spans about one
+E-W beam width plus a beam spacing, so a wider cluster is broadband RFI no
+matter how few beams it occupies. The DM-floor
 veto tags a cluster `dm_floor` when its lowest member DM sits at hella's
 first trial (`max_dm_lo`, 20.6 for DM_MIN 20) with boxcar index at or
 above `min_width`; that is a zero-DM impulse leaking up the bowtie. The

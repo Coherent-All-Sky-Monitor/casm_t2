@@ -57,7 +57,10 @@ def main() -> None:
     p.add_argument("--samp-scale", type=float, default=64.0)
     p.add_argument("--dm-idx-scale", type=float, default=32.0)
     p.add_argument("--width-scale", type=float, default=2.0)
-    p.add_argument("--sky-scale-deg", type=float, default=4.4)
+    p.add_argument("--beam-fwhm-x-deg", type=float, default=18.1,
+                   help="E-W beam FWHM, which is the E-W link scale")
+    p.add_argument("--beam-fwhm-y-deg", type=float, default=3.9,
+                   help="N-S beam FWHM, which is the N-S link scale")
     p.add_argument("--beam-scale", type=float, default=4.0,
                    help="fallback beam-index scale, used only without --pointings")
     p.add_argument("--pointings",
@@ -78,8 +81,8 @@ def main() -> None:
     params = cluster.ClusterParams(
         eps=args.eps, min_samples=args.min_samples,
         samp_scale=args.samp_scale, dm_idx_scale=args.dm_idx_scale,
-        width_scale=args.width_scale, sky_scale_deg=args.sky_scale_deg,
-        beam_scale=args.beam_scale)
+        width_scale=args.width_scale, beam_fwhm_x_deg=args.beam_fwhm_x_deg,
+        beam_fwhm_y_deg=args.beam_fwhm_y_deg, beam_scale=args.beam_scale)
 
     sky = None
     if args.pointings:
@@ -149,8 +152,8 @@ def main() -> None:
 
     if sky is not None:
         print("\nsky-extent distribution (max pairwise separation of member beams):")
-        for lo, hi, label in [(0.0, 0.01, "0 (one beam)"), (0.01, 8.0, "<=8"),
-                              (8.0, 25.0, "8-25"), (25.0, 1e9, ">25 (rfi_wide)")]:
+        for lo, hi, label in [(0.0, 0.01, "0 (one beam)"), (0.01, 18.1, "<=18"),
+                              (18.1, 25.0, "18-25"), (25.0, 1e9, ">25 (rfi_wide)")]:
             n = sum(1 for cl in all_clusters if lo <= cl.sky_extent_deg < hi)
             print(f"  {label:>15} deg: {n:7d}  ({n / max(n_real, 1) * 100:.1f}%)")
 
