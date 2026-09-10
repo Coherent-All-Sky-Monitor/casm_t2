@@ -185,13 +185,26 @@ Timeline per shot, from the FIFO write:
 
 In `single` mode nothing posts at 0 s and the whole card appears at the end.
 
+Every shot has a display name, `inj_YYYYMMDD_NNNN`, counting from 0001 each
+UTC day. It is the ledger's `file_id`, and it is what appears in Slack, in the
+plot title, and as the archive directory name; the integer row id stays the
+primary key. The counter reads the day's highest recorded name, so a restart
+continues the sequence instead of reusing one.
+
 Archive layout, one directory per shot under `events_root`:
 
-    inj667/inj667.png     the replay plot
-    inj667/inj667.json    the synthetic card
-    inj667/inj667.fil     the beam with the pulse added, float32 single-beam
+    inj_20260910_0002/inj_20260910_0002.png     the replay plot
+    inj_20260910_0002/inj_20260910_0002.json    the synthetic card
+    inj_20260910_0002/inj_20260910_0002.fil     the beam with the pulse added
 
-The dump itself is deleted after the plot unless `keep_dump: true`. Everything
+Cleanup deletes only this shot's own `.dada` FILES, selected by the window
+each file covers (from its name and size) against the recorded
+`dump_utc_start..dump_utc_stop`, and never the directory: `dump_dir` is the
+shared per-stream directory that T2's ordinary triggered dumps also write to.
+It refuses to delete anything if the selection returns more than four files or
+if no window was recorded, and logs every deletion by full path. On 2026-09-10
+an earlier version called `rmtree` on that directory after shot 668 and took
+every other dump in `stream_0` with it. Set `keep_dump: true` to keep them. Everything
 in the chain is fail-soft: a failed dump, render or post leaves the injection
 and its ledger row alone, and the shot is still reconciled normally.
 
@@ -202,15 +215,15 @@ The daemon posts one Slack message per injection, and completes it in place.
 In the default `sent_then_update` mode the sent line goes up the moment the
 pulse hits the FIFO, so the channel shows a shot in flight:
 
-    injection 667 sent: beam 220, DM 300, FWHM 11.8 ms, injected S/N 25
+    injection inj_20260910_0002 sent: beam 220, DM 300, FWHM 11.8 ms, injected S/N 25
     _awaiting recovery..._
 
 About 100-110 s later that same message is updated: the awaiting tail goes,
 and a bar coloured by outcome (green recovered, red missed, grey not fired)
 appears under it carrying the result line and the replay plot inline.
 
-    injection 667 sent: beam 220, DM 300, FWHM 11.8 ms, injected S/N 25
-    | recovered -> <.../event/260910qklnfh|260910qklnfh> | SNR 24.6 (ratio 0.99) | DM 299.8 (delta -0.2) | beam 220 | width 11.5 ms (ibox 4)
+    injection inj_20260910_0002 sent: beam 220, DM 300, FWHM 11.8 ms, injected S/N 25
+    | recovered -> SNR 24.6 (ratio 0.99) | DM 299.8 (delta -0.2) | beam 220 | width 11.5 ms (ibox 4)
     | [replay plot]
 
 The message `text` stays the plain sent line, so notifications and the channel
@@ -274,7 +287,7 @@ The messages:
 
     injection 660 sent: beam 150, DM 300, FWHM 4.7 ms, injected S/N 28
     injection 671 sent: beam 90, DM 300, FWHM 11.8 ms, injected S/N 16 (IB sub off)
-    recovered -> <.../injections/plot/inj_..._b150|inj_..._b150> | SNR 43.0 (ratio 1.54) | DM 299.8 (delta -0.2) | beam 150 | width 3.1 ms (ibox 2)
+    recovered -> SNR 43.0 (ratio 1.54) | DM 299.8 (delta -0.2) | beam 150 | width 3.1 ms (ibox 2)
 
 Incoherent-beam subtraction is normally on and says nothing; only the
 unusual state is called out. The link goes to the shot's truth plot on the

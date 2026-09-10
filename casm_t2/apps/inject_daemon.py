@@ -306,6 +306,30 @@ def injection_neighbours(cfg: dict, utc: datetime, beam: int) -> tuple[set[int],
                                    scale), True
 
 
+def next_file_id(conn, when: datetime | None = None) -> str:
+    """The shot's display name: ``inj_YYYYMMDD_NNNN``, NNNN per UTC day.
+
+    Counts from 0001 each UTC day, from the highest number already recorded
+    for that day, so a daemon restart continues the sequence rather than
+    reusing a name. The ledger's integer `id` stays the primary key; this is
+    the handle a person reads, in Slack, on the plot, and in the archive
+    directory name.
+    """
+    when = when or datetime.now(timezone.utc)
+    day = f"{when:%Y%m%d}"
+    prefix = f"inj_{day}_"
+    row = conn.execute(
+        "SELECT max(file_id) FROM injections WHERE file_id LIKE ?",
+        (prefix + "%",)).fetchone()
+    n = 0
+    if row and row[0]:
+        try:
+            n = int(str(row[0])[len(prefix):][:4])
+        except ValueError:
+            n = 0
+    return f"{prefix}{n + 1:04d}"
+
+
 def obs_utc_start_at(conn, utc: datetime) -> str | None:
     """UTC_START of the observation live at `utc`, as a PSRDADA string.
 
@@ -583,6 +607,14 @@ def reconcile(conn, inj_id: int, cfg: dict) -> None:
                 "" if n_trials is None else f" t1_trials={n_trials}")
 
 
+def _parse_utc(value):
+    """An ISO timestamp from the ledger, or None."""
+    try:
+        return datetime.fromisoformat(value) if value else None
+    except (TypeError, ValueError):
+        return None
+
+
 def do_replay(conn, cfg: dict, poster, inj_id: int, dump_dir) -> Path | None:
     """Render the shot's replay plot and thread it under its Slack message.
 
@@ -594,6 +626,10 @@ def do_replay(conn, cfg: dict, poster, inj_id: int, dump_dir) -> Path | None:
     rcfg = inject_replay.replay_cfg(icfg)
     row = ledger_row(conn, inj_id)
     outcome = (row or {}).get("outcome")
+    # The dump directory is shared with T2's ordinary triggered dumps, so
+    # cleanup needs this shot's own window to know which files are its.
+    d_start = _parse_utc((row or {}).get("dump_utc_start"))
+    d_stop = _parse_utc((row or {}).get("dump_utc_stop"))
     completes = poster.mode in (inject_slack.MODE_SINGLE,
                                 inject_slack.MODE_SENT_THEN_UPDATE)
     due = (dump_dir is not None and rcfg.get("post") != "never"
@@ -603,7 +639,7 @@ def do_replay(conn, cfg: dict, poster, inj_id: int, dump_dir) -> Path | None:
         if dump_dir is not None:
             logger.info("injection %d: replay not due (post=%s, outcome=%s)",
                         inj_id, rcfg.get("post"), outcome)
-            inject_replay.cleanup_dump(dump_dir, rcfg)
+            inject_replay.cleanup_dump(dump_dir, rcfg, d_start, d_stop)
         if completes:
             # These modes owe the shot a finished card either way: without a
             # plot it is the outcome bar alone, which is the part that
@@ -625,7 +661,8 @@ def do_replay(conn, cfg: dict, poster, inj_id: int, dump_dir) -> Path | None:
             conn, datetime.fromisoformat(row["inject_utc"]))
     png = inject_replay.run_replay(inj_id, dump_dir, rcfg,
                                    db_path=cfg.get("db", db.DEFAULT_PATH),
-                                   event_utc=event_utc)
+                                   event_utc=event_utc,
+                                   label=(row or {}).get("file_id"))
     posted = False
     if png is not None:
         with conn:
@@ -648,7 +685,7 @@ def do_replay(conn, cfg: dict, poster, inj_id: int, dump_dir) -> Path | None:
         with conn:
             conn.execute("UPDATE injections SET replay_posted=? WHERE id=?",
                          (int(posted), inj_id))
-    inject_replay.cleanup_dump(dump_dir, rcfg)
+    inject_replay.cleanup_dump(dump_dir, rcfg, d_start, d_stop)
     return png
 
 
@@ -763,7 +800,7 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
         else:
             amp = random.uniform(*icfg.get("amp_range", [25.0, 45.0]))
             inject_snr = target_rec = sigma_n = nchan_usable = None
-        file_id = f"inj_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}_b{beam:03d}"
+        file_id = next_file_id(conn)
 
         try:
             dada, est_snr = await asyncio.to_thread(

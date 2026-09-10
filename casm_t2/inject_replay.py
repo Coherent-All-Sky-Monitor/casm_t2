@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import shutil
 import statistics
+import sys
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -131,25 +132,54 @@ def expected_event_utc(conn, inject_utc: datetime,
     return inject_utc + timedelta(seconds=lead)
 
 
-def replay_paths(inj_id: int, rcfg: dict) -> dict:
-    """Where this shot's replay products go: <events_root>/inj<id>/inj<id>.*"""
-    root = Path(rcfg.get("events_root", "/mnt/nvme3/T3/EVENTS")) / f"inj{inj_id}"
+def replay_paths(inj_id, rcfg: dict, label: str | None = None) -> dict:
+    """Where this shot's products go: <events_root>/<label>/<label>.*
+
+    `label` is the display name (`inj_20260910_0002`); without one it falls
+    back to the ledger id, which is what the very first shots used.
+    """
+    name = str(label or f"inj{inj_id}")
+    root = Path(rcfg.get("events_root", "/mnt/nvme3/T3/EVENTS")) / name
     return {"dir": root,
-            "png": root / f"inj{inj_id}.png",
-            "json": root / f"inj{inj_id}.json",
-            "fil": root / f"inj{inj_id}.fil"}
+            "png": root / f"{name}.png",
+            "json": root / f"{name}.json",
+            "fil": root / f"{name}.fil"}
+
+
+def resolve_command(command: str) -> list[str]:
+    """Split `replay.command` into argv, finding the tool if PATH lacks it.
+
+    The daemon runs under systemd with a PATH that does not include the venv,
+    so a bare `t3-replay-injection` is not found even though it sits next to
+    the interpreter running this code. Look there before giving up; an
+    absolute path or a `python -m ...` form is left alone.
+    """
+    parts = str(command).split()
+    if not parts:
+        return parts
+    head = parts[0]
+    if "/" in head or shutil.which(head):
+        return parts
+    beside = Path(sys.executable).parent / head
+    if beside.is_file():
+        logger.info("replay command %r is not on PATH; using %s", head, beside)
+        return [str(beside), *parts[1:]]
+    logger.warning("replay command %r is not on PATH and not beside %s",
+                   head, sys.executable)
+    return parts
 
 
 def build_command(inj_id: int, dump_dir, rcfg: dict, db_path: str | None = None,
-                  event_utc: datetime | None = None) -> list[str]:
+                  event_utc: datetime | None = None,
+                  label: str | None = None) -> list[str]:
     """The replay tool's argv.
 
     `event_utc` is passed only for a shot with no recovered cluster: the tool
     then adds the pulse at the time it should have arrived, so the reader
     sees what hella should have found.
     """
-    paths = replay_paths(inj_id, rcfg)
-    cmd = [*str(rcfg.get("command", "t3-replay-injection")).split(),
+    paths = replay_paths(inj_id, rcfg, label)
+    cmd = [*resolve_command(rcfg.get("command", "t3-replay-injection")),
            "--inject-id", str(inj_id),
            "--dump", str(dump_dir),
            "--out", str(paths["png"]),
@@ -159,14 +189,17 @@ def build_command(inj_id: int, dump_dir, rcfg: dict, db_path: str | None = None,
         cmd += ["--db", str(db_path)]
     if event_utc is not None:
         cmd += ["--event-utc", event_utc.isoformat(timespec="milliseconds")]
+    if label:
+        cmd += ["--label", label]
     return cmd
 
 
 def run_replay(inj_id: int, dump_dir, rcfg: dict, db_path: str | None = None,
-               event_utc: datetime | None = None, runner=None) -> Path | None:
+               event_utc: datetime | None = None, runner=None,
+               label: str | None = None) -> Path | None:
     """Render the replay; returns the PNG path, or None on any failure."""
-    paths = replay_paths(inj_id, rcfg)
-    cmd = build_command(inj_id, dump_dir, rcfg, db_path, event_utc)
+    paths = replay_paths(inj_id, rcfg, label)
+    cmd = build_command(inj_id, dump_dir, rcfg, db_path, event_utc, label)
     runner = runner or subprocess.run
     try:
         paths["dir"].mkdir(parents=True, exist_ok=True)
@@ -186,24 +219,105 @@ def run_replay(inj_id: int, dump_dir, rcfg: dict, db_path: str | None = None,
     return paths["png"]
 
 
-def cleanup_dump(dump_dir, rcfg: dict) -> bool:
-    """Delete the dump unless keep_dump. Returns True if it was removed."""
-    if rcfg.get("keep_dump"):
-        logger.info("keeping dump %s (keep_dump)", dump_dir)
-        return False
-    path = Path(dump_dir)
-    if not path.exists():
-        return False
+#: Intensity dump rate per stream, the ring's BYTES_PER_SECOND. A file's
+#: byte offset in its name converts to seconds from the observation start
+#: with this (same constant casm_t3's janitor uses).
+BYTES_PER_SECOND = 375e6
+
+#: A dump of the configured window is one or two files. More than this from
+#: the window selection means the arithmetic is wrong, and the right response
+#: to that is to delete nothing.
+MAX_DELETE = 4
+
+
+def dump_file_span(path) -> tuple[datetime, datetime] | None:
+    """Sky-time interval a .dada file covers, from its name and size.
+
+    Files are named ``<UTC_START>_<byteoffset>.000000.dada``; the offset is
+    bytes since the observation started. Returns None when the name does not
+    parse, which must never be read as "no overlap".
+    """
+    path = Path(path)
     try:
-        if path.is_dir():
-            shutil.rmtree(path)
-        else:
-            path.unlink()
-    except OSError as exc:
-        logger.warning("could not delete dump %s: %s", path, exc)
-        return False
-    logger.info("deleted dump %s", path)
-    return True
+        obs_s, rest = path.name.split("_", 1)
+        offset = int(rest.split(".")[0])
+        size = path.stat().st_size
+    except (ValueError, IndexError, OSError):
+        return None
+    try:
+        from casm_t2 import timing
+        t0 = timing.parse_dada_utc(obs_s) + timedelta(
+            seconds=offset / BYTES_PER_SECOND)
+    except ValueError:
+        return None
+    return t0, t0 + timedelta(seconds=size / BYTES_PER_SECOND)
+
+
+def dump_files_in_window(dump_dir, start: datetime, stop: datetime,
+                         margin_s: float = 2.0) -> list[Path]:
+    """The .dada files in `dump_dir` overlapping [start, stop].
+
+    `dump_dir` is a per-STREAM directory shared with T2's ordinary triggered
+    dumps, so this must pick out only the injection's own files. Selection is
+    by the window each file covers, from its name and size; a file whose name
+    does not parse is left alone rather than guessed at.
+    """
+    lo = start - timedelta(seconds=margin_s)
+    hi = stop + timedelta(seconds=margin_s)
+    hits = []
+    for path in sorted(Path(dump_dir).glob("*.dada")):
+        span = dump_file_span(path)
+        if span is None:
+            continue
+        f0, f1 = span
+        if f0 <= hi and f1 >= lo:
+            hits.append(path)
+    return hits
+
+
+def cleanup_dump(dump_dir, rcfg: dict, start=None, stop=None) -> int:
+    """Delete this injection's dump FILES. Returns how many went.
+
+    Never removes the directory. `dump_dir` is
+    `/mnt/nvme4/data/casm/cand_beam_dumps/stream_N`, which T2's ordinary
+    triggered dumps share: on 2026-09-10 an earlier version rmtree'd it after
+    shot 668 and took every other dump with it. Only files whose own window
+    overlaps the recorded [start, stop] are removed, at most MAX_DELETE of
+    them, and every deletion is logged by full path.
+
+    Without a recorded window nothing is deleted - there is no way to tell
+    this shot's files from anyone else's, and leaving disk to the janitor is
+    the cheap mistake.
+    """
+    if rcfg.get("keep_dump"):
+        logger.info("keeping dump files in %s (keep_dump)", dump_dir)
+        return 0
+    path = Path(dump_dir)
+    if not path.is_dir():
+        return 0
+    if start is None or stop is None:
+        logger.warning("no dump window recorded for %s; deleting nothing "
+                       "(the janitor will reclaim it)", path)
+        return 0
+    hits = dump_files_in_window(path, start, stop)
+    if not hits:
+        logger.info("no dump files in %s overlap [%s .. %s]", path, start, stop)
+        return 0
+    if len(hits) > MAX_DELETE:
+        logger.error("dump cleanup in %s selected %d files for [%s .. %s], "
+                     "more than the %d expected; deleting nothing",
+                     path, len(hits), start, stop, MAX_DELETE)
+        return 0
+    n = 0
+    for f in hits:
+        try:
+            f.unlink()
+        except OSError as exc:
+            logger.warning("could not delete %s: %s", f, exc)
+            continue
+        logger.info("deleted dump file %s", f)
+        n += 1
+    return n
 
 
 CAPTION = "replay: injected pulse added to the stream dump"

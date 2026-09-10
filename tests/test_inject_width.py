@@ -884,3 +884,57 @@ def test_gulp_index_is_samp_over_8192():
     """Checked against shot 660: cluster samp 3543044 is stored as gulp 432."""
     assert d.GULP_SAMPS == 8192
     assert 3543044 // d.GULP_SAMPS == 432
+
+
+# --- the per-day display id --------------------------------------------------
+
+def _row(conn, rid, utc, file_id):
+    conn.execute(
+        "INSERT INTO injections (id, inject_utc, stream, beam, dm, amp,"
+        " sigma_ms, file_id, created_utc) VALUES (?,?,0,4,300.0,5.0,5.0,?,?)",
+        (rid, utc, file_id, utc))
+    conn.commit()
+
+
+def test_the_first_shot_of_a_day_is_0001(conn):
+    from datetime import datetime, timezone
+    when = datetime(2026, 9, 10, 2, 30, tzinfo=timezone.utc)
+    assert d.next_file_id(conn, when) == "inj_20260910_0001"
+
+
+def test_the_counter_increments_within_the_day(conn):
+    from datetime import datetime, timezone
+    when = datetime(2026, 9, 10, 2, 30, tzinfo=timezone.utc)
+    _row(conn, 1, "2026-09-10T00:10:00.000+00:00", "inj_20260910_0001")
+    assert d.next_file_id(conn, when) == "inj_20260910_0002"
+    _row(conn, 2, "2026-09-10T01:10:00.000+00:00", "inj_20260910_0002")
+    assert d.next_file_id(conn, when) == "inj_20260910_0003"
+
+
+def test_the_counter_restarts_at_the_utc_day_boundary(conn):
+    from datetime import datetime, timezone
+    for i in range(1, 4):
+        _row(conn, i, f"2026-09-10T0{i}:00:00.000+00:00",
+             f"inj_20260910_000{i}")
+    just_before = datetime(2026, 9, 10, 23, 59, 30, tzinfo=timezone.utc)
+    just_after = datetime(2026, 9, 11, 0, 0, 30, tzinfo=timezone.utc)
+    assert d.next_file_id(conn, just_before) == "inj_20260910_0004"
+    assert d.next_file_id(conn, just_after) == "inj_20260911_0001"
+
+
+def test_the_counter_continues_after_a_restart(conn):
+    """It reads the ledger, so a restart cannot reuse a name."""
+    from datetime import datetime, timezone
+    _row(conn, 7, "2026-09-10T05:00:00.000+00:00", "inj_20260910_0009")
+    when = datetime(2026, 9, 10, 6, 0, tzinfo=timezone.utc)
+    assert d.next_file_id(conn, when) == "inj_20260910_0010"
+
+
+def test_legacy_file_ids_do_not_break_the_counter(conn):
+    """Old rows are `inj_<ts>_b<beam>` and must be ignored, not parsed."""
+    from datetime import datetime, timezone
+    _row(conn, 1, "2026-09-10T02:00:00.000+00:00", "inj_20260910_021424_b150")
+    when = datetime(2026, 9, 10, 3, 0, tzinfo=timezone.utc)
+    got = d.next_file_id(conn, when)
+    assert got.startswith("inj_20260910_")
+    assert len(got) == len("inj_20260910_0001")

@@ -96,7 +96,7 @@ RECOVERED_ROW = {
     "id": 661, "inject_utc": "2026-09-09T22:17:55.642+00:00", "stream": 1,
     "beam": 90, "dm": 300.0, "amp": 8.0, "sigma_ms": 5.0, "est_snr": 19.662,
     "target_snr": 25.0, "inject_snr": 12.0, "sigma_n": 62.39,
-    "nchan_usable": 2600, "file_id": "inj_20260909_221751_b090",
+    "nchan_usable": 2600, "file_id": "inj_20260909_0005",
     "rec_offset_arcsec": 15.0, "rec_name": None,
     "gate_t1": 1, "gate_t2": 1, "gate_trigger": 1, "rec_snr": 35.5246,
     "rec_dm": 299.818, "rec_width": 4, "rec_beam": 90, "rec_samp": 12345,
@@ -117,7 +117,7 @@ NBSP = inject_slack.NBSP
 def test_sent_text_is_the_short_form():
     text = inject_slack.sent_text(RECOVERED_ROW)
     assert text.split("\n")[0] == (
-        f"injection 661 sent: beam 90, DM 300, "
+        f"injection inj_20260909_0005 sent: beam 90, DM 300, "
         f"FWHM 11.8{NBSP}ms, injected S/N 20")
     assert text.endswith("_awaiting recovery..._")
     # sigma, the live std, the stream and the raw counts are all gone
@@ -157,26 +157,11 @@ def test_outcome_text_recovered_is_the_dsa_shape():
     text = inject_slack.outcome_text(RECOVERED_ROW, "http://host:8050")
     # ratio 35.5246/19.662 = 1.81; ibox 4 kernel FWHM 11.5 ms, not 2^4=16.8
     assert text == (
-        "recovered -> <http://host:8050/injections/plot/"
-        "inj_20260909_221751_b090|inj_20260909_221751_b090> | "
-        "SNR 35.5 (ratio 1.81) | DM 299.8 (delta -0.2) | "
+        "recovered -> SNR 35.5 (ratio 1.81) | DM 299.8 (delta -0.2) | "
         f"beam 90 | width 11.5{NBSP}ms (ibox 4)")
+    # the plot is in the card; a link to it would be noise
+    assert "http" not in text
     assert inject_slack.outcome_color(RECOVERED_ROW) == inject_slack.COLOR_RECOVERED
-
-
-def test_outcome_link_prefers_the_event_page_when_the_cluster_triggered():
-    """A cluster with a candname has a dump and a full event page."""
-    row = dict(RECOVERED_ROW, rec_name="260909abcdef")
-    assert inject_slack.outcome_link(row, "http://host:8050") == (
-        "<http://host:8050/event/260909abcdef|260909abcdef>")
-    assert "/event/260909abcdef|" in inject_slack.outcome_text(
-        row, "http://host:8050")
-
-
-def test_outcome_link_defaults_to_the_local_web_base():
-    assert inject_slack.DEFAULT_WEB_BASE == "http://127.0.0.1:8050"
-    assert inject_slack.outcome_link(RECOVERED_ROW).startswith(
-        "<http://127.0.0.1:8050/injections/plot/")
 
 
 def test_same_beam_needs_no_offset():
@@ -510,7 +495,7 @@ def test_sent_then_update_posts_the_sent_line_at_fire_time(tmp_path,
     assert poster.post_sent(RECOVERED_ROW) is not None
     written, = list(tmp_path.glob("*_inject_661_sent.txt"))
     payload = json.loads(written.read_text())
-    assert payload["text"].startswith("injection 661 sent:")
+    assert payload["text"].startswith("injection inj_20260909_0005 sent:")
     assert payload["text"].endswith("_awaiting recovery..._")
     assert "attachments" not in payload      # nothing to colour yet
 
@@ -518,9 +503,9 @@ def test_sent_then_update_posts_the_sent_line_at_fire_time(tmp_path,
 def test_the_caption_is_the_sent_line_then_the_outcome_line():
     text = inject_slack.injection_text(RECOVERED_ROW, "http://host:8050")
     first, second = text.split("\n")
-    assert first == (f"injection 661 sent: beam 90, DM 300, "
+    assert first == (f"injection inj_20260909_0005 sent: beam 90, DM 300, "
                      f"FWHM 11.8{NBSP}ms, injected S/N 20")
-    assert second.startswith("recovered -> <http://host:8050/injections/plot/")
+    assert second.startswith("recovered -> SNR 35.5")
     assert "SNR 35.5 (ratio 1.81)" in second
     # nothing is being awaited by the time this posts
     assert "awaiting recovery" not in text
@@ -667,7 +652,7 @@ def test_single_mode_dry_run_writes_the_payload(tmp_path):
     written, = list(tmp_path.glob("*_inject_661.txt"))
     body = written.read_text()
     payload = json.loads(body.split("\n\n[uploaded")[0])
-    assert payload["text"].startswith("injection 661 sent:")
+    assert payload["text"].startswith("injection inj_20260909_0005 sent:")
     att, = payload["attachments"]
     assert att["color"] == inject_slack.COLOR_RECOVERED
     assert [b["type"] for b in att["blocks"]] == ["section", "image"]

@@ -143,6 +143,11 @@ def dm_bucket(dm: float | None, icfg: dict | None = None):
 # message text
 # ---------------------------------------------------------------------------
 
+def display_id(row) -> str:
+    """The name a person reads for a shot: `file_id`, else the ledger id."""
+    return str(_g(row, "file_id") or _g(row, "id", "?"))
+
+
 def injected_fwhm_ms(row) -> float | None:
     """The injected width as FWHM. The ledger stores the Gaussian sigma."""
     sigma = _f(row, "sigma_ms")
@@ -180,29 +185,11 @@ def sent_text(row, icfg: dict | None = None) -> str:
     # The standing state is subtraction ON, so it adds nothing to the line;
     # only the unusual state is called out.
     suffix = " (IB sub off)" if _g(row, "sub_incoh") == 0 else ""
-    return (f"injection {_g(row, 'id', '?')} sent: " + ", ".join(bits) + suffix
+    return (f"injection {display_id(row)} sent: " + ", ".join(bits) + suffix
             + "\n_awaiting recovery..._")
 
 
 DEFAULT_WEB_BASE = "http://127.0.0.1:8050"
-
-
-def outcome_link(row, web_base: str = DEFAULT_WEB_BASE) -> str:
-    """Slack link to the page that shows this shot.
-
-    A cluster that triggered a dump has an event name and a full event page,
-    which carries the dump, the plot and the trigger audit; prefer it. A
-    shot that did not trigger has only its own truth plot, which the T3 web
-    app serves at /injections/plot/<file_id>.
-    """
-    base = (web_base or DEFAULT_WEB_BASE).rstrip("/")
-    name = _g(row, "rec_name")
-    if name:
-        return f"<{base}/event/{name}|{name}>"
-    file_id = _g(row, "file_id")
-    if file_id:
-        return f"<{base}/injections/plot/{file_id}|{file_id}>"
-    return f"`{_g(row, 'id', '?')}`"
 
 
 def recovered_beam_text(row) -> str:
@@ -257,8 +244,7 @@ def outcome_text(row, web_base: str = DEFAULT_WEB_BASE) -> str:
     if rec_dm is not None:
         delta = f" (delta {rec_dm - dm:+.1f})" if dm is not None else ""
         dm_bit = f"DM {rec_dm:.1f}{delta}"
-    bits = [f"recovered -> {outcome_link(row, web_base)}", snr_bit, dm_bit,
-            recovered_beam_text(row)]
+    bits = [f"recovered -> {snr_bit}", dm_bit, recovered_beam_text(row)]
     if ibox is not None:
         bits.append(f"width {hella_kernel.kernel_fwhm_ms(int(ibox)):.1f}"
                     f"{NBSP}ms (ibox {int(ibox)})")

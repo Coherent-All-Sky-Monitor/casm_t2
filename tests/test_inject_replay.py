@@ -4,6 +4,7 @@ Nothing here requests a dump, runs the replay tool, or touches Slack.
 """
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -138,7 +139,8 @@ def test_expected_event_utc_falls_back_when_nothing_recovered(conn):
 def test_command_for_a_recovered_shot(tmp_path):
     cfg = ir.replay_cfg({"replay": {"events_root": str(tmp_path)}})
     cmd = ir.build_command(667, "/dumps/x", cfg, db_path="/db/t2.sqlite")
-    assert cmd[:3] == ["t3-replay-injection", "--inject-id", "667"]
+    assert cmd[0].endswith("t3-replay-injection")
+    assert cmd[1:3] == ["--inject-id", "667"]
     assert "--dump" in cmd and "/dumps/x" in cmd
     assert str(tmp_path / "inj667" / "inj667.png") in cmd
     assert str(tmp_path / "inj667" / "inj667.json") in cmd
@@ -213,25 +215,128 @@ def test_a_runner_that_raises_is_swallowed(tmp_path, caplog):
 
 # --- cleanup ----------------------------------------------------------------
 
-def test_the_dump_is_deleted_by_default(tmp_path):
-    dump = tmp_path / "dump"
-    dump.mkdir()
-    (dump / "a.dada").write_bytes(b"x" * 10)
-    assert ir.cleanup_dump(dump, ir.replay_cfg({})) is True
-    assert not dump.exists()
+UTC0 = datetime(2026, 9, 10, 2, 30, tzinfo=UTC)
+BPS = 375e6
 
 
-def test_keep_dump_keeps_it(tmp_path):
-    dump = tmp_path / "dump"
-    dump.mkdir()
-    (dump / "a.dada").write_bytes(b"x")
+def _dada(dump_dir, obs="2026-09-10-02:27:18", offset_s=0.0, dur_s=7.0):
+    """A .dada file named the way the dump daemon names them."""
+    offset = int(offset_s * BPS)
+    path = Path(dump_dir) / f"{obs}_{offset:016d}.000000.dada"
+    path.write_bytes(b"x" * int(dur_s * BPS / 1_000_000))   # size/1e6 scaled
+    return path
+
+
+def _dada_real(dump_dir, obs, offset_s, dur_s):
+    """As above but with a truthful size, so the span arithmetic is real."""
+    offset = int(offset_s * BPS)
+    path = Path(dump_dir) / f"{obs}_{offset:016d}.000000.dada"
+    with path.open("wb") as fh:
+        fh.truncate(int(dur_s * BPS))
+    return path
+
+
+def test_only_the_window_files_go_and_the_directory_survives(tmp_path):
+    """The regression that took out stream_0 on 2026-09-10.
+
+    dump_dir is the shared per-stream directory, so cleanup must remove this
+    injection's two files and nothing else - least of all the directory.
+    """
+    obs = "2026-09-10-02:27:18"
+    t_obs = datetime(2026, 9, 10, 2, 27, 18, tzinfo=UTC)
+    start = t_obs + timedelta(seconds=600)
+    stop = start + timedelta(seconds=14)
+    mine_a = _dada_real(tmp_path, obs, 600.0, 7.0)
+    mine_b = _dada_real(tmp_path, obs, 607.0, 7.0)
+    older = _dada_real(tmp_path, obs, 60.0, 7.0)        # someone else's dump
+    later = _dada_real(tmp_path, obs, 1200.0, 7.0)      # and another
+
+    n = ir.cleanup_dump(tmp_path, ir.replay_cfg({}), start, stop)
+    assert n == 2
+    assert not mine_a.exists() and not mine_b.exists()
+    assert older.is_file(), "an unrelated earlier dump was deleted"
+    assert later.is_file(), "an unrelated later dump was deleted"
+    assert tmp_path.is_dir(), "the shared dump directory was removed"
+
+
+def test_the_directory_always_survives_even_with_nothing_to_keep(tmp_path):
+    obs = "2026-09-10-02:27:18"
+    t_obs = datetime(2026, 9, 10, 2, 27, 18, tzinfo=UTC)
+    _dada_real(tmp_path, obs, 600.0, 7.0)
+    ir.cleanup_dump(tmp_path, ir.replay_cfg({}),
+                    t_obs + timedelta(seconds=600),
+                    t_obs + timedelta(seconds=614))
+    assert tmp_path.is_dir()
+    assert list(tmp_path.glob("*.dada")) == []
+
+
+def test_too_many_matches_delete_nothing(tmp_path, caplog):
+    """If the arithmetic is wrong, deleting nothing is the safe answer."""
+    obs = "2026-09-10-02:27:18"
+    t_obs = datetime(2026, 9, 10, 2, 27, 18, tzinfo=UTC)
+    for i in range(6):
+        _dada_real(tmp_path, obs, 600.0 + i * 2.0, 7.0)
+    with caplog.at_level("ERROR"):
+        n = ir.cleanup_dump(tmp_path, ir.replay_cfg({}),
+                            t_obs + timedelta(seconds=600),
+                            t_obs + timedelta(seconds=614))
+    assert n == 0
+    assert len(list(tmp_path.glob("*.dada"))) == 6
+    assert "more than the" in caplog.text
+
+
+def test_no_window_means_no_deletion(tmp_path, caplog):
+    """Without a recorded window there is no way to tell whose files these are."""
+    _dada_real(tmp_path, "2026-09-10-02:27:18", 600.0, 7.0)
+    with caplog.at_level("WARNING"):
+        assert ir.cleanup_dump(tmp_path, ir.replay_cfg({}), None, None) == 0
+    assert len(list(tmp_path.glob("*.dada"))) == 1
+    assert "deleting nothing" in caplog.text
+
+
+def test_keep_dump_keeps_everything(tmp_path):
+    obs = "2026-09-10-02:27:18"
+    t_obs = datetime(2026, 9, 10, 2, 27, 18, tzinfo=UTC)
+    f = _dada_real(tmp_path, obs, 600.0, 7.0)
     cfg = ir.replay_cfg({"replay": {"keep_dump": True}})
-    assert ir.cleanup_dump(dump, cfg) is False
-    assert (dump / "a.dada").is_file()
+    assert ir.cleanup_dump(tmp_path, cfg, t_obs + timedelta(seconds=600),
+                           t_obs + timedelta(seconds=614)) == 0
+    assert f.is_file()
 
 
-def test_cleanup_of_a_missing_dump_is_harmless(tmp_path):
-    assert ir.cleanup_dump(tmp_path / "gone", ir.replay_cfg({})) is False
+def test_cleanup_of_a_missing_directory_is_harmless(tmp_path):
+    assert ir.cleanup_dump(tmp_path / "gone", ir.replay_cfg({}),
+                           UTC0, UTC0 + timedelta(seconds=14)) == 0
+
+
+def test_an_unparseable_name_is_left_alone(tmp_path):
+    odd = tmp_path / "not-a-dump-name.dada"
+    odd.write_bytes(b"x")
+    assert ir.dump_file_span(odd) is None
+    assert ir.cleanup_dump(tmp_path, ir.replay_cfg({}), UTC0,
+                           UTC0 + timedelta(seconds=14)) == 0
+    assert odd.is_file()
+
+
+def test_the_span_arithmetic(tmp_path):
+    f = _dada_real(tmp_path, "2026-09-10-02:27:18", 600.0, 7.0)
+    t0, t1 = ir.dump_file_span(f)
+    assert t0 == datetime(2026, 9, 10, 2, 37, 18, tzinfo=UTC)
+    assert (t1 - t0).total_seconds() == pytest.approx(7.0)
+
+
+def test_the_command_is_found_beside_the_interpreter(monkeypatch):
+    """systemd's PATH lacks the venv, but the tool sits next to python."""
+    import sys
+    monkeypatch.setattr(ir.shutil, "which", lambda name: None)
+    monkeypatch.setattr(ir.Path, "is_file", lambda self: True)
+    got = ir.resolve_command("t3-replay-injection")
+    assert got == [str(Path(sys.executable).parent / "t3-replay-injection")]
+
+
+def test_an_absolute_command_is_left_alone():
+    assert ir.resolve_command("/opt/x/t3-replay-injection --flag") == [
+        "/opt/x/t3-replay-injection", "--flag"]
 
 
 # --- the thread post --------------------------------------------------------
