@@ -248,6 +248,14 @@ class T2Daemon:
         self.veto = set(filt.get("beam_veto", []))
         self.max_nbeam = filt.get("max_nbeam", 32)
         self.dm_floor = filt.get("dm_floor", 20.0)
+        # DM-floor veto (2026-09-09): a bright zero-DM impulse of 10-20 ms
+        # still gives S/N ~20 at the lowest DM trial (the dedispersed smear
+        # over ~190 ms costs only a factor of 3), and hella never searches
+        # below DM_MIN so it cannot see that DM 0 fits better. A cluster
+        # whose dm_lo sits at the floor with a wide boxcar is that leak.
+        dfv = filt.get("dm_floor_veto") or {}
+        self.dm_floor_veto_max_dm_lo = float(dfv.get("max_dm_lo", 0.0))
+        self.dm_floor_veto_min_width = int(dfv.get("min_width", 4))
         # Beam-occupancy veto (iteration-2 closure design): tag any cluster
         # whose surrounding raw candidates span >= min_beams distinct beams
         # within +-window_samp samples. min_beams 0 disables.
@@ -561,6 +569,12 @@ class T2Daemon:
                 return True
         return False
 
+    def _is_dm_floor_leak(self, cl: cluster.Cluster) -> bool:
+        """Wide cluster whose lowest DM sits at hella's first trial."""
+        return (self.dm_floor_veto_max_dm_lo > 0
+                and cl.dm_lo <= self.dm_floor_veto_max_dm_lo
+                and cl.peak.width >= self.dm_floor_veto_min_width)
+
     def _classify(self, cl: cluster.Cluster, event_utc: datetime | None) -> tuple[str, list[str]]:
         tags = []
         if event_utc is not None and self._injection_match(cl, event_utc.timestamp()):
@@ -569,6 +583,8 @@ class T2Daemon:
             tags.append("veto")
         if cl.n_beams > self.max_nbeam:
             tags.append("rfi_wide")
+        if self._is_dm_floor_leak(cl):
+            tags.append("dm_floor")
         if event_utc is not None:
             for src in self.sources:
                 if src.matches(cl, event_utc):
@@ -582,7 +598,7 @@ class T2Daemon:
 
     def _wants_trigger(self, cl: cluster.Cluster, tier: str, tags: list[str]) -> str | None:
         """Why this cluster deserves a dump, or None."""
-        if any(t in ("injection", "veto", "rfi_wide")
+        if any(t in ("injection", "veto", "rfi_wide", "dm_floor")
                or t.startswith("occupancy:") for t in tags):
             return None
         src = next((t[4:] for t in tags if t.startswith("src:")), None)
@@ -612,10 +628,19 @@ class T2Daemon:
         # that have not been inserted yet (every insert happens after the
         # loop), so without this the batch can collide with itself.
         minted: set[str] = set()
+        # DM-floor leak: DBSCAN fragments one zero-DM impulse into several
+        # clusters up the bowtie, and only the lowest fragment touches the
+        # floor. Tag every cluster within the occupancy window of a floor
+        # fragment in this gulp, so the next fragment up does not trigger.
+        floor_samps = [cl.peak.samp for cl in clusters if self._is_dm_floor_leak(cl)]
         for cl in clusters:
             event_utc = (timing.samp_to_utc(cl.peak.samp, utc_start)
                          if utc_start else None)
             tier, tags = self._classify(cl, event_utc)
+            if ("dm_floor" not in tags and floor_samps
+                    and any(abs(cl.peak.samp - s) <= self.occ_window_samp
+                            for s in floor_samps)):
+                tags.append("dm_floor")
             if self.occ_min_beams and footprint is not None:
                 n_occ = occupancy_beams(footprint[0], footprint[1],
                                         cl.peak.samp, self.occ_window_samp)

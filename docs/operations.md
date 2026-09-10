@@ -22,7 +22,16 @@ DB.
 touch:
 
 `tiers` and `filters` (S/N thresholds, `beam_veto`, `max_nbeam`,
-`dm_floor`) shape what counts as an event. `trigger` holds `fast_path`
+`dm_floor`, `dm_floor_veto`) shape what counts as an event. The DM-floor
+veto tags a cluster `dm_floor` when its lowest member DM sits at hella's
+first trial (`max_dm_lo`, 20.6 for DM_MIN 20) with boxcar index at or
+above `min_width`; that is a zero-DM impulse leaking up the bowtie. The
+tag spreads to every cluster in the same gulp within the occupancy window
+of such a cluster, because DBSCAN splits one impulse into fragments and the
+fragment starting at DM 26 would otherwise trigger. Tagged clusters are
+stored and never dumped. `trigger.storm_lockout_s` (300 since 2026-09-09)
+is the quiet time a blind trigger needs after the previous blind-eligible
+event. `trigger` holds `fast_path`
 (strict cluster-first when false), the per-kind budgets, `disk_floor_gb`,
 and the voltage block, which ships `enabled: false`. `known_sources` is
 per-source DM, transit schedule CSV, and `snr_min`. `injections` sets

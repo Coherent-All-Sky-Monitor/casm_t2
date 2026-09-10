@@ -75,6 +75,14 @@ filters:
                         # weights — the first-beam artifact died with it)
   max_nbeam: 32         # wider clusters are tagged rfi_wide, never trigger
   dm_floor: 20.0        # blind (tier) triggers require peak DM >= this
+  # DM-floor veto (2026-09-09, Vishnu): clusters whose lowest member DM sits
+  # at hella's first reported trial (20.5 at DM_MIN 20) with boxcar index
+  # >= min_width are zero-DM impulses leaking up the bowtie; tagged
+  # dm_floor, stored, never trigger. Every storm trigger of 2026-09-09
+  # 23:18-23:45 UTC had dm_lo 20.5 and width 4-5. max_dm_lo: 0 disables.
+  dm_floor_veto:
+    max_dm_lo: 20.6
+    min_width: 4
 
 # Beam-occupancy veto (iteration-2 closure design, casm-wiki hella-sigma.md):
 # a cluster is tagged occupancy:<n> and never triggers when the gulp's RAW
@@ -101,7 +109,9 @@ trigger:
   # storm gets one dump then locks out until it ends — min_spacing_s alone
   # would let a storm take a dump every 60 s for its whole duration.
   # Known-source triggers (B0329) are exempt. 0 disables.
-  storm_lockout_s: 30
+  # 2026-09-09 (Vishnu): 30 -> 300. At 30 s a slow storm with events every
+  # 1-7 min cleared the gate every time (six dumps in 25 min, 23:19-23:45 UTC).
+  storm_lockout_s: 300
   disk_floor_gb: 200    # refuse any dump if target fs has less free
   intensity:
     # No rate gate: every T2-passed candidate is dumped, plotted, and its
