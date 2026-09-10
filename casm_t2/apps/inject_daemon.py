@@ -56,6 +56,9 @@ _SNR_RE = re.compile(r"INJECTED_SNR_ESTIMATE\s+([-+0-9.eE]+)")
 #: against shot 660: cluster samp 3543044 -> gulp 432, as stored).
 GULP_SAMPS = 8192
 
+#: The display-name format, and nothing else: `inj_YYYYMMDD_NNNN`.
+_FILE_ID_RE = re.compile(r"inj_(\d{8})_(\d{4})")
+
 
 def make_injection_files(dm: float, amp: float, sigma_ms: float, local_beam: int,
                          scratch: Path, file_id: str) -> tuple[Path, float | None]:
@@ -318,15 +321,18 @@ def next_file_id(conn, when: datetime | None = None) -> str:
     when = when or datetime.now(timezone.utc)
     day = f"{when:%Y%m%d}"
     prefix = f"inj_{day}_"
-    row = conn.execute(
-        "SELECT max(file_id) FROM injections WHERE file_id LIKE ?",
-        (prefix + "%",)).fetchone()
+    # Strictly this format only. A LIKE prefix also matches the old
+    # `inj_YYYYMMDD_HHMMSS_bNNN` names, and on 2026-09-10 that parsed the
+    # 1754 out of `inj_20260910_175412_b053` and numbered the next shot
+    # `inj_20260910_1755`.
+    rows = conn.execute(
+        "SELECT file_id FROM injections WHERE file_id LIKE ?",
+        (prefix + "%",)).fetchall()
     n = 0
-    if row and row[0]:
-        try:
-            n = int(str(row[0])[len(prefix):][:4])
-        except ValueError:
-            n = 0
+    for (value,) in rows:
+        m = _FILE_ID_RE.fullmatch(str(value or ""))
+        if m and m.group(1) == day:
+            n = max(n, int(m.group(2)))
     return f"{prefix}{n + 1:04d}"
 
 
@@ -639,7 +645,8 @@ def do_replay(conn, cfg: dict, poster, inj_id: int, dump_dir) -> Path | None:
         if dump_dir is not None:
             logger.info("injection %d: replay not due (post=%s, outcome=%s)",
                         inj_id, rcfg.get("post"), outcome)
-            inject_replay.cleanup_dump(dump_dir, rcfg, d_start, d_stop)
+            inject_replay.cleanup_dump(dump_dir, rcfg, d_start, d_stop,
+                                       outcome, (row or {}).get('file_id'))
         if completes:
             # These modes owe the shot a finished card either way: without a
             # plot it is the outcome bar alone, which is the part that
@@ -653,6 +660,23 @@ def do_replay(conn, cfg: dict, poster, inj_id: int, dump_dir) -> Path | None:
                                  (ts, inj_id))
         return None
 
+    if (outcome in inject_outcome.MISSES
+            and rcfg.get("on_miss", "none") == "none"):
+        # A miss gets the red bar and the reason, which is the whole story;
+        # an image of a pulse nobody detected mostly invites squinting at
+        # noise. The raw dump is kept instead (keep_dump_on_miss).
+        logger.info("injection %d missed (%s): no replay rendered "
+                    "(replay.on_miss=none)", inj_id, outcome)
+        if completes:
+            ts = poster.post_injection(row, None)
+            if ts:
+                with conn:
+                    conn.execute("UPDATE injections SET slack_ts=? WHERE id=?",
+                                 (ts, inj_id))
+        inject_replay.cleanup_dump(dump_dir, rcfg, d_start, d_stop, outcome,
+                                   (row or {}).get("file_id"))
+        return None
+
     event_utc = None
     if outcome in inject_outcome.MISSES:
         # Nothing was found, so the tool is told where to put the pulse: the
@@ -662,7 +686,8 @@ def do_replay(conn, cfg: dict, poster, inj_id: int, dump_dir) -> Path | None:
     png = inject_replay.run_replay(inj_id, dump_dir, rcfg,
                                    db_path=cfg.get("db", db.DEFAULT_PATH),
                                    event_utc=event_utc,
-                                   label=(row or {}).get("file_id"))
+                                   label=(row or {}).get("file_id"),
+                                   card_only=outcome in inject_outcome.MISSES)
     posted = False
     if png is not None:
         with conn:
@@ -681,11 +706,13 @@ def do_replay(conn, cfg: dict, poster, inj_id: int, dump_dir) -> Path | None:
             conn.execute("UPDATE injections SET replay_posted=? WHERE id=?",
                          (int(posted), inj_id))
     elif png is not None:
-        posted = bool(poster.post_replay(row, png, inject_replay.CAPTION))
+        posted = bool(poster.post_replay(
+            row, png, inject_slack.display_id(row)))
         with conn:
             conn.execute("UPDATE injections SET replay_posted=? WHERE id=?",
                          (int(posted), inj_id))
-    inject_replay.cleanup_dump(dump_dir, rcfg, d_start, d_stop)
+    inject_replay.cleanup_dump(dump_dir, rcfg, d_start, d_stop, outcome,
+                               (row or {}).get('file_id'))
     return png
 
 

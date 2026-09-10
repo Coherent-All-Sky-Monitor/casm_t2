@@ -354,7 +354,7 @@ def test_replay_posts_as_a_thread_reply(tmp_path, monkeypatch):
     row = {"id": 667, "slack_ts": "1757000000.001"}
     assert poster.post_replay(row, tmp_path / "x.png", ir.CAPTION) is True
     assert calls["thread_ts"] == "1757000000.001"     # a reply, not a new post
-    assert calls["comment"] == "replay: injected pulse added to the stream dump"
+    assert calls["comment"] == ir.CAPTION
     assert calls["title"] == "inj667 replay"
 
 
@@ -377,3 +377,75 @@ def test_dry_run_writes_the_thread_message(tmp_path):
     body = written[0].read_text()
     assert "thread_ts=123.4" in body
     assert ir.CAPTION in body
+
+
+# --- a shot the search missed ------------------------------------------------
+
+def test_on_miss_defaults_to_rendering_nothing():
+    cfg = ir.replay_cfg({})
+    assert cfg["on_miss"] == "none"
+    assert cfg["keep_dump_on_miss"] is True
+
+
+def test_an_unknown_on_miss_falls_back_to_none(caplog):
+    with caplog.at_level("WARNING"):
+        cfg = ir.replay_cfg({"replay": {"on_miss": "maybe"}})
+    assert cfg["on_miss"] == "none"
+    assert "none|expected" in caplog.text
+
+
+@pytest.mark.parametrize("outcome,keep", [
+    (oc.MISSED_T1, True),
+    (oc.MISSED_T2, True),
+    (oc.RECOVERED, False),
+    (oc.FIRE_FAILED, False),
+])
+def test_keep_for_miss(outcome, keep):
+    assert ir.keep_for_miss(ir.replay_cfg({}), outcome) is keep
+
+
+def test_a_missed_shot_keeps_its_dump_and_logs_the_paths(tmp_path, caplog):
+    obs = "2026-09-10-02:27:18"
+    t_obs = datetime(2026, 9, 10, 2, 27, 18, tzinfo=UTC)
+    mine = _dada_real(tmp_path, obs, 600.0, 7.0)
+    with caplog.at_level("INFO"):
+        n = ir.cleanup_dump(tmp_path, ir.replay_cfg({}),
+                            t_obs + timedelta(seconds=600),
+                            t_obs + timedelta(seconds=614),
+                            outcome=oc.MISSED_T1, inj_label="inj_20260910_0007")
+    assert n == 0
+    assert mine.is_file(), "the raw stream of a miss was deleted"
+    assert "inj_20260910_0007" in caplog.text
+    assert str(mine) in caplog.text
+
+
+def test_a_recovered_shot_still_has_its_dump_cleaned(tmp_path):
+    obs = "2026-09-10-02:27:18"
+    t_obs = datetime(2026, 9, 10, 2, 27, 18, tzinfo=UTC)
+    mine = _dada_real(tmp_path, obs, 600.0, 7.0)
+    n = ir.cleanup_dump(tmp_path, ir.replay_cfg({}),
+                        t_obs + timedelta(seconds=600),
+                        t_obs + timedelta(seconds=614),
+                        outcome=oc.RECOVERED)
+    assert n == 1 and not mine.exists()
+
+
+def test_keep_dump_on_miss_can_be_turned_off(tmp_path):
+    obs = "2026-09-10-02:27:18"
+    t_obs = datetime(2026, 9, 10, 2, 27, 18, tzinfo=UTC)
+    mine = _dada_real(tmp_path, obs, 600.0, 7.0)
+    cfg = ir.replay_cfg({"replay": {"keep_dump_on_miss": False}})
+    n = ir.cleanup_dump(tmp_path, cfg, t_obs + timedelta(seconds=600),
+                        t_obs + timedelta(seconds=614), outcome=oc.MISSED_T1)
+    assert n == 1 and not mine.exists()
+
+
+def test_a_rendered_miss_archives_only_the_card(tmp_path):
+    """card_only: the numbers, not the pictures."""
+    cfg = ir.replay_cfg({"replay": {"events_root": str(tmp_path)}})
+    cmd = ir.build_command(670, "/d", cfg, label="inj_20260910_0007",
+                           card_only=True)
+    paths = ir.replay_paths(670, cfg, "inj_20260910_0007")
+    assert "--card-json" in cmd and str(paths["json"]) in cmd
+    assert "--fil" not in cmd
+    assert str(paths["png"]) not in cmd        # no PNG kept beside the card

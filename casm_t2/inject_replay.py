@@ -55,6 +55,19 @@ def replay_cfg(icfg: dict | None) -> dict:
     cfg.setdefault("keep_dump", False)
     cfg.setdefault("events_root", "/mnt/nvme3/T3/EVENTS")
     cfg.setdefault("command", "t3-replay-injection")
+    # What to do about a shot the search did not find. `none` renders
+    # nothing: the card carries the red bar and the reason, which is the
+    # whole story, and an image of a pulse nobody detected mostly invites
+    # squinting at noise. `expected` renders it anyway, with the pulse where
+    # it should have been, for when a miss is worth staring at.
+    cfg.setdefault("on_miss", "none")
+    # A miss is the case where the raw stream is worth keeping: the dump is
+    # the only copy of what hella actually saw.
+    cfg.setdefault("keep_dump_on_miss", True)
+    if cfg["on_miss"] not in ("none", "expected"):
+        logger.warning("injection.replay.on_miss %r is not none|expected; "
+                       "using none", cfg["on_miss"])
+        cfg["on_miss"] = "none"
     if cfg["post"] not in POST_MODES:
         logger.warning("injection.replay.post %r is not one of %s; "
                        "treating it as 'never'", cfg["post"], POST_MODES)
@@ -171,7 +184,8 @@ def resolve_command(command: str) -> list[str]:
 
 def build_command(inj_id: int, dump_dir, rcfg: dict, db_path: str | None = None,
                   event_utc: datetime | None = None,
-                  label: str | None = None) -> list[str]:
+                  label: str | None = None,
+                  card_only: bool = False) -> list[str]:
     """The replay tool's argv.
 
     `event_utc` is passed only for a shot with no recovered cluster: the tool
@@ -182,9 +196,14 @@ def build_command(inj_id: int, dump_dir, rcfg: dict, db_path: str | None = None,
     cmd = [*resolve_command(rcfg.get("command", "t3-replay-injection")),
            "--inject-id", str(inj_id),
            "--dump", str(dump_dir),
-           "--out", str(paths["png"]),
-           "--card-json", str(paths["json"]),
-           "--fil", str(paths["fil"])]
+           "--card-json", str(paths["json"])]
+    if card_only:
+        # A rendered miss archives the numbers, not the pictures: --out is
+        # required by the tool, so its PNG goes to a scratch path that is not
+        # kept alongside the card.
+        cmd += ["--out", str(paths["dir"] / f"_scratch_{paths['png'].name}")]
+    else:
+        cmd += ["--out", str(paths["png"]), "--fil", str(paths["fil"])]
     if db_path:
         cmd += ["--db", str(db_path)]
     if event_utc is not None:
@@ -196,10 +215,11 @@ def build_command(inj_id: int, dump_dir, rcfg: dict, db_path: str | None = None,
 
 def run_replay(inj_id: int, dump_dir, rcfg: dict, db_path: str | None = None,
                event_utc: datetime | None = None, runner=None,
-               label: str | None = None) -> Path | None:
+               label: str | None = None, card_only: bool = False) -> Path | None:
     """Render the replay; returns the PNG path, or None on any failure."""
     paths = replay_paths(inj_id, rcfg, label)
-    cmd = build_command(inj_id, dump_dir, rcfg, db_path, event_utc, label)
+    cmd = build_command(inj_id, dump_dir, rcfg, db_path, event_utc, label,
+                        card_only)
     runner = runner or subprocess.run
     try:
         paths["dir"].mkdir(parents=True, exist_ok=True)
@@ -275,7 +295,13 @@ def dump_files_in_window(dump_dir, start: datetime, stop: datetime,
     return hits
 
 
-def cleanup_dump(dump_dir, rcfg: dict, start=None, stop=None) -> int:
+def keep_for_miss(rcfg: dict, outcome: str | None) -> bool:
+    """Should this shot's dump be kept because the search missed it?"""
+    return bool(rcfg.get("keep_dump_on_miss", True)) and outcome in oc.MISSES
+
+
+def cleanup_dump(dump_dir, rcfg: dict, start=None, stop=None,
+                 outcome: str | None = None, inj_label=None) -> int:
     """Delete this injection's dump FILES. Returns how many went.
 
     Never removes the directory. `dump_dir` is
@@ -294,6 +320,16 @@ def cleanup_dump(dump_dir, rcfg: dict, start=None, stop=None) -> int:
         return 0
     path = Path(dump_dir)
     if not path.is_dir():
+        return 0
+    if keep_for_miss(rcfg, outcome):
+        kept = (dump_files_in_window(path, start, stop)
+                if start and stop else [])
+        for f in kept:
+            logger.info("injection %s missed (%s): keeping raw dump %s",
+                        inj_label or "?", outcome, f)
+        if not kept:
+            logger.info("injection %s missed (%s): no dump files matched the "
+                        "window in %s", inj_label or "?", outcome, path)
         return 0
     if start is None or stop is None:
         logger.warning("no dump window recorded for %s; deleting nothing "
@@ -320,4 +356,6 @@ def cleanup_dump(dump_dir, rcfg: dict, start=None, stop=None) -> int:
     return n
 
 
-CAPTION = "replay: injected pulse added to the stream dump"
+#: Comment on a separately posted plot: just the shot id, since the
+#: message it accompanies already says what it is.
+CAPTION = ""

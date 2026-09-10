@@ -220,7 +220,7 @@ injection:
   sample:
     dm:         {dist: uniform,    lo: 100.0, hi: 900.0}
     fwhm_ms:    {dist: loguniform, lo: 2.5,   hi: 30.0}
-    inject_snr: {dist: loguniform, lo: 12.0,  hi: 18.0}
+    inject_snr: {dist: loguniform, lo: 15.0,  hi: 18.0}
   # DM bins for the daily summary's per-DM tally.
   summary_dm_bins: [100.0, 300.0, 500.0, 700.0, 900.0]
   # Ceiling on the PREDICTED reported S/N (injected * rec_per_true). Over it,
@@ -296,6 +296,13 @@ injection:
     dump_post_s: 10
     dump_timeout_s: 60
     keep_dump: false
+    # A shot the search missed: `none` renders nothing (the card carries the
+    # red bar and the reason, which is the whole story), `expected` renders it
+    # anyway with the pulse where it should have been, archiving only the card
+    # JSON. Either way the raw dump is KEPT when the shot was missed - it is
+    # the only copy of what hella actually saw.
+    on_miss: none
+    keep_dump_on_miss: true
     events_root: /mnt/nvme3/T3/EVENTS
     command: /home/casm/software/dev/casm_venvs/casm_offline_env/bin/t3-replay-injection
   scratch_dir: /mnt/nvme5/casm_pipeline/injections

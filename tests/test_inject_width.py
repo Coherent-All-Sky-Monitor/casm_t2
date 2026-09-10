@@ -938,3 +938,20 @@ def test_legacy_file_ids_do_not_break_the_counter(conn):
     got = d.next_file_id(conn, when)
     assert got.startswith("inj_20260910_")
     assert len(got) == len("inj_20260910_0001")
+
+
+def test_the_old_format_row_does_not_feed_the_counter(conn):
+    """`inj_20260910_175412_b053` once parsed as 1754 and gave shot 669
+    the name `inj_20260910_1755`."""
+    from datetime import datetime, timezone
+    _row(conn, 1, "2026-09-10T17:54:12.000+00:00", "inj_20260910_175412_b053")
+    when = datetime(2026, 9, 10, 18, 0, tzinfo=timezone.utc)
+    assert d.next_file_id(conn, when) == "inj_20260910_0001"
+
+
+def test_a_mix_of_old_and_new_counts_only_the_new(conn):
+    from datetime import datetime, timezone
+    _row(conn, 1, "2026-09-10T17:54:12.000+00:00", "inj_20260910_175412_b053")
+    _row(conn, 2, "2026-09-10T18:00:00.000+00:00", "inj_20260910_0003")
+    when = datetime(2026, 9, 10, 19, 0, tzinfo=timezone.utc)
+    assert d.next_file_id(conn, when) == "inj_20260910_0004"

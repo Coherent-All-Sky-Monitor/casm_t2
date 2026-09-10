@@ -50,7 +50,6 @@ COLOR_MISSED = "#C62828"
 COLOR_NEUTRAL = "#9E9E9E"
 
 #: Caption when the plot has to hang under the card instead of inside it.
-CAPTION_REPLY = "replay: injected pulse added to the stream dump"
 _INK = "#262626"
 
 #: Marker identity per DM bin, in bin order. Identity rides on colour AND
@@ -263,23 +262,27 @@ def injection_text(row, web_base: str = DEFAULT_WEB_BASE,
     return sent + "\n" + outcome_text(row, web_base)
 
 
-def injection_attachments(row, file_id: str | None = None,
-                          web_base: str = DEFAULT_WEB_BASE) -> list[dict]:
-    """The coloured attachment of a shot's single message, DSA style.
+def injection_blocks(row, file_id=None, icfg=None) -> list[dict]:
+    """Top-level blocks: the sent line, then the plot if there is one.
 
-    One bar, coloured by outcome, holding the result line and - when the
-    replay plot was uploaded - the plot itself inline. `file_id` is a file
-    the bot owns and has NOT shared to a channel; referencing it from a
-    block is what puts the image inside the bar rather than beside it.
+    The image is a block on the MESSAGE, not nested in the attachment: Slack
+    refused blocks inside a coloured attachment on chat.update
+    (invalid_attachments, shot 669). `file_id` is a file the bot owns and has
+    not shared to any channel, referenced by id.
     """
-    line = outcome_text(row, web_base)
-    blocks = [{"type": "section",
-               "text": {"type": "mrkdwn", "text": line}}]
+    sent = sent_text(row, icfg).split("\n")[0]
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": sent}}]
     if file_id:
         blocks.append({"type": "image",
                        "slack_file": {"id": file_id},
-                       "alt_text": "injection replay"})
-    return [{"color": outcome_color(row), "blocks": blocks, "fallback": line}]
+                       "alt_text": f"injection {display_id(row)}"})
+    return blocks
+
+
+def injection_attachments(row, web_base: str = DEFAULT_WEB_BASE) -> list[dict]:
+    """The coloured bar: the outcome line, and nothing nested inside it."""
+    line = outcome_text(row, web_base)
+    return [{"color": outcome_color(row), "text": line, "fallback": line}]
 
 
 def outcome_color(row) -> str:
@@ -634,7 +637,7 @@ class SlackPoster:
             return None, None
         return token, channel
 
-    def _post(self, text: str, attachments=None, thread_ts=None,
+    def _post(self, text: str, attachments=None, thread_ts=None, blocks=None,
               want_error: bool = False):
         """chat.postMessage; returns the message ts, or None on any failure.
 
@@ -649,6 +652,8 @@ class SlackPoster:
         if token is None:
             return out(None, "unconfigured")
         payload = {"channel": channel, "text": text}
+        if blocks:
+            payload["blocks"] = blocks
         if attachments:
             payload["attachments"] = attachments
         if thread_ts:
@@ -669,7 +674,7 @@ class SlackPoster:
             logger.warning("slack post failed: %s", exc)
             return out(None, str(exc))
 
-    def _update(self, ts: str, text: str, attachments=None,
+    def _update(self, ts: str, text: str, attachments=None, blocks=None,
                 want_error: bool = False):
         """chat.update; returns the ts, or (ts, error) with `want_error`."""
         def out(got, err):
@@ -679,6 +684,8 @@ class SlackPoster:
         if token is None:
             return out(None, "unconfigured")
         payload = {"channel": channel, "ts": ts, "text": text}
+        if blocks:
+            payload["blocks"] = blocks
         if attachments:
             payload["attachments"] = attachments
         try:
@@ -844,7 +851,7 @@ class SlackPoster:
         if self.dry_run:
             import json
             body = json.dumps({"text": text}, indent=2)
-            return self._dry_write(f"inject_{_g(row, 'id', 'x')}_sent", body)
+            return self._dry_write(f"inject_{display_id(row)}_sent", body)
         return self._post(text)
 
     def post_outcome(self, row) -> str | None:
@@ -857,7 +864,7 @@ class SlackPoster:
         line = outcome_text(row, self.web_base)
         color = outcome_color(row)
         if self.dry_run:
-            return self._dry_write(f"outcome_{_g(row, 'id', 'x')}",
+            return self._dry_write(f"outcome_{display_id(row)}",
                                    f"[{color}] {line}")
         attachment = {"color": color, "text": line, "fallback": line}
         ts = _g(row, "slack_ts")
@@ -873,26 +880,24 @@ class SlackPoster:
     def post_injection(self, row, png=None) -> str | None:
         """Complete (or post) the shot's message; returns its ts.
 
-        In `sent_then_update` the fire-time message is UPDATED in place: the
-        sent line loses its "awaiting recovery" tail and gains a bar coloured
-        by outcome, carrying the result line and the replay plot inline. In
-        `single` the same card is posted fresh, because nothing went up
-        earlier.
+        The sent line is the message text and its first block; the plot, if
+        there is one, is a top-level image block beside it; one coloured
+        attachment carries the outcome. The image never goes in a thread and
+        never carries a caption - the card already says what it is.
 
-        Both share the plot trick: upload the file WITHOUT a channel, so the
-        bot owns something that appears nowhere, then reference it from an
-        image block by id. Sharing it to the channel instead would give the
-        picture its own message.
+        Forms, in descending order of how much lands in one message; the one
+        used is logged, so a channel that has quietly degraded says so:
 
-        Every step down the fallback chain is logged with the form used, so
-        a channel that has quietly degraded says so in the journal rather
-        than just looking dull.
+          inline     one message: sent line, plot, coloured bar
+          bar+image  the bar on the sent message, the plot as its own
+                     top-level message (the workspace refused the blocks)
+          bar        the bar alone, no plot to show
+          text       both lines as text, nothing else worked
         """
         if not self.enabled:
             return None
         sent = sent_text(row, self.icfg).split("\n")[0]
-        caption = injection_text(row, self.web_base, self.icfg)
-        inj_id = _g(row, "id", "x")
+        inj_id = display_id(row)
         ts = _g(row, "slack_ts")
         updating = self.mode == MODE_SENT_THEN_UPDATE and bool(ts)
 
@@ -900,8 +905,8 @@ class SlackPoster:
             import json
             file_id = f"F_DRYRUN_{inj_id}" if png is not None else None
             payload = {"text": sent,
-                       "attachments": injection_attachments(
-                           row, file_id, self.web_base)}
+                       "blocks": injection_blocks(row, file_id, self.icfg),
+                       "attachments": injection_attachments(row, self.web_base)}
             if updating:
                 payload = {"ts": ts, **payload}
             body = json.dumps(payload, indent=2)
@@ -910,55 +915,55 @@ class SlackPoster:
             name = f"inject_{inj_id}_update" if updating else f"inject_{inj_id}"
             return self._dry_write(name, body)
 
-        file_id = self._upload_unshared(png, f"inj{inj_id}") if png else None
-        attachments = injection_attachments(row, file_id, self.web_base)
+        file_id = self._upload_unshared(png, inj_id) if png else None
+        blocks = injection_blocks(row, file_id, self.icfg)
+        attachments = injection_attachments(row, self.web_base)
 
         if updating:
             got, err = self._update(ts, sent, attachments=attachments,
-                                    want_error=True)
+                                    blocks=blocks, want_error=True)
             if got:
                 logger.info("injection %s completed in place (form=%s)",
                             inj_id, "inline" if file_id else "bar")
                 return got
             if file_id is not None:
-                # Most likely the app may not reference slack_file images.
-                # Complete the card without the picture, then hang the plot
-                # under it so it is still one thread, one shot.
+                # The workspace will not take a slack_file image block. Put
+                # the outcome on the card anyway and give the plot its own
+                # TOP-LEVEL message; never a thread reply.
                 logger.warning("injection %s: update with blocks refused (%s);"
-                               " completing without the image", inj_id, err)
-                plain = injection_attachments(row, None, self.web_base)
-                got, err2 = self._update(ts, sent, attachments=plain,
-                                         want_error=True)
+                               " posting the plot separately", inj_id, err)
+                plain = injection_blocks(row, None, self.icfg)
+                got, err2 = self._update(ts, sent, attachments=attachments,
+                                         blocks=plain, want_error=True)
                 if got:
-                    self._post_file(Path(png), f"inj{inj_id}", thread_ts=ts,
-                                    comment=CAPTION_REPLY)
-                    logger.info("injection %s completed (form=bar+thread)",
+                    self._post_file(Path(png), inj_id, comment=inj_id)
+                    logger.info("injection %s completed (form=bar+image)",
                                 inj_id)
                     return got
                 err = err2
             logger.warning("injection %s: update failed (%s); posting a new "
                            "message instead", inj_id, err)
 
-        # `single` mode, or an update that could not be made at all.
-        got, err = self._post(sent, attachments=attachments, want_error=True)
+        got, err = self._post(sent, attachments=attachments, blocks=blocks,
+                              want_error=True)
         if got:
             logger.info("injection %s posted (form=%s)", inj_id,
                         "inline" if file_id else "bar")
             return got
         if file_id is not None:
-            logger.warning("injection %s: block post refused (%s); falling "
-                           "back to the shared-upload caption form",
-                           inj_id, err)
-            shared = self._post_file(Path(png), f"inj{inj_id}",
-                                     comment=caption, want_ts=True)
-            if shared:
-                logger.info("injection %s posted (form=caption)", inj_id)
-                return shared
+            logger.warning("injection %s: block post refused (%s); posting "
+                           "the bar and the plot separately", inj_id, err)
+            got, _ = self._post(sent, attachments=attachments, want_error=True)
+            if got:
+                self._post_file(Path(png), inj_id, comment=inj_id)
+                logger.info("injection %s posted (form=bar+image)", inj_id)
+                return got
         logger.warning("injection %s: falling back to plain text", inj_id)
-        got = self._post(caption)
+        got = self._post(f"{sent}\n{outcome_text(row, self.web_base)}")
         if got:
             logger.info("injection %s posted (form=text)", inj_id)
         return got
+
 
     def post_replay(self, row, png, caption: str) -> bool:
         """Thread the replay plot under this shot's own message.
