@@ -274,6 +274,30 @@ injection:
   std_poll_s: 5.0
   nchan_usable: 2600            # 3072 minus the 472-channel 470-484 MHz mask
   amp_range: [25.0, 45.0]
+  # How long to wait after the FIFO write before reconciling. T1 reports
+  # 20-30 s late and the sidecar joins a gulp already seconds old, so 90 s is
+  # comfortably past both; it was 180 s.
+  reconcile_wait_s: 90
+  # Automated replay: dump the injected stream around each shot, render the
+  # dump with the injected pulse added, and thread the PNG under the shot's
+  # Slack message. `post` says when to post it:
+  #   daily    once per UTC day, plus every miss   (default)
+  #   on_miss  only when the shot was not recovered
+  #   always   every shot
+  #   never    no dump requested at all
+  # The dump window is [inject_utc - dump_pre_s, inject_utc - dump_post_s]:
+  # the pulse lands BEFORE inject_utc (the sidecar joins a gulp already
+  # seconds old), so both offsets are negative-going. The daemon replies only
+  # after writing, and a 14 s window took ~20 s on 2026-09-09, hence the
+  # timeout. Dumps are deleted after the plot unless keep_dump.
+  replay:
+    post: daily
+    dump_pre_s: 24
+    dump_post_s: 10
+    dump_timeout_s: 60
+    keep_dump: false
+    events_root: /mnt/nvme3/T3/EVENTS
+    command: t3-replay-injection
   scratch_dir: /mnt/nvme5/casm_pipeline/injections
   # Slack posting for injections. SHIPS DISABLED: with enabled false the
   # daemon posts nothing and behaves exactly as it did before. Set

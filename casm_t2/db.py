@@ -99,6 +99,8 @@ CREATE TABLE IF NOT EXISTS triggers (
     detail        TEXT NOT NULL,     -- daemon reply or refusal reason
     dump_utc_start TEXT,
     dump_utc_stop  TEXT,
+    replay_png    TEXT,              -- rendered replay plot
+    replay_posted INTEGER            -- 1 once threaded under the Slack message,
     bytes_written INTEGER,           -- filled by janitor/plotter when known
     cleaned_utc   TEXT,              -- set when the janitor deletes the dump
     created_utc   TEXT NOT NULL
@@ -137,6 +139,11 @@ CREATE TABLE IF NOT EXISTS injections (
     rec_offset_arcsec REAL,          -- injected vs recovered beam pointing, arcsec
     n_t1_trials   INTEGER,           -- raw T1 trials matching the shot when no cluster did
     sub_incoh     INTEGER,           -- IB subtraction on (1) / off (0) at fire time; NULL unknown
+    dump_dir      TEXT,              -- intensity dump requested for the replay
+    dump_utc_start TEXT,
+    dump_utc_stop  TEXT,
+    replay_png    TEXT,              -- rendered replay plot
+    replay_posted INTEGER            -- 1 once threaded under the Slack message
     slack_ts      TEXT,              -- ts of the Slack "sent" message, if posted
     outcome       TEXT               -- casm_t2.inject_outcome enum
 );
@@ -181,6 +188,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     tcols = {r[1] for r in conn.execute("PRAGMA table_info(triggers)")}
     for col, decl in [("kind", "TEXT NOT NULL DEFAULT 'intensity'"),
                       ("dump_utc_start", "TEXT"), ("dump_utc_stop", "TEXT"),
+                      ("replay_png", "TEXT"), ("replay_posted", "INTEGER"),
                       ("bytes_written", "INTEGER"), ("cleaned_utc", "TEXT")]:
         if tcols and col not in tcols:
             conn.execute(f"ALTER TABLE triggers ADD COLUMN {col} {decl}")
@@ -191,7 +199,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
                       ("rec_beam", "INTEGER"), ("rec_samp", "INTEGER"),
                       ("rec_lead_s", "REAL"),
                       ("rec_offset_arcsec", "REAL"), ("n_t1_trials", "INTEGER"),
-                      ("sub_incoh", "INTEGER"),
+                      ("sub_incoh", "INTEGER"), ("dump_dir", "TEXT"),
+                      ("dump_utc_start", "TEXT"), ("dump_utc_stop", "TEXT"),
+                      ("replay_png", "TEXT"), ("replay_posted", "INTEGER"),
                       ("slack_ts", "TEXT"),
                       ("outcome", "TEXT")]:
         if icols and col not in icols:

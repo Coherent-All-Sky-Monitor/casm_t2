@@ -35,11 +35,13 @@ import re
 import subprocess
 import time
 from datetime import datetime, timedelta, timezone
+from typing import NamedTuple
 from pathlib import Path
 
 import yaml
 
-from casm_t2 import (cluster, db, inject_calib, inject_outcome, inject_plot,
+from casm_t2 import (beams, cluster, db, dump_client, inject_calib,
+                     inject_outcome, inject_plot, inject_replay,
                      inject_slack, logsetup, timing, weights_registry)
 
 logger = logging.getLogger("t2.inject")
@@ -49,6 +51,10 @@ CONVERT_DIR = "/home/casm/software/meilin/code/casm-hella/scripts"
 PYTHON = "/home/casm/software/dev/casm_venvs/casm_offline_env/bin/python"
 
 _SNR_RE = re.compile(r"INJECTED_SNR_ESTIMATE\s+([-+0-9.eE]+)")
+
+#: samples per gulp; gulp index is exactly samp // GULP_SAMPS (checked
+#: against shot 660: cluster samp 3543044 -> gulp 432, as stored).
+GULP_SAMPS = 8192
 
 
 def make_injection_files(dm: float, amp: float, sigma_ms: float, local_beam: int,
@@ -325,8 +331,17 @@ def cands_path(obs_utc_start: str, stream: int, cands_dir: str | Path = HELLA_CA
     return Path(cands_dir) / f"cands_{obs_utc_start}.dat.{stream}"
 
 
-def count_t1_trials(path, beams, dm: float, samp_lo: float, samp_hi: float
-                    ) -> tuple[int, float | None] | None:
+class T1Match(NamedTuple):
+    """What hella's raw candidate file holds for one injection."""
+
+    n: int
+    best_snr: float | None
+    gulp: int | None            # samp // GULP_SAMPS of the best trial
+    all_veto_width: bool        # every match was a width t2d drops at parse
+
+
+def count_t1_trials(path, beams, dm: float, samp_lo: float, samp_hi: float,
+                    veto_widths=(6,)) -> T1Match | None:
     """Raw T1 trials matching an injection: (count, best S/N).
 
     Returns None when the file does not exist - that is "we cannot tell",
@@ -346,7 +361,9 @@ def count_t1_trials(path, beams, dm: float, samp_lo: float, samp_hi: float
     tol = dm_tolerance(dm)
     dm_lo, dm_hi = dm - tol, dm + tol
     beams = {int(b) for b in beams}
-    n, best = 0, None
+    veto = {int(w) for w in (veto_widths or ())}
+    n, best, best_samp = 0, None, None
+    widths: set[int] = set()
     with path.open() as fh:
         for line in fh:
             fields = line.split()
@@ -355,6 +372,7 @@ def count_t1_trials(path, beams, dm: float, samp_lo: float, samp_hi: float
             try:
                 snr = float(fields[0])
                 samp = float(fields[1])
+                width = int(fields[3])
                 cdm = float(fields[5])
                 cbeam = int(fields[6])
             except ValueError:
@@ -366,36 +384,84 @@ def count_t1_trials(path, beams, dm: float, samp_lo: float, samp_hi: float
             if not (dm_lo <= cdm <= dm_hi):
                 continue
             n += 1
+            widths.add(width)
             if best is None or snr > best:
-                best = snr
-    return n, best
+                best, best_samp = snr, samp
+    gulp = int(best_samp // GULP_SAMPS) if best_samp is not None else None
+    return T1Match(n, best, gulp, bool(widths) and widths <= veto)
 
 
 def scan_t1_trials(conn, cfg: dict, t0: datetime, stream: int, beams,
-                   dm: float) -> tuple[int | None, float | None, str | None]:
+                   dm: float):
     """Look for raw T1 trials behind a shot that produced no cluster.
 
-    Returns (n_trials, best_snr, note). `n_trials` is None when the question
-    could not be asked - no observation known, or the file is not there - and
-    `note` says which, for the ledger.
+    Returns (n_trials, best_snr, note, match). `n_trials` is None when the
+    question could not be asked - no observation known, or the file is not
+    there - and `note` says which, for the ledger. `match` is the full
+    T1Match when there was a file to read.
     """
     obs = obs_utc_start_at(conn, t0)
     if obs is None:
-        return None, None, "T1 file unavailable (no observation known at that time)"
+        return (None, None,
+                "T1 file unavailable (no observation known at that time)", None)
     try:
         utc_start = timing.parse_dada_utc(obs)
     except ValueError:
-        return None, None, f"T1 file unavailable (unparseable obs_utc_start {obs!r})"
+        return (None, None,
+                f"T1 file unavailable (unparseable obs_utc_start {obs!r})", None)
     path = cands_path(obs, stream, cfg.get("injection", {}).get(
         "hella_cands_dir", HELLA_CANDS_DIR))
     samp_lo = (t0 - utc_start).total_seconds() + WINDOW_LO_S
     samp_hi = (t0 - utc_start).total_seconds() + WINDOW_HI_S
     got = count_t1_trials(path, beams, dm,
-                          samp_lo / timing.TSAMP_S, samp_hi / timing.TSAMP_S)
+                          samp_lo / timing.TSAMP_S, samp_hi / timing.TSAMP_S,
+                          veto_widths=cfg.get("veto_widths", [6]))
     if got is None:
-        return None, None, f"T1 file unavailable ({path.name} not found)"
-    n, best = got
-    return n, best, None
+        return None, None, f"T1 file unavailable ({path.name} not found)", None
+    return got.n, got.best_snr, None, got
+
+
+
+def t2_miss_reason(conn, obs_utc_start: str | None, gulp: int | None,
+                   match=None, log=logger) -> str:
+    """Why a gulp with matching T1 trials produced no cluster.
+
+    T2 clusters every surviving trial - DBSCAN noise points become singleton
+    clusters (`cluster.cluster_candidates`) - and stores everything at
+    S/N >= 12. So "trials arrived but nothing clustered" cannot happen to an
+    intact gulp: something dropped the gulp or the trials before clustering.
+    `gulp_stats` records exactly which, one row per coalesced gulp.
+
+    The last branch is the interesting one: if it ever fires, an assumption
+    above is wrong and the log says so.
+    """
+    where = f"gulp {gulp}" if gulp is not None else "the gulp"
+    if obs_utc_start is None or gulp is None:
+        log.warning("t2 miss with no gulp to look up (obs=%r gulp=%r)",
+                    obs_utc_start, gulp)
+        return f"lost at T2: {where} could not be identified"
+    row = conn.execute(
+        "SELECT n_jobs, n_cands, n_clusters, n_stored, n_vetoed, n_shed, skipped"
+        " FROM gulp_stats WHERE obs_utc_start = ? AND gulp = ?",
+        (obs_utc_start, gulp)).fetchone()
+    if row is None:
+        log.warning("t2 miss: no gulp_stats row for %s gulp %s - t2d never "
+                    "processed that gulp", obs_utc_start, gulp)
+        return (f"lost at T2: {where} never reached t2d (no gulp_stats row)")
+    n_jobs, n_cands, n_clusters, n_stored, n_vetoed, n_shed, skipped = row
+    if skipped:
+        return f"lost at T2: {where} skipped incomplete ({n_jobs}/8 jobs)"
+    if n_shed and n_cands and n_shed >= n_cands:
+        return (f"lost at T2: {where} dropped by the storm cap "
+                f"({n_cands} trials > max)")
+    if n_shed:
+        return f"lost at T2: {where} shed {n_shed} of {n_cands} trials"
+    if match is not None and getattr(match, "all_veto_width", False):
+        return f"lost at T2: {where} width-vetoed"
+    log.warning("t2 miss on an intact gulp: %s gulp %s had %d cands, "
+                "%d clusters, %d stored, %d vetoed - investigate",
+                obs_utc_start, gulp, n_cands, n_clusters, n_stored, n_vetoed)
+    return f"lost at T2: {where} intact but no cluster (unexpected, investigate)"
 
 
 def beam_offset_arcsec(cfg: dict, utc, inj_beam: int, rec_beam: int):
@@ -464,18 +530,17 @@ def reconcile(conn, inj_id: int, cfg: dict) -> None:
         # No cluster. Ask hella's own candidate file whether the trials were
         # there, which is the only way to tell a clustering loss from a
         # detection loss - T2 stores clusters, never raw trials.
-        n_trials, best_snr, note = scan_t1_trials(conn, cfg, t0, stream,
-                                                  beams, dm)
+        n_trials, best_snr, note, match = scan_t1_trials(conn, cfg, t0, stream,
+                                                         beams, dm)
         if n_trials is None:
             reason = (f"lost at T1: no cluster in the window in beam {beam} "
                       f"or its {len(beams) - 1} sky neighbours at DM "
                       f"{dm:.0f} (+-{dm_tol:.0f}) ({note})")
         elif n_trials > 0:
-            best = f"{best_snr:.1f}" if best_snr is not None else "?"
-            reason = (f"lost at T2: {n_trials} matching T1 trials "
-                      f"(best S/N {best}) but no cluster formed "
-                      f"(min {cfg.get('clustering', {}).get('min_samples', 5)} "
-                      f"members)")
+            # Trials were there, so the loss is upstream of clustering.
+            # gulp_stats says which gulp-level drop did it.
+            reason = t2_miss_reason(conn, obs_utc_start_at(conn, t0),
+                                    match.gulp if match else None, match)
         else:
             reason = (f"lost at T1: no matching trial in beam {beam} or its "
                       f"{len(beams) - 1} sky neighbours within the window "
@@ -518,6 +583,44 @@ def reconcile(conn, inj_id: int, cfg: dict) -> None:
                 "" if n_trials is None else f" t1_trials={n_trials}")
 
 
+def do_replay(conn, cfg: dict, poster, inj_id: int, dump_dir) -> Path | None:
+    """Render the shot's replay plot and thread it under its Slack message.
+
+    Runs after reconcile, so the outcome is known and a miss can be rendered
+    at the time the pulse should have arrived. Returns the PNG path, or None
+    when nothing was due or anything failed.
+    """
+    icfg = cfg.get("injection", {}) or {}
+    rcfg = inject_replay.replay_cfg(icfg)
+    if dump_dir is None or rcfg.get("post") == "never":
+        return None
+    row = ledger_row(conn, inj_id)
+    outcome = (row or {}).get("outcome")
+    if not inject_replay.post_due(rcfg, outcome,
+                                  inject_replay.last_replay_day(conn)):
+        logger.info("injection %d: replay not due (post=%s, outcome=%s)",
+                    inj_id, rcfg.get("post"), outcome)
+        inject_replay.cleanup_dump(dump_dir, rcfg)
+        return None
+
+    event_utc = None
+    if outcome in inject_outcome.MISSES:
+        # Nothing was found, so the tool is told where to put the pulse.
+        event_utc = inject_replay.expected_event_utc(
+            conn, datetime.fromisoformat(row["inject_utc"]))
+    png = inject_replay.run_replay(inj_id, dump_dir, rcfg,
+                                   db_path=cfg.get("db", db.DEFAULT_PATH),
+                                   event_utc=event_utc)
+    posted = False
+    if png is not None:
+        posted = bool(poster.post_replay(row, png, inject_replay.CAPTION))
+        with conn:
+            conn.execute("UPDATE injections SET replay_png=?, replay_posted=?"
+                         " WHERE id=?", (str(png), int(posted), inj_id))
+    inject_replay.cleanup_dump(dump_dir, rcfg)
+    return png
+
+
 async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa: C901
     force = force or {}
     icfg = cfg.get("injection", {})
@@ -529,6 +632,7 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
     # Ships disabled: with injection.slack.enabled false every poster call is
     # a no-op, so the deployed daemon behaves exactly as it did before.
     poster = inject_slack.poster_from_cfg(icfg)
+    rcfg = inject_replay.replay_cfg(icfg)
     i = 0
     first = True
     while True:
@@ -670,6 +774,32 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
                     "fwhm=%.1fms est_snr=%s", inj_id, beam, stream, dm, amp,
                     fwhm_ms, f"{est_snr:.1f}" if est_snr else "?")
 
+        # Dump the injected stream around the shot, for the replay plot. The
+        # window is BEFORE inject_utc: that is where the pulse is. Requested
+        # now because it cannot be taken retrospectively - whether the plot
+        # is posted is decided later, once the outcome is known.
+        dump_dir = None
+        if inject_replay.dump_due(rcfg):
+            d_start, d_stop = inject_replay.dump_window(now, rcfg)
+            try:
+                loc = beams.stream_location(stream)
+                reply = await asyncio.to_thread(
+                    dump_client.request_dump, loc.host, loc.control_port,
+                    d_start, d_stop, float(rcfg.get("dump_timeout_s", 60.0)))
+                dump_dir = loc.dump_dir
+                with conn:
+                    conn.execute(
+                        "UPDATE injections SET dump_dir=?, dump_utc_start=?,"
+                        " dump_utc_stop=? WHERE id=?",
+                        (dump_dir,
+                         d_start.isoformat(timespec="milliseconds"),
+                         d_stop.isoformat(timespec="milliseconds"), inj_id))
+                logger.info("injection %d: dump [%s .. %s] on %s -> %r",
+                            inj_id, d_start, d_stop, loc.host, reply)
+            except Exception:
+                logger.exception("injection %d: dump request failed", inj_id)
+                dump_dir = None
+
         try:
             ts = poster.post_sent(ledger_row(conn, inj_id))
             if ts:
@@ -692,8 +822,9 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
         except Exception:
             logger.exception("truth plot for injection %d failed", inj_id)
 
-        # T1 reports 20-30 s late; give it 3 minutes, then attribute gates.
-        await asyncio.sleep(180)
+        # T1 reports 20-30 s late and the sidecar joins a gulp already
+        # seconds old, so the default 90 s clears both.
+        await asyncio.sleep(float(icfg.get("reconcile_wait_s", 90)))
         try:
             reconcile(conn, inj_id, cfg)
         except Exception:
@@ -705,6 +836,10 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
             except Exception:
                 logger.exception("slack outcome-post for injection %d failed",
                                  inj_id)
+            try:
+                do_replay(conn, cfg, poster, inj_id, dump_dir)
+            except Exception:
+                logger.exception("replay of injection %d failed", inj_id)
 
         # rolling scratch cleanup: keep the last ~20 injections of work files
         work = sorted(scratch.glob("inj_*"), key=lambda p: p.stat().st_mtime)

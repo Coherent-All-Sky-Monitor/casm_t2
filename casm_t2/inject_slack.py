@@ -661,7 +661,8 @@ class SlackPoster:
             logger.warning("slack update failed: %s", exc)
             return None
 
-    def _post_file(self, png: Path, title: str, thread_ts=None) -> bool:
+    def _post_file(self, png: Path, title: str, thread_ts=None,
+                   comment: str | None = None) -> bool:
         """External-upload flow, same three steps as casm_t3.alerts."""
         token, channel = self._auth()
         if token is None:
@@ -690,6 +691,8 @@ class SlackPoster:
             r2.raise_for_status()
             body = {"files": [{"id": d1["file_id"], "title": title}],
                     "channel_id": channel}
+            if comment:
+                body["initial_comment"] = comment
             if thread_ts:
                 body["thread_ts"] = thread_ts
             r3 = requests.post(f"{_SLACK_API}/files.completeUploadExternal",
@@ -735,6 +738,28 @@ class SlackPoster:
             logger.warning("slack edit of injection %s failed; posting fresh",
                            _g(row, "id"))
         return self._post(f"`{_g(row, 'id')}`: {line}", attachments=[attachment])
+
+    def post_replay(self, row, png, caption: str) -> bool:
+        """Thread the replay plot under this shot's own message.
+
+        A reply, not a new message: the channel keeps one top-level line per
+        injection, and the plot sits with the shot it belongs to. Without a
+        stored ts there is nothing to reply to, so the plot is skipped rather
+        than posted loose.
+        """
+        if not self.enabled:
+            return False
+        if self.dry_run:
+            self._dry_write(f"replay_{_g(row, 'id', 'x')}",
+                            f"[thread_ts={_g(row, 'slack_ts')}] {caption}\n{png}")
+            return True
+        ts = _g(row, "slack_ts")
+        if not ts:
+            logger.warning("no slack_ts for injection %s; not posting the "
+                           "replay loose in the channel", _g(row, "id"))
+            return False
+        return self._post_file(Path(png), f"inj{_g(row, 'id')} replay",
+                               thread_ts=ts, comment=caption)
 
     def post_streak(self, n: int, ids, why: str | None) -> str | None:
         if not self.enabled:

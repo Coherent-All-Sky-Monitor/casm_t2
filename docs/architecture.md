@@ -259,6 +259,8 @@ working from and what the matched cluster looked like:
 | rec_offset_arcsec | sky separation of the injected and recovered beams; shown only when they differ |
 | n_t1_trials | raw T1 trials matching the shot, counted only when no cluster did (NULL = not looked at, or the file was unreadable) |
 | sub_incoh | incoherent-beam subtraction on (1) / off (0) at fire time, from the beamformer log; NULL unknown |
+| dump_dir, dump_utc_start, dump_utc_stop | the intensity dump taken for the replay |
+| replay_png, replay_posted | the rendered replay plot, and whether it reached Slack |
 | slack_ts | ts of the Slack message for this shot, when posting is on |
 | outcome | closed enum, below |
 
@@ -302,6 +304,19 @@ paths, so a shot can never be tagged on one path and missed on the other.
 With no pointing table the callers fall back to the index window and say so
 in the log, because that is a guess about hardware ordering rather than a
 statement about the sky.
+
+A `missed_t2` is worth a second look, because T2 clusters *every* surviving
+trial - DBSCAN noise points become singleton clusters - and stores everything
+at S/N >= 12. "Trials arrived but nothing clustered" is therefore impossible
+for an intact gulp: something dropped the gulp or the trials before clustering
+ever ran. `t2_miss_reason()` asks `gulp_stats`, which records exactly that, one
+row per coalesced gulp, and names the cause: the gulp was skipped incomplete,
+dropped by the storm cap, partly shed, or width-vetoed. If none of those fits,
+the reason says "intact but no cluster (unexpected, investigate)" and logs a
+WARNING - if that ever fires, an assumption here is wrong.
+
+The gulp index is exactly `samp // 8192`, checked against shot 660 (cluster
+samp 3543044, stored gulp 432).
 
 Telling `missed_t1` from `missed_t2` needs the raw trials, which T2 never
 stores. `reconcile()` therefore reads hella's own candidate file for the

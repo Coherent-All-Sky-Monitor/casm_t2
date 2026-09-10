@@ -343,16 +343,19 @@ def test_matching_trials_are_counted(tmp_path):
         (30.0, 1005, 900.0, 200),     # wrong DM
         (30.0, 90000, 500.0, 200),    # outside the sample window
     ])
-    n, best = d.count_t1_trials(path, beams={198, 199, 200, 201, 202},
-                                dm=500.0, samp_lo=900, samp_hi=1100)
-    assert n == 3
-    assert best == pytest.approx(9.2)
+    got = d.count_t1_trials(path, beams={198, 199, 200, 201, 202},
+                            dm=500.0, samp_lo=900, samp_hi=1100)
+    assert got.n == 3
+    assert got.best_snr == pytest.approx(9.2)
+    assert got.gulp == 1000 // 8192          # samp // GULP_SAMPS
+    assert got.all_veto_width is False       # the fixture writes width 4
 
 
 def test_no_matching_trials(tmp_path):
     path = _cands(tmp_path, [(30.0, 1005, 900.0, 210)])
-    assert d.count_t1_trials(path, beams={200}, dm=500.0,
-                             samp_lo=900, samp_hi=1100) == (0, None)
+    got = d.count_t1_trials(path, beams={200}, dm=500.0,
+                            samp_lo=900, samp_hi=1100)
+    assert (got.n, got.best_snr) == (0, None)
 
 
 def test_a_missing_file_is_not_the_same_as_no_trials(tmp_path):
@@ -362,8 +365,9 @@ def test_a_missing_file_is_not_the_same_as_no_trials(tmp_path):
 
 def test_the_header_line_is_not_a_trial(tmp_path):
     path = _cands(tmp_path, [])
-    assert d.count_t1_trials(path, beams={200}, dm=500.0,
-                             samp_lo=0, samp_hi=1e9) == (0, None)
+    got = d.count_t1_trials(path, beams={200}, dm=500.0,
+                            samp_lo=0, samp_hi=1e9)
+    assert (got.n, got.best_snr) == (0, None)
 
 
 def test_dm_tolerance_matches_the_cluster_rule():
@@ -428,8 +432,9 @@ def test_reconcile_missed_t2_when_trials_are_there(conn, cluster_row, tmp_path):
     outcome, reason, n = _outcome(conn)
     assert outcome == "missed_t2"
     assert n == 2
-    assert reason == ("lost at T2: 2 matching T1 trials (best S/N 9.2) "
-                      "but no cluster formed (min 5 members)")
+    # no gulp_stats row for that gulp in this fixture DB
+    assert reason == ("lost at T2: gulp 34 never reached t2d "
+                      "(no gulp_stats row)")
 
 
 def test_reconcile_missed_t1_when_the_file_has_nothing(conn, cluster_row,
@@ -797,3 +802,85 @@ def test_a_calibration_grid_config_draws_only_the_grid():
     assert widths == {3.0, 8.0, 20.0}
     assert d.sample_spec(icfg, "inject_snr", rng) == 15.0
     assert d.sample_spec(icfg, "dm", rng) == 300.0
+
+
+# --- why a gulp with trials produced no cluster ------------------------------
+
+OBS = "2026-07-31-00:00:00"
+
+
+def _gulp_stats(conn, gulp, n_cands=54, n_clusters=7, n_stored=7, n_vetoed=0,
+                n_shed=0, skipped=0, n_jobs=8):
+    conn.execute(
+        "INSERT INTO gulp_stats (obs_utc_start, gulp, gulp_utc, n_jobs,"
+        " n_cands, n_clusters, n_stored, n_would, clustering_ms, n_vetoed,"
+        " n_shed, skipped, created_utc)"
+        " VALUES (?,?,'2026-07-31T00:00:00.000+00:00',?,?,?,?,0,1.0,?,?,?,'x')",
+        (OBS, gulp, n_jobs, n_cands, n_clusters, n_stored, n_vetoed, n_shed,
+         skipped))
+    conn.commit()
+
+
+class _Match:
+    def __init__(self, gulp=432, all_veto_width=False):
+        self.gulp = gulp
+        self.all_veto_width = all_veto_width
+
+
+def test_t2_miss_incomplete_gulp(conn):
+    _gulp_stats(conn, 432, skipped=1, n_jobs=5)
+    assert d.t2_miss_reason(conn, OBS, 432, _Match()) == (
+        "lost at T2: gulp 432 skipped incomplete (5/8 jobs)")
+
+
+def test_t2_miss_storm_cap(conn):
+    _gulp_stats(conn, 432, n_cands=10000, n_shed=10000)
+    assert d.t2_miss_reason(conn, OBS, 432, _Match()) == (
+        "lost at T2: gulp 432 dropped by the storm cap (10000 trials > max)")
+
+
+def test_t2_miss_partial_shed(conn):
+    _gulp_stats(conn, 432, n_cands=8000, n_shed=3000)
+    assert d.t2_miss_reason(conn, OBS, 432, _Match()) == (
+        "lost at T2: gulp 432 shed 3000 of 8000 trials")
+
+
+def test_t2_miss_width_vetoed(conn):
+    _gulp_stats(conn, 432, n_cands=54, n_vetoed=54)
+    assert d.t2_miss_reason(conn, OBS, 432, _Match(all_veto_width=True)) == (
+        "lost at T2: gulp 432 width-vetoed")
+
+
+def test_t2_miss_on_an_intact_gulp_is_flagged(conn, caplog):
+    """Should be impossible: T2 clusters every surviving trial."""
+    _gulp_stats(conn, 432)
+    with caplog.at_level("WARNING"):
+        reason = d.t2_miss_reason(conn, OBS, 432, _Match())
+    assert reason == (
+        "lost at T2: gulp 432 intact but no cluster (unexpected, investigate)")
+    assert "investigate" in caplog.text
+
+
+def test_t2_miss_with_no_gulp_stats_row(conn, caplog):
+    with caplog.at_level("WARNING"):
+        reason = d.t2_miss_reason(conn, OBS, 999, _Match(gulp=999))
+    assert reason == "lost at T2: gulp 999 never reached t2d (no gulp_stats row)"
+    assert "never processed" in caplog.text
+
+
+def test_t2_miss_with_no_gulp_at_all(conn, caplog):
+    with caplog.at_level("WARNING"):
+        reason = d.t2_miss_reason(conn, None, None, None)
+    assert reason == "lost at T2: the gulp could not be identified"
+
+
+def test_skipped_wins_over_shed(conn):
+    """t2d skips the gulp before it ever sheds, so say the earlier cause."""
+    _gulp_stats(conn, 432, skipped=1, n_jobs=3, n_shed=100, n_cands=200)
+    assert "skipped incomplete" in d.t2_miss_reason(conn, OBS, 432, _Match())
+
+
+def test_gulp_index_is_samp_over_8192():
+    """Checked against shot 660: cluster samp 3543044 is stored as gulp 432."""
+    assert d.GULP_SAMPS == 8192
+    assert 3543044 // d.GULP_SAMPS == 432

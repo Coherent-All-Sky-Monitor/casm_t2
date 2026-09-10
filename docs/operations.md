@@ -137,6 +137,60 @@ trials are therefore ibox 1 to 5; ibox 0 cannot be targeted (it shares a
 If narrow-end coverage matters, the fix is an argument in that script, not
 a config change here.
 
+### Automated replay
+
+The truth plot the daemon renders comes from the .fil that was pushed into the
+FIFO, so it shows the pulse as generated. It cannot show what the pulse looked
+like in the live stream, because intensity dumps tap upstream of the injection
+merge - which is exactly what you want when a shot comes back at half the
+expected S/N, or not at all.
+
+The replay closes that: dump the injected stream around the shot, add the
+pulse to the dump where it should have arrived, render it, and thread the PNG
+under the shot's own Slack message. On a miss it shows what hella should have
+found and did not.
+
+    injection:
+      reconcile_wait_s: 90
+      replay:
+        post: daily             # daily | on_miss | always | never
+        dump_pre_s: 24
+        dump_post_s: 10
+        dump_timeout_s: 60
+        keep_dump: false
+        events_root: /mnt/nvme3/T3/EVENTS
+        command: t3-replay-injection
+
+`post` decides when the PNG is posted: `always` every shot, `on_miss` only
+misses, `daily` every miss plus the first shot of each UTC day, `never` nothing
+(and then no dump is requested at all). The dump is taken on every shot
+whenever posting is possible, because it cannot be taken retrospectively.
+
+The window is `[inject_utc - dump_pre_s, inject_utc - dump_post_s]` - both
+offsets go backwards, because the pulse lands before the FIFO write: the
+sidecar joins a gulp whose samples are already 5-20 s old. The dump daemon
+replies only after writing, and a 14 s window took about 20 s on 2026-09-09,
+hence the timeout.
+
+Timeline per shot, from the FIFO write:
+
+| time | what |
+| --- | --- |
+| 0 s | ledger row, FIFO write, Slack "injection sent" |
+| ~20 s | the intensity dump completes |
+| ~100 s | reconcile; the outcome edits the Slack message |
+| ~110 s | the replay PNG lands as a thread reply under it |
+
+Archive layout, one directory per shot under `events_root`:
+
+    inj667/inj667.png     the replay plot
+    inj667/inj667.json    the synthetic card
+    inj667/inj667.fil     the beam with the pulse added, float32 single-beam
+
+The dump itself is deleted after the plot unless `keep_dump: true`. Everything
+in the chain is fail-soft: a failed dump, render or post leaves the injection
+and its ledger row alone, and the shot is still reconciled normally.
+
 ### Injection messages in Slack
 
 The daemon can post one Slack message per injection: a "sent" line when
