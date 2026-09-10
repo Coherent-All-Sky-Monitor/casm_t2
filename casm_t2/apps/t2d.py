@@ -831,8 +831,8 @@ class T2Daemon:
                     exclude=minted)
                 minted.add(name)
             ev_iso = event_utc.isoformat(timespec="milliseconds") if event_utc else ""
-            sky = self._sky(event_utc, cl.peak.beam, radec=False)
-            rows.append((cl, utc_start_s or "", gulp, ev_iso, tier, ",".join(tags), name, sky))
+            sky_row = self._sky(event_utc, cl.peak.beam, radec=False)
+            rows.append((cl, utc_start_s or "", gulp, ev_iso, tier, ",".join(tags), name, sky_row))
             if reason is not None and event_utc is not None:
                 to_trigger.append((cl, name, event_utc, tier, reason))
 
