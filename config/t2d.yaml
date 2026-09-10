@@ -297,7 +297,7 @@ injection:
     dump_timeout_s: 60
     keep_dump: false
     events_root: /mnt/nvme3/T3/EVENTS
-    command: t3-replay-injection
+    command: /home/casm/software/dev/casm_venvs/casm_offline_env/bin/t3-replay-injection
   scratch_dir: /mnt/nvme5/casm_pipeline/injections
   # Slack posting for injections. SHIPS DISABLED: with enabled false the
   # daemon posts nothing and behaves exactly as it did before. Set
