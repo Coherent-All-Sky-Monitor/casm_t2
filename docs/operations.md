@@ -16,6 +16,15 @@ daemons over TCP. Config changes need `systemctl --user restart t2d`,
 which costs the in-flight gulp and nothing else; budgets rebuild from the
 DB.
 
+### Outbound network from the correlator nodes
+
+corr1 and corr2 have no working DNS. All outbound HTTP goes through the
+zapdos privoxy at http://10.70.0.1:8118. User units inherit the proxy from
+`~/.config/environment.d/proxy.conf` (two lines, `https_proxy` and
+`http_proxy`) on both nodes, set 2026-09-10. Units that post to Slack also
+carry explicit `Environment=` lines for the same proxy, as belt and braces.
+A unit with neither fails with `NameResolutionError`.
+
 ## Configuration
 
 `config/t2d.yaml` is the only user config. The blocks you'll actually
