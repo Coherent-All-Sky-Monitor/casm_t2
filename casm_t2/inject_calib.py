@@ -103,6 +103,115 @@ def clamp_inject_snr(inject_snr: float, fwhm_ms: float,
     return float(scaled), float(cap), True
 
 
+#: hella's DM grid. A shot outside it cannot be recovered at its own DM, so
+#: a draw is clamped here rather than silently wasted.
+DM_MIN, DM_MAX = 0.0, 1000.0
+
+
+class SpecError(ValueError):
+    """A `sample:` entry that cannot be drawn from."""
+
+
+def draw(spec, rng) -> float:
+    """One value from a distribution spec.
+
+    Specs are the `injection.sample` block: a dict with `dist` plus the
+    arguments that distribution needs.
+
+        {dist: uniform,    lo: 100, hi: 900}
+        {dist: loguniform, lo: 2.5, hi: 30.0}
+        {dist: choice,     values: [3, 8, 20], weights: [1, 2, 1]}
+        {dist: fixed,      value: 15}
+
+    `loguniform` is the right default for anything spanning a decade and
+    sampled against powers-of-two search trials; `choice` and `fixed`
+    express a calibration grid, where the point is to repeat the same few
+    settings rather than to cover a range.
+
+    Raises SpecError on anything malformed: a bad spec is a config mistake
+    that should stop the daemon at startup, not quietly produce injections
+    at the wrong brightness for a week.
+    """
+    if not isinstance(spec, dict):
+        raise SpecError(f"sample spec must be a mapping, got {spec!r}")
+    dist = str(spec.get("dist", "")).lower()
+
+    if dist == "fixed":
+        if "value" not in spec:
+            raise SpecError("fixed needs `value`")
+        return float(spec["value"])
+
+    if dist == "choice":
+        values = spec.get("values")
+        if not values:
+            raise SpecError("choice needs a non-empty `values`")
+        weights = spec.get("weights")
+        if weights is not None:
+            if len(weights) != len(values):
+                raise SpecError("choice `weights` must match `values` in length")
+            if any(w < 0 for w in weights) or sum(weights) <= 0:
+                raise SpecError("choice `weights` must be non-negative and sum > 0")
+            return float(rng.choices(list(values), weights=list(weights))[0])
+        return float(rng.choice(list(values)))
+
+    if dist in ("uniform", "loguniform"):
+        if "lo" not in spec or "hi" not in spec:
+            raise SpecError(f"{dist} needs `lo` and `hi`")
+        lo, hi = float(spec["lo"]), float(spec["hi"])
+        if not lo < hi:
+            raise SpecError(f"{dist} needs lo < hi, got lo={lo} hi={hi}")
+        if dist == "uniform":
+            return float(rng.uniform(lo, hi))
+        if lo <= 0:
+            raise SpecError(f"loguniform needs lo > 0, got lo={lo}")
+        return float(math.exp(rng.uniform(math.log(lo), math.log(hi))))
+
+    raise SpecError(f"unknown dist {spec.get('dist')!r}")
+
+
+def sample_spec(icfg: dict, name: str, rng, legacy_key: str | None = None,
+                legacy_log=logger) -> float:
+    """Draw one shot parameter from `injection.sample`, or an old range key.
+
+    The old `dm_range` / `fwhm_ms_range` / `inject_snr_range` lists still
+    work so a config from before the `sample:` block keeps running, but they
+    warn: two ways to say the same thing is how a config drifts out of step
+    with what is actually being injected.
+    """
+    spec = ((icfg or {}).get("sample") or {}).get(name)
+    if spec is not None:
+        return draw(spec, rng)
+    if legacy_key and (icfg or {}).get(legacy_key):
+        lo, hi = (icfg or {})[legacy_key][:2]
+        legacy_log.warning(
+            "injection.%s is deprecated; use injection.sample.%s "
+            "{dist: %s, lo: %s, hi: %s}", legacy_key, name,
+            "uniform" if name == "dm" else "loguniform", lo, hi)
+        dist = "uniform" if name == "dm" else "loguniform"
+        return draw({"dist": dist, "lo": lo, "hi": hi}, rng)
+    raise SpecError(f"no injection.sample.{name} and no {legacy_key}")
+
+
+def clamp_fwhm_ms(fwhm_ms: float, log=logger) -> float:
+    """Hold a drawn FWHM at what the generator can actually render."""
+    if fwhm_ms < MIN_RENDERABLE_FWHM_MS:
+        log.warning("injected FWHM %.2f ms is below the %.2f ms the generator "
+                    "can render (it floors sigma at one sample); using the "
+                    "floor", fwhm_ms, MIN_RENDERABLE_FWHM_MS)
+        return MIN_RENDERABLE_FWHM_MS
+    return float(fwhm_ms)
+
+
+def clamp_dm(dm: float, log=logger) -> float:
+    """Hold a drawn DM on hella's search grid."""
+    if not DM_MIN <= dm <= DM_MAX:
+        clamped = min(max(dm, DM_MIN), DM_MAX)
+        log.warning("injected DM %.1f is off hella's grid [%.0f, %.0f]; "
+                    "using %.1f", dm, DM_MIN, DM_MAX, clamped)
+        return clamped
+    return float(dm)
+
+
 def sample_fwhm_ms(rng, lo_ms: float, hi_ms: float) -> float:
     """Draw an injected FWHM log-uniformly, clamped to what the generator can render.
 

@@ -50,15 +50,37 @@ COLOR_MISSED = "#C62828"
 COLOR_NEUTRAL = "#9E9E9E"
 _INK = "#262626"
 
-#: DM buckets for the summary figures, as (upper bound exclusive, label,
-#: fill, marker, edge). Identity rides on colour AND marker shape, so the
-#: figures survive greyscale printing and colour-blind readers.
-DM_BUCKETS = [
-    (250.0, "DM < 250", "#4C6EF5", "o", "#364FC7"),
-    (500.0, "DM 250-500", "#F59F00", "s", "#E67700"),
-    (750.0, "DM 500-750", "#12B886", "^", "#087F5B"),
-    (float("inf"), "DM > 750", "#BE4BDB", "D", "#9C36B5"),
+#: Marker identity per DM bin, in bin order. Identity rides on colour AND
+#: marker shape, so the figures survive greyscale printing and colour-blind
+#: readers. Bin EDGES come from `injection.summary_dm_bins`; these are just
+#: the styles they are drawn with, reused cyclically if there are more bins.
+DM_STYLES = [
+    ("#4C6EF5", "o", "#364FC7"),
+    ("#F59F00", "s", "#E67700"),
+    ("#12B886", "^", "#087F5B"),
+    ("#BE4BDB", "D", "#9C36B5"),
+    ("#E8590C", "v", "#D9480F"),
 ]
+
+#: Default bin edges, matching the shipped `injection.sample.dm` range.
+DEFAULT_DM_BINS = [100.0, 300.0, 500.0, 700.0, 900.0]
+
+
+def dm_bins(icfg: dict | None = None) -> list[float]:
+    """Bin edges for the per-DM tally, from config or the default."""
+    bins = ((icfg or {}).get("summary_dm_bins") or DEFAULT_DM_BINS)
+    return [float(b) for b in bins]
+
+
+def dm_bin_labels(icfg: dict | None = None) -> list[str]:
+    """One label per bin, plus the two open-ended ends."""
+    edges = dm_bins(icfg)
+    labels = [f"DM < {edges[0]:.0f}"]
+    labels += [f"DM {lo:.0f}-{hi:.0f}"
+               for lo, hi in zip(edges[:-1], edges[1:])]
+    labels.append(f"DM > {edges[-1]:.0f}")
+    return labels
+
 
 OUTCOME_COLORS = {
     oc.RECOVERED: COLOR_RECOVERED,
@@ -95,12 +117,26 @@ def _f(row, key):
         return None
 
 
-def dm_bucket(dm: float | None):
-    """(label, fill, marker, edge) for a DM, never None."""
-    for hi, label, fill, marker, edge in DM_BUCKETS:
-        if dm is not None and float(dm) < hi:
-            return label, fill, marker, edge
-    return DM_BUCKETS[-1][1:]
+def dm_bucket(dm: float | None, icfg: dict | None = None):
+    """(label, fill, marker, edge) for a DM, never None.
+
+    Bins are half-open [lo, hi), with an under- and an over-flow bin so a DM
+    outside the sampled range still lands somewhere rather than vanishing.
+    """
+    edges = dm_bins(icfg)
+    labels = dm_bin_labels(icfg)
+    idx = len(edges)                       # overflow unless a bin claims it
+    if dm is not None:
+        value = float(dm)
+        if value < edges[0]:
+            idx = 0
+        else:
+            for i, (lo, hi) in enumerate(zip(edges[:-1], edges[1:])):
+                if lo <= value < hi:
+                    idx = i + 1
+                    break
+    style = DM_STYLES[idx % len(DM_STYLES)]
+    return (labels[idx], *style)
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +177,10 @@ def sent_text(row, icfg: dict | None = None) -> str:
         f"FWHM {fwhm:.1f}{NBSP}ms" if fwhm is not None else "FWHM n/a",
         f"injected S/N {snr:.0f}" if snr is not None else "injected S/N n/a",
     ]
-    return (f"injection {_g(row, 'id', '?')} sent: " + ", ".join(bits)
+    # The standing state is subtraction ON, so it adds nothing to the line;
+    # only the unusual state is called out.
+    suffix = " (IB sub off)" if _g(row, "sub_incoh") == 0 else ""
+    return (f"injection {_g(row, 'id', '?')} sent: " + ", ".join(bits) + suffix
             + "\n_awaiting recovery..._")
 
 
@@ -245,7 +284,7 @@ def streak_text(n: int, ids, why: str | None) -> str:
     )
 
 
-def summary_text(rows, day: str) -> str:
+def summary_text(rows, day: str, icfg: dict | None = None) -> str:
     """The daily roll-up posted once per UTC day."""
     rows = list(rows)
     counts = {o: 0 for o in oc.ALL}
@@ -259,12 +298,12 @@ def summary_text(rows, day: str) -> str:
 
     by_bucket: dict[str, list[int]] = {}
     for r in rows:
-        label = dm_bucket(_f(r, "dm"))[0]
+        label = dm_bucket(_f(r, "dm"), icfg)[0]
         got, tot = by_bucket.setdefault(label, [0, 0])
         by_bucket[label] = [got + (1 if _g(r, "outcome") == oc.RECOVERED else 0),
                             tot + 1]
     if by_bucket:
-        order = [b[1] for b in DM_BUCKETS]
+        order = dm_bin_labels(icfg)
         lines.append("per DM: " + " | ".join(
             f"{label}: {by_bucket[label][0]}/{by_bucket[label][1]}"
             for label in order if label in by_bucket))
@@ -277,14 +316,37 @@ def summary_text(rows, day: str) -> str:
         lines.append(f"{counts[oc.FIRE_FAILED]} fire failures "
                      "(injector plumbing, not a pipeline miss)")
 
-    ratios = sorted(
-        (_f(r, "rec_snr") / injected_snr(r)) for r in rows
-        if _g(r, "outcome") == oc.RECOVERED and _f(r, "rec_snr") is not None
-        and injected_snr(r))
-    if ratios:
-        med = ratios[len(ratios) // 2]
-        lines.append(f"recovered/injected S/N: median {med:.2f} "
-                     f"(range {ratios[0]:.2f}-{ratios[-1]:.2f})")
+    def _ratios(subset):
+        return sorted(
+            (_f(r, "rec_snr") / injected_snr(r)) for r in subset
+            if _g(r, "outcome") == oc.RECOVERED and _f(r, "rec_snr") is not None
+            and injected_snr(r))
+
+    def _ratio_line(subset, label=""):
+        vals = _ratios(subset)
+        if not vals:
+            return None
+        med = vals[len(vals) // 2]
+        return (f"recovered/injected S/N{label}: median {med:.2f} "
+                f"(range {vals[0]:.2f}-{vals[-1]:.2f})")
+
+    # The reported/true ratio differs between subtraction states, so a day
+    # that mixes them must not be averaged into one meaningless number.
+    states = {_g(r, "sub_incoh") for r in rows}
+    if len({s for s in states if s is not None}) > 1:
+        for state, label in ((1, " (IB sub on)"), (0, " (IB sub off)")):
+            line = _ratio_line([r for r in rows
+                                if _g(r, "sub_incoh") == state], label)
+            if line:
+                lines.append(line)
+        unknown = _ratio_line([r for r in rows if _g(r, "sub_incoh") is None],
+                              " (IB sub unknown)")
+        if unknown:
+            lines.append(unknown)
+    else:
+        line = _ratio_line(rows)
+        if line:
+            lines.append(line)
     return "\n".join(lines)
 
 
@@ -329,17 +391,21 @@ def _despine(ax) -> None:
     ax.xaxis.label.set_color(_INK)
 
 
-def _dm_legend_handles(line2d, with_miss: bool) -> list:
-    handles = [line2d([], [], marker=m, color=c, ls="none", ms=8,
-                      mec=e, mew=0.9, label=label)
-               for _hi, label, c, m, e in DM_BUCKETS]
+def _dm_legend_handles(line2d, with_miss: bool,
+                       icfg: dict | None = None) -> list:
+    handles = []
+    for i, label in enumerate(dm_bin_labels(icfg)):
+        c, m, e = DM_STYLES[i % len(DM_STYLES)]
+        handles.append(line2d([], [], marker=m, color=c, ls="none", ms=8,
+                              mec=e, mew=0.9, label=label))
     if with_miss:
         handles.append(line2d([], [], marker="o", mfc="none", mec=_INK,
                               ls="none", ms=8, mew=1.1, label="open = missed"))
     return handles
 
 
-def render_summary_figures(rows, out_dir) -> list[Path]:  # noqa: C901
+def render_summary_figures(rows, out_dir,
+                           icfg: dict | None = None) -> list[Path]:  # noqa: C901
     """Three figures for the daily summary; returns the paths written.
 
     Never raises: a matplotlib problem logs a warning and returns whatever
@@ -393,7 +459,7 @@ def render_summary_figures(rows, out_dir) -> list[Path]:  # noqa: C901
                 if t is None:
                     continue
                 plotted += 1
-                _lab, fill, marker, edge = dm_bucket(_f(r, "dm"))
+                _lab, fill, marker, edge = dm_bucket(_f(r, "dm"), icfg)
                 s_rec = _f(r, "rec_snr")
                 if s_rec is not None and _g(r, "outcome") == oc.RECOVERED:
                     ax.scatter([t], [s_rec], s=70, marker=marker,
@@ -413,7 +479,7 @@ def render_summary_figures(rows, out_dir) -> list[Path]:  # noqa: C901
             ax.set_ylim(-1.0, hi)
             ax.set_xlabel("injected S/N")
             ax.set_ylabel("recovered S/N")
-            fig.legend(handles=_dm_legend_handles(Line2D, True),
+            fig.legend(handles=_dm_legend_handles(Line2D, True, icfg),
                        loc="outside center right", ncol=1,
                        handletextpad=0.3, labelspacing=0.6, fontsize=9.5)
             _despine(ax)
@@ -683,8 +749,8 @@ class SlackPoster:
         """Summary text as one top-level message, figures as replies in its thread."""
         if not self.enabled:
             return None
-        text = summary_text(rows, day)
-        figures = render_summary_figures(rows, fig_dir)
+        text = summary_text(rows, day, self.icfg)
+        figures = render_summary_figures(rows, fig_dir, self.icfg)
         if not figures:
             text += "\n(summary figures failed to render - see the log)"
         if self.dry_run:

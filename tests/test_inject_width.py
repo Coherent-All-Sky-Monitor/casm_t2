@@ -99,6 +99,8 @@ def test_sampling_range_exercises_ibox_1_to_5():
 
 # --- the per-width reported/true ratio --------------------------------------
 
+# The sub-OFF sweep, kept as the fixture for the interpolation tests: it has
+# three clearly distinct points, which is what those tests exercise.
 TABLE_CFG = {"rec_per_true_table": [[4.7, 2.24], [11.8, 2.08], [23.5, 1.22]],
              "rec_per_true": 1.30}
 
@@ -177,40 +179,60 @@ def test_clamp_leaves_a_normal_shot_alone():
     assert predicted == pytest.approx(15.0 * 2.08)
 
 
-def test_the_sampled_range_never_clamps_at_any_width():
-    """`inject_snr_range` is chosen so the cap is a safety net, not a ceiling
-    the scheduled shots keep running into. A clamp during normal running
-    means the range and the cap have drifted apart, so it is worth failing.
+def test_the_sampled_range_never_clamps_at_any_width_or_dm():
+    """`inject_snr` is drawn so the cap is a safety net, not a ceiling the
+    scheduled shots keep running into. A clamp during normal running means
+    the sample block and the cap have drifted apart, so it is worth failing.
 
-    Swept finely because the cap steps down at 6 and 15 ms; the tightest
-    point is FWHM 6.0 ms, where 18 * 2.198 = 39.6 against a cap of 40.
+    DM is swept too, to pin that nothing in the solver reads it: the
+    amplitude and the cap are functions of width and S/N only. DM matters
+    downstream (the dump window, the search grid), not here.
     """
     import yaml
     with open("config/t2d.yaml") as fh:
         icfg = yaml.safe_load(fh)["injection"]
-    hi = icfg["inject_snr_range"][1]
-    lo_fwhm, hi_fwhm = icfg["fwhm_ms_range"]
-    fwhm, worst = lo_fwhm, None
-    while fwhm <= hi_fwhm + 1e-9:
+    hi = icfg["sample"]["inject_snr"]["hi"]
+    lo_f, hi_f = icfg["sample"]["fwhm_ms"]["lo"], icfg["sample"]["fwhm_ms"]["hi"]
+    lo_dm, hi_dm = icfg["sample"]["dm"]["lo"], icfg["sample"]["dm"]["hi"]
+    worst = None
+    fwhm = lo_f
+    while fwhm <= hi_f + 1e-9:
         _inj, predicted, clamped = d.clamp_inject_snr(hi, fwhm, icfg)
         assert not clamped, f"top of the range clamps at FWHM {fwhm:.3f} ms"
         margin = d.reported_snr_cap(fwhm, icfg) - predicted
         worst = margin if worst is None else min(worst, margin)
+        # the same width at every DM in the range must give the same answer
+        for dm in (lo_dm, (lo_dm + hi_dm) / 2, hi_dm):
+            amp_a = d.rec_per_true(fwhm, icfg)
+            assert d.reported_snr_cap(fwhm, icfg) == d.reported_snr_cap(
+                fwhm, icfg), dm
+            assert amp_a == d.rec_per_true(fwhm, icfg)
         fwhm += 0.01
-    # headroom is real but thin at the 6 ms step; worth knowing if it moves
-    assert 0.0 < worst < 1.0
+    assert worst > 0.0
+
+
+def test_the_solver_does_not_read_dm():
+    """The amplitude is a function of S/N, width and the live std only."""
+    import inspect
+    src = inspect.getsource(d.amp_for_target_snr)
+    assert "dm" not in src.lower().replace("nchan", "")
 
 
 def test_a_manual_overbright_shot_is_still_clamped():
-    """The safety net still catches --inject-snr 30 at FWHM 11.8 ms."""
+    """The safety net catches a manual --inject-snr well over the cap.
+
+    Under the sub-ON table the ratio at 11.8 ms is 1.30, so the 40 cap is
+    reached at an injected S/N of 30.8 - a manual 40 is over it.
+    """
     import yaml
     with open("config/t2d.yaml") as fh:
         icfg = yaml.safe_load(fh)["injection"]
-    inj, predicted, clamped = d.clamp_inject_snr(30.0, 11.8, icfg)
+    assert d.clamp_inject_snr(30.0, 11.8, icfg)[2] is False   # just under
+    inj, predicted, clamped = d.clamp_inject_snr(40.0, 11.8, icfg)
     assert clamped is True
     assert predicted == pytest.approx(40.0)
-    assert inj == pytest.approx(40.0 / 2.08, rel=1e-3)
-    assert inj < 30.0
+    assert inj == pytest.approx(40.0 / 1.30, rel=1e-3)
+    assert inj < 40.0
 
 
 def test_clamp_reproduces_the_saturating_shot():
@@ -238,8 +260,10 @@ def test_sampled_shots_never_predict_over_the_cap():
         icfg = yaml.safe_load(fh)["injection"]
     rng = random.Random(5)
     for _ in range(2000):
-        fwhm = d.sample_fwhm_ms(rng, *icfg["fwhm_ms_range"])
-        raw = d.sample_inject_snr(rng, *icfg["inject_snr_range"])
+        fwhm = d.clamp_fwhm_ms(d.sample_spec(icfg, "fwhm_ms", rng))
+        raw = d.sample_spec(icfg, "inject_snr", rng)
+        dm = d.clamp_dm(d.sample_spec(icfg, "dm", rng))
+        assert 0.0 <= dm <= 1000.0
         _inj, predicted, _c = d.clamp_inject_snr(raw, fwhm, icfg)
         assert predicted <= d.reported_snr_cap(fwhm, icfg) + 1e-9
 
@@ -248,11 +272,19 @@ def test_config_uses_the_new_keys():
     import yaml
     with open("config/t2d.yaml") as fh:
         icfg = yaml.safe_load(fh)["injection"]
-    assert icfg["inject_snr_range"] == [12.0, 18.0]
-    assert icfg["fwhm_ms_range"] == [2.5, 30.0]
+    assert icfg["sample"]["dm"] == {"dist": "uniform", "lo": 100.0, "hi": 900.0}
+    assert icfg["sample"]["fwhm_ms"] == {"dist": "loguniform", "lo": 2.5,
+                                         "hi": 30.0}
+    assert icfg["sample"]["inject_snr"] == {"dist": "loguniform", "lo": 12.0,
+                                            "hi": 18.0}
+    assert icfg["summary_dm_bins"] == [100.0, 300.0, 500.0, 700.0, 900.0]
     assert icfg["reported_snr_cap"]["narrow"] == 50.0
+    # seeded for IB subtraction ON: measured 1.30 at the mid width
+    assert icfg["rec_per_true_table"] == [[4.7, 1.40], [11.8, 1.30],
+                                          [23.5, 0.77]]
     assert icfg["reported_snr_cap"]["mid"] == 40.0
-    for gone in ("sigma_ms_range", "target_rec_snr_range", "target_rec_snr_max"):
+    for gone in ("sigma_ms_range", "target_rec_snr_range", "target_rec_snr_max",
+                 "dm_range", "fwhm_ms_range", "inject_snr_range"):
         assert gone not in icfg
 
 
@@ -541,3 +573,227 @@ def test_t2d_falls_back_to_the_index_window_without_a_table(daemon,
     # index +-2 catches beam 6, and the daemon says so once
     assert d_._injection_match(cl, 1000.0, None) is True
     assert d_._inj_index_warned is True
+
+
+# --- IB subtraction state ---------------------------------------------------
+
+BFC = ("{n} [{ts}] START casm_bfcorr -a 64 -f 512 -i a00a -m corr"
+       " --corr_out a022{sub} -t 2048 -d 5 -m bf --bf_out a016\n")
+
+
+def _bfcorr_log(tmp_path, entries):
+    path = tmp_path / "antenna_bfcorr.log"
+    with path.open("w") as fh:
+        for n, ts, sub in entries:
+            fh.write(BFC.format(n=n, ts=ts, sub=" --sub_incoh" if sub else ""))
+    return path
+
+
+def test_sub_incoh_on(tmp_path):
+    path = _bfcorr_log(tmp_path, [(1, "2026-09-09-22:26:46.220", True)])
+    assert d.current_sub_incoh(path) == 1
+
+
+def test_sub_incoh_off(tmp_path):
+    path = _bfcorr_log(tmp_path, [(1, "2026-09-09-22:26:46.220", False)])
+    assert d.current_sub_incoh(path) == 0
+
+
+def test_sub_incoh_takes_the_LATEST_start_not_the_last_line(tmp_path):
+    """The log interleaves nodes: node 1 can log after node 5 restarted."""
+    path = _bfcorr_log(tmp_path, [
+        (5, "2026-09-09-22:27:58.266", False),   # latest, subtraction OFF
+        (1, "2026-09-09-22:26:46.220", True),    # last LINE, but older
+    ])
+    assert d.current_sub_incoh(path) == 0
+    assert d.last_bfcorr_start(path).minute == 27
+
+
+def test_sub_incoh_unknown_when_unreadable(tmp_path):
+    assert d.current_sub_incoh(tmp_path / "nope.log") is None
+    assert d.last_bfcorr_start(tmp_path / "nope.log") is None
+    empty = tmp_path / "empty.log"
+    empty.write_text("nothing to see\n")
+    assert d.current_sub_incoh(empty) is None
+
+
+# --- live-std staleness guard -----------------------------------------------
+
+def _clock(start):
+    from datetime import timedelta
+    box = {"t": start}
+
+    def now():
+        return box["t"]
+
+    def sleep(dt):
+        box["t"] += timedelta(seconds=dt)
+    return now, sleep, box
+
+
+def test_std_is_trusted_when_no_recent_restart(tmp_path):
+    from datetime import datetime, timezone
+    path = _bfcorr_log(tmp_path, [(1, "2026-09-09-20:00:00.000", True)])
+    now, sleep, _ = _clock(datetime(2026, 9, 9, 22, 0, tzinfo=timezone.utc))
+    reads = iter([36.2])
+    std, age = d.wait_for_fresh_std(
+        150, {}, reader=lambda: next(reads), now=now, sleep=sleep,
+        log_path=path)
+    assert std == 36.2
+    assert age > 7000                  # two hours since the restart
+
+
+def test_a_recent_restart_waits_for_the_value_to_move(tmp_path):
+    from datetime import datetime, timezone
+    path = _bfcorr_log(tmp_path, [(1, "2026-09-09-22:00:00.000", True)])
+    now, sleep, box = _clock(datetime(2026, 9, 9, 22, 0, 10,
+                                      tzinfo=timezone.utc))
+    # frozen for two polls, then republished
+    reads = iter([77.3, 77.3, 77.3, 41.0])
+    std, age = d.wait_for_fresh_std(
+        150, {"std_wait_s": 60.0, "std_poll_s": 5.0},
+        reader=lambda: next(reads), now=now, sleep=sleep, log_path=path)
+    assert std == 41.0
+    assert age == pytest.approx(25.0)   # 10 s since restart + 15 s waiting
+
+
+def test_a_frozen_std_gives_up_and_raises(tmp_path):
+    from datetime import datetime, timezone
+    path = _bfcorr_log(tmp_path, [(1, "2026-09-09-22:00:00.000", True)])
+    now, sleep, _ = _clock(datetime(2026, 9, 9, 22, 0, 10,
+                                    tzinfo=timezone.utc))
+    with pytest.raises(d.StaleStdError) as exc:
+        d.wait_for_fresh_std(150, {"std_wait_s": 20.0, "std_poll_s": 5.0},
+                             reader=lambda: 77.3, now=now, sleep=sleep,
+                             log_path=path)
+    assert "live std stale" in str(exc.value)
+    assert exc.value.age_s == pytest.approx(30.0)
+
+
+def test_no_bfcorr_log_means_no_guard(tmp_path):
+    """Unknown restart time must not block injections forever."""
+    std, age = d.wait_for_fresh_std(150, {}, reader=lambda: 36.2,
+                                    log_path=tmp_path / "nope.log")
+    assert std == 36.2 and age == 0.0
+
+
+def test_the_666_scenario_is_caught(tmp_path):
+    """Fired 2.5 min after a restart on a std that never moved."""
+    from datetime import datetime, timezone
+    path = _bfcorr_log(tmp_path, [(1, "2026-09-09-22:27:58.267", True)])
+    now, sleep, _ = _clock(datetime(2026, 9, 9, 22, 30, 0,
+                                    tzinfo=timezone.utc))
+    # 122 s after the restart, inside a max_std_age_s of 180
+    with pytest.raises(d.StaleStdError):
+        d.wait_for_fresh_std(150, {"max_std_age_s": 180.0, "std_wait_s": 30.0,
+                                   "std_poll_s": 5.0},
+                             reader=lambda: 77.27, now=now, sleep=sleep,
+                             log_path=path)
+
+
+# --- the sample block -------------------------------------------------------
+
+def test_draw_fixed():
+    rng = random.Random(0)
+    assert d.draw({"dist": "fixed", "value": 15}, rng) == 15.0
+    assert d.draw({"dist": "fixed", "value": 15}, rng) == 15.0   # no variance
+
+
+def test_draw_uniform_covers_the_range():
+    rng = random.Random(1)
+    vals = [d.draw({"dist": "uniform", "lo": 100, "hi": 900}, rng)
+            for _ in range(4000)]
+    assert min(vals) >= 100.0 and max(vals) <= 900.0
+    # a uniform draw's median sits at the arithmetic midpoint
+    assert sorted(vals)[2000] == pytest.approx(500.0, rel=0.05)
+
+
+def test_draw_loguniform_is_not_uniform():
+    rng = random.Random(2)
+    vals = sorted(d.draw({"dist": "loguniform", "lo": 2.5, "hi": 30.0}, rng)
+                  for _ in range(4000))
+    assert vals[0] >= 2.5 and vals[-1] <= 30.0
+    # median at the geometric mean, not the arithmetic one (16.25)
+    assert vals[2000] == pytest.approx(math.sqrt(2.5 * 30.0), rel=0.06)
+
+
+def test_draw_choice_only_returns_listed_values():
+    rng = random.Random(3)
+    spec = {"dist": "choice", "values": [3.0, 8.0, 20.0]}
+    vals = {d.draw(spec, rng) for _ in range(300)}
+    assert vals == {3.0, 8.0, 20.0}
+
+
+def test_draw_choice_honours_weights():
+    rng = random.Random(4)
+    spec = {"dist": "choice", "values": [3.0, 8.0], "weights": [0, 1]}
+    assert {d.draw(spec, rng) for _ in range(100)} == {8.0}
+
+
+@pytest.mark.parametrize("spec,msg", [
+    ({"dist": "uniform", "lo": 900, "hi": 100}, "lo < hi"),
+    ({"dist": "uniform", "lo": 1}, "needs `lo` and `hi`"),
+    ({"dist": "loguniform", "lo": 0, "hi": 30}, "lo > 0"),
+    ({"dist": "loguniform", "lo": -5, "hi": 30}, "lo > 0"),
+    ({"dist": "choice", "values": []}, "non-empty"),
+    ({"dist": "choice", "values": [1, 2], "weights": [1]}, "match `values`"),
+    ({"dist": "choice", "values": [1, 2], "weights": [0, 0]}, "sum > 0"),
+    ({"dist": "fixed"}, "needs `value`"),
+    ({"dist": "nonsense"}, "unknown dist"),
+    ("not a mapping", "must be a mapping"),
+])
+def test_a_bad_spec_is_refused_loudly(spec, msg):
+    """A config mistake must stop the daemon, not quietly mis-inject."""
+    with pytest.raises(d.inject_calib.SpecError) as exc:
+        d.draw(spec, random.Random(0))
+    assert msg in str(exc.value)
+
+
+def test_the_old_range_keys_still_work_and_warn(caplog):
+    rng = random.Random(5)
+    legacy = {"fwhm_ms_range": [2.5, 30.0]}
+    with caplog.at_level("WARNING"):
+        v = d.sample_spec(legacy, "fwhm_ms", rng, "fwhm_ms_range")
+    assert 2.5 <= v <= 30.0
+    assert "deprecated" in caplog.text
+    assert "sample.fwhm_ms" in caplog.text
+
+
+def test_the_sample_block_wins_over_a_legacy_key(caplog):
+    both = {"sample": {"fwhm_ms": {"dist": "fixed", "value": 7.0}},
+            "fwhm_ms_range": [2.5, 30.0]}
+    with caplog.at_level("WARNING"):
+        assert d.sample_spec(both, "fwhm_ms", random.Random(0),
+                             "fwhm_ms_range") == 7.0
+    assert "deprecated" not in caplog.text
+
+
+def test_nothing_configured_at_all_is_an_error():
+    with pytest.raises(d.inject_calib.SpecError):
+        d.sample_spec({}, "fwhm_ms", random.Random(0), "fwhm_ms_range")
+
+
+def test_fwhm_floor_is_enforced_after_the_draw(caplog):
+    with caplog.at_level("WARNING"):
+        assert d.clamp_fwhm_ms(1.0) == pytest.approx(d.MIN_RENDERABLE_FWHM_MS)
+    assert "below" in caplog.text
+    assert d.clamp_fwhm_ms(11.8) == 11.8       # no warning for a normal width
+
+
+@pytest.mark.parametrize("dm,want", [
+    (-5.0, 0.0), (0.0, 0.0), (450.0, 450.0), (1000.0, 1000.0), (1500.0, 1000.0),
+])
+def test_dm_is_clamped_to_hellas_grid(dm, want):
+    assert d.clamp_dm(dm) == pytest.approx(want)
+
+
+def test_a_calibration_grid_config_draws_only_the_grid():
+    """The shape a calibration run will be expressed in."""
+    icfg = {"sample": {"fwhm_ms": {"dist": "choice", "values": [3.0, 8.0, 20.0]},
+                       "inject_snr": {"dist": "fixed", "value": 15.0},
+                       "dm": {"dist": "fixed", "value": 300.0}}}
+    rng = random.Random(6)
+    widths = {d.sample_spec(icfg, "fwhm_ms", rng) for _ in range(200)}
+    assert widths == {3.0, 8.0, 20.0}
+    assert d.sample_spec(icfg, "inject_snr", rng) == 15.0
+    assert d.sample_spec(icfg, "dm", rng) == 300.0

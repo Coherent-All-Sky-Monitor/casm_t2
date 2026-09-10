@@ -401,3 +401,64 @@ def test_summary_posts_one_message_with_the_figures_in_its_thread(tmp_path,
     # both figures replied into that message's thread
     assert [n for n, _ in calls["files"]] == ["snr_recovery.png", "outcomes.png"]
     assert all(t == ts for _, t in calls["files"])
+
+
+# --- IB subtraction state in the messages ------------------------------------
+
+def test_sent_line_is_silent_when_subtraction_is_on():
+    """The standing state adds nothing."""
+    text = inject_slack.sent_text(dict(RECOVERED_ROW, sub_incoh=1))
+    assert "IB sub" not in text
+    assert inject_slack.sent_text(
+        dict(RECOVERED_ROW, sub_incoh=None)).count("IB sub") == 0
+
+
+def test_sent_line_calls_out_subtraction_off():
+    text = inject_slack.sent_text(dict(RECOVERED_ROW, sub_incoh=0))
+    assert text.split("\n")[0].endswith("injected S/N 20 (IB sub off)")
+
+
+def test_summary_splits_the_ratio_line_when_a_day_mixes_states():
+    on = dict(RECOVERED_ROW, sub_incoh=1, rec_snr=25.6)      # ratio 1.30
+    off = dict(RECOVERED_ROW, sub_incoh=0, rec_snr=40.9)     # ratio 2.08
+    text = inject_slack.summary_text([on, off], "2026-09-10")
+    assert "recovered/injected S/N (IB sub on): median 1.30" in text
+    assert "recovered/injected S/N (IB sub off): median 2.08" in text
+
+
+def test_summary_keeps_one_ratio_line_for_a_single_state():
+    rows = [dict(RECOVERED_ROW, sub_incoh=1)]
+    text = inject_slack.summary_text(rows, "2026-09-10")
+    assert "recovered/injected S/N: median" in text
+    assert "IB sub" not in text
+
+
+# --- configurable DM bins ----------------------------------------------------
+
+def test_default_dm_bins_follow_the_widened_range():
+    assert inject_slack.dm_bin_labels() == [
+        "DM < 100", "DM 100-300", "DM 300-500", "DM 500-700", "DM 700-900",
+        "DM > 900"]
+
+
+@pytest.mark.parametrize("dm,label", [
+    (50.0, "DM < 100"), (100.0, "DM 100-300"), (299.9, "DM 100-300"),
+    (300.0, "DM 300-500"), (699.0, "DM 500-700"), (899.0, "DM 700-900"),
+    (950.0, "DM > 900"), (None, "DM > 900"),
+])
+def test_dm_bucket_edges_are_half_open(dm, label):
+    assert inject_slack.dm_bucket(dm)[0] == label
+
+
+def test_dm_bins_come_from_config():
+    icfg = {"summary_dm_bins": [200.0, 600.0]}
+    assert inject_slack.dm_bin_labels(icfg) == [
+        "DM < 200", "DM 200-600", "DM > 600"]
+    assert inject_slack.dm_bucket(400.0, icfg)[0] == "DM 200-600"
+    assert inject_slack.dm_bucket(50.0, icfg)[0] == "DM < 200"
+
+
+def test_summary_per_dm_line_uses_the_configured_bins():
+    rows = [dict(RECOVERED_ROW, dm=150.0), dict(RECOVERED_ROW, dm=850.0)]
+    text = inject_slack.summary_text(rows, "2026-09-10")
+    assert "per DM: DM 100-300: 1/1 | DM 700-900: 1/1" in text

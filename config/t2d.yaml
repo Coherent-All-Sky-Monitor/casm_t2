@@ -195,14 +195,34 @@ context:                # T1 neighbourhood embedded in trigger cards
 injection:
   cadence_min: 120
   streams: [0, 1, 2, 3]
-  dm_range: [100.0, 1000.0]
-  # The sampled quantity is the INJECTED (true, analytic) S/N of the pulse:
-  # what it really is, not how hella chooses to report it. The amplitude is
-  # solved straight from it and the live beam std (Redis bf_proc_stat), with
-  # no table in the loop. Log-uniform. amp_range is the fallback used only if
-  # this is absent; its 25-45 counts predate Route Z and would now give S/N of
-  # several hundred (casm-wiki injection-saturation.md).
-  inject_snr_range: [12.0, 18.0]
+  # Shot parameters, one entry per drawn quantity. Each is
+  #   {dist: uniform|loguniform|choice|fixed, ...}
+  # with lo/hi for the two ranges, `values` (and optional `weights`) for
+  # choice, `value` for fixed. Manual CLI flags still override any of them.
+  #
+  # dm         uniform over hella's searched grid, widened to 900 on
+  #            2026-09-10; anything drawn outside [0, 1000] is clamped.
+  # fwhm_ms    LOG-uniform so the powers-of-two search trials are exercised
+  #            evenly: a uniform draw over 2.5-30 ms would put two thirds of
+  #            the shots on the two widest trials. Aim: hella trials ibox 1-5
+  #            (kernel FWHM 1.0, 3.1, 5.2, 11.5, 22.0 ms; casm_t2.hella_kernel).
+  #            ibox 6 (45.1 ms) is dropped by t2d's width veto, so 30 ms is
+  #            the ceiling. The floor is NOT a choice: the generator floors
+  #            the rendered pulse at sigma = 1 sample, so nothing narrower
+  #            than FWHM 2.469 ms exists and a smaller draw is clamped up.
+  # inject_snr the INJECTED (true, analytic) S/N of the pulse: what it really
+  #            is, not how hella reports it. The amplitude is solved straight
+  #            from it and the live beam std, with no table in the loop.
+  #
+  # For a calibration run, express the grid instead of a range, e.g.
+  #   fwhm_ms:    {dist: choice, values: [3.0, 8.0, 20.0]}
+  #   inject_snr: {dist: fixed,  value: 15.0}
+  sample:
+    dm:         {dist: uniform,    lo: 100.0, hi: 900.0}
+    fwhm_ms:    {dist: loguniform, lo: 2.5,   hi: 30.0}
+    inject_snr: {dist: loguniform, lo: 12.0,  hi: 18.0}
+  # DM bins for the daily summary's per-DM tally.
+  summary_dm_bins: [100.0, 300.0, 500.0, 700.0, 900.0]
   # Ceiling on the PREDICTED reported S/N (injected * rec_per_true). Over it,
   # the injected S/N is scaled down to sit on the cap and the clamp is logged.
   # Above the ceiling the pulse fills hella's 10000-peak per-gulp candidate
@@ -222,29 +242,38 @@ injection:
   # hella-reported S/N / the ANALYTICAL matched-filter S/N the solver computes.
   # Not a constant: hella's matched trial is a smoothing kernel of FWHM about
   # 0.67 * 2**ibox samples over unit-variance rows, so the ratio falls as the
-  # pulse widens. Measured 2026-09-09 with the T1 subtraction OFF:
-  #   FWHM  4.7 ms -> 2.24                       (id 660)
-  #   FWHM 11.8 ms -> 1.85, 2.25, 2.15 -> 2.08   (ids 661, 663, 664)
-  #   FWHM 23.5 ms -> 1.22                       (id 662)
-  # Interpolated linearly in log FWHM, held flat outside the range. The two
-  # subtraction-ON shots the same day (657, 659, both FWHM 11.8 ms) gave 1.44
-  # and 1.30 instead; do not mix them into this table while subtraction is off.
+  # pulse widens.
+  #
+  # Seeded 2026-09-10 for IB subtraction ON, which is the standing state.
+  # MEASURED at FWHM 11.8 ms only, from the four clean sub-ON shots:
+  #   657 60.2/41.7 = 1.44   659 25.8/19.8 = 1.30
+  #   665 22.8/15.2 = 1.50   667 24.6/24.8 = 0.99   -> mean 1.31
+  # (666 excluded: fired 2.5 min after a bfcorr restart on a stale Redis std.)
+  # The 4.7 and 23.5 ms points are NOT measured with subtraction on. They are
+  # the mid value SCALED by the shape of the sub-OFF sweep, which had
+  # 2.24 @4.7, 2.08 @11.8, 1.22 @23.5, i.e. narrow/mid 1.08 and wide/mid 0.59.
+  # Treat them as a starting guess until a sub-ON width sweep exists; the
+  # spread of the four mid-width points alone is 0.99-1.50.
   rec_per_true_table:
-    - [4.7, 2.24]
-    - [11.8, 2.08]
-    - [23.5, 1.22]
+    - [4.7, 1.40]             # scaled, not measured with subtraction on
+    - [11.8, 1.30]            # measured, 4 shots
+    - [23.5, 0.77]            # scaled, not measured with subtraction on
   # Fallback when rec_per_true_table is absent; the pre-table scalar.
   rec_per_true: 1.30
+  # Live-std staleness guard. A beamformer restart leaves whatever std was
+  # last published sitting in Redis, and Redis carries no timestamp for these
+  # keys (the age query_live_noise_std returns is the LOCAL cache age, always
+  # 0 on the force_refresh path). So: a restart within max_std_age_s means
+  # poll every std_poll_s until the value changes, which is proof the
+  # publisher is back, and give up after std_wait_s - skipping the shot as
+  # fire_failed rather than firing on a std we cannot trust. Injection 666
+  # was fired 2.5 min after a restart on a stale std and came out a factor
+  # low; it is excluded from the rec_per_true seed for that reason.
+  max_std_age_s: 30.0           # about 3 gulps
+  std_wait_s: 120.0
+  std_poll_s: 5.0
   nchan_usable: 2600            # 3072 minus the 472-channel 470-484 MHz mask
   amp_range: [25.0, 45.0]
-  # Injected width as FWHM, sampled LOG-uniformly so the powers-of-two trials
-  # are exercised evenly. Aim: hella trials ibox 0-5 (kernel FWHM 1.0, 1.0,
-  # 3.1, 5.2, 11.5, 22.0 ms; casm_t2.hella_kernel). ibox 6 (45.1 ms) is dropped
-  # by t2d's width veto, so 30 ms is the ceiling: it still sits nearest ibox 5.
-  # The floor is NOT a choice: make_noise_fil_with_frb_snr floors the rendered
-  # pulse at sigma = 1 sample with no argument to lower it, so nothing narrower
-  # than FWHM 2.469 ms can be generated and ibox 0 is out of reach.
-  fwhm_ms_range: [2.5, 30.0]
   scratch_dir: /mnt/nvme5/casm_pipeline/injections
   # Slack posting for injections. SHIPS DISABLED: with enabled false the
   # daemon posts nothing and behaves exactly as it did before. Set

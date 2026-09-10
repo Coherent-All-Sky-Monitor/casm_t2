@@ -175,9 +175,12 @@ a whole UTC day (`--day`). `--web-base` sets the host the links point at.
 The messages:
 
     injection 660 sent: beam 150, DM 300, FWHM 4.7 ms, injected S/N 28
+    injection 671 sent: beam 90, DM 300, FWHM 11.8 ms, injected S/N 16 (IB sub off)
     recovered -> <.../injections/plot/inj_..._b150|inj_..._b150> | SNR 43.0 (ratio 1.54) | DM 299.8 (delta -0.2) | beam 150 | width 3.1 ms (ibox 2)
 
-The link goes to the shot's truth plot on the T3 web app; a shot whose
+Incoherent-beam subtraction is normally on and says nothing; only the
+unusual state is called out. The link goes to the shot's truth plot on the
+T3 web app; a shot whose
 cluster triggered a dump links to its event page instead, which carries the
 dump, the plot and the trigger audit. `injection.slack.web_base` sets the
 base URL, defaulting to `http://127.0.0.1:8050` like t3-collect's

@@ -72,8 +72,19 @@ def make_injection_files(dm: float, amp: float, sigma_ms: float, local_beam: int
     return dada, est_snr
 
 
+def read_live_std(beam: int) -> float:
+    """The live per-channel std of one beam, straight from Redis."""
+    import sys
+    sys.path.insert(0, str(Path(MAKE_NOISE).parent))
+    import make_noise_fil_with_frb_snr as mn  # noqa: E402
+    _, sigma_n, _, _, _ = mn.query_live_noise_std(beam, "bf_proc_stat",
+                                                  force_refresh=True)
+    return float(sigma_n)
+
+
 def amp_for_target_snr(target_snr: float, sigma_ms: float, beam: int,
-                       nchan_usable: int = 2880) -> tuple[float, float]:
+                       nchan_usable: int = 2880,
+                       std: float | None = None) -> tuple[float, float]:
     """Pulse amplitude in stream counts for a target matched-filter S/N.
 
     Analytical Gaussian matched filter over nchan independent channels
@@ -84,11 +95,7 @@ def amp_for_target_snr(target_snr: float, sigma_ms: float, beam: int,
     is rounded and floored at 1 count. Returns (amp_counts, sigma_n).
     """
     import math
-    import sys
-    sys.path.insert(0, str(Path(MAKE_NOISE).parent))
-    import make_noise_fil_with_frb_snr as mn  # noqa: E402
-    _, sigma_n, _, _, _ = mn.query_live_noise_std(beam, "bf_proc_stat",
-                                                   force_refresh=True)
+    sigma_n = read_live_std(beam) if std is None else float(std)
     sigma_t = max(sigma_ms / 1.048576, 1.0)
     amp = target_snr * sigma_n / (math.sqrt(nchan_usable) * math.sqrt(sigma_t * math.sqrt(math.pi)))
     return float(max(1, round(amp))), float(sigma_n)
@@ -101,6 +108,10 @@ FWHM_PER_SIGMA = inject_calib.FWHM_PER_SIGMA
 MIN_RENDERABLE_FWHM_MS = inject_calib.MIN_RENDERABLE_FWHM_MS
 sample_fwhm_ms = inject_calib.sample_fwhm_ms
 sample_inject_snr = inject_calib.sample_inject_snr
+draw = inject_calib.draw
+sample_spec = inject_calib.sample_spec
+clamp_fwhm_ms = inject_calib.clamp_fwhm_ms
+clamp_dm = inject_calib.clamp_dm
 rec_per_true = inject_calib.rec_per_true
 reported_snr_cap = inject_calib.reported_snr_cap
 clamp_inject_snr = inject_calib.clamp_inject_snr
@@ -141,6 +152,126 @@ WINDOW_HI_S = 90.0
 def dm_tolerance(dm: float) -> float:
     """DM half-width for a match, for clusters and raw trials alike."""
     return max(0.15 * dm, 5.0)
+
+
+BFCORR_LOG = "/data/casm/logs/antenna_bfcorr.log"
+
+_BFCORR_START_RE = re.compile(r"START casm_bfcorr\b")
+_BFCORR_STAMP_RE = re.compile(r"\[([0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9:.]+)\]")
+
+
+def _bfcorr_starts(log_path) -> list[tuple[datetime | None, str]]:
+    """Every ``START casm_bfcorr`` line as (timestamp, line), file order.
+
+    The log interleaves the antenna nodes, so the last LINE is not the
+    latest start - node 1 can log after node 5 has already restarted.
+    Callers must sort on the timestamp, not take the tail.
+    """
+    out: list[tuple[datetime | None, str]] = []
+    try:
+        with open(log_path, errors="replace") as fh:
+            for line in fh:
+                if not _BFCORR_START_RE.search(line):
+                    continue
+                m = _BFCORR_STAMP_RE.search(line)
+                stamp = None
+                if m:
+                    try:
+                        stamp = timing.parse_dada_utc(m.group(1))
+                    except ValueError:
+                        stamp = None
+                out.append((stamp, line))
+    except OSError as exc:
+        logger.debug("bfcorr log unreadable (%s): %s", log_path, exc)
+    return out
+
+
+class StaleStdError(RuntimeError):
+    """The live beam std could not be trusted in time; skip the shot."""
+
+    def __init__(self, age_s: float):
+        self.age_s = float(age_s)
+        super().__init__(f"live std stale (age {self.age_s:.0f} s)")
+
+
+def wait_for_fresh_std(beam: int, icfg: dict, reader=None, now=None,
+                       sleep=None, log_path=BFCORR_LOG) -> tuple[float, float]:
+    """The live std of `beam`, once it can be trusted. Returns (std, age_s).
+
+    What makes the std untrustworthy is a beamformer restart: the value in
+    Redis is whatever was last published, and after a restart it can sit
+    unchanged for minutes while the publisher comes back. Injection 666 was
+    fired 2.5 min after a restart on exactly that stale value and came out
+    a factor low.
+
+    Redis carries no timestamp for these keys, and the `age_s` that
+    query_live_noise_std returns is the age of the LOCAL cache - it is
+    always 0.0 on the force_refresh path the daemon uses, so it cannot see
+    this. Freshness is therefore decided two ways:
+
+      * no restart within `max_std_age_s` -> the value is trusted at once,
+        which is the normal case and costs one Redis read;
+      * a recent restart -> poll every 5 s until the value CHANGES, which is
+        proof the publisher is running again, giving up after `std_wait_s`.
+
+    Raises StaleStdError when the wait runs out.
+    """
+    import time as _time
+    now = now or (lambda: datetime.now(timezone.utc))
+    sleep = sleep or _time.sleep
+    reader = reader or (lambda: read_live_std(beam))
+    max_age = float(icfg.get("max_std_age_s", 30.0))
+    wait_s = float(icfg.get("std_wait_s", 120.0))
+    poll_s = float(icfg.get("std_poll_s", 5.0))
+
+    first = reader()
+    started = last_bfcorr_start(log_path)
+    if started is None:
+        return float(first), 0.0
+    age = (now() - started).total_seconds()
+    if age > max_age:
+        return float(first), float(age)
+
+    logger.warning("beam %d: beamformer restarted %.0f s ago (max_std_age_s "
+                   "%.0f); waiting for the live std to be republished",
+                   beam, age, max_age)
+    waited = 0.0
+    while waited < wait_s:
+        sleep(poll_s)
+        waited += poll_s
+        value = reader()
+        if value != first:
+            logger.info("beam %d: live std republished after %.0f s "
+                        "(%.2f -> %.2f)", beam, waited, first, value)
+            return float(value), float(age + waited)
+    raise StaleStdError(age + waited)
+
+
+def current_sub_incoh(log_path=BFCORR_LOG) -> int | None:
+    """Is incoherent-beam subtraction on right now? 1 / 0, or None if unknown.
+
+    Read from the most recent ``START casm_bfcorr`` line in the beamformer
+    log: the flag is a command-line argument, so the latest start is the
+    current state. Returns None when the log cannot be read or holds no
+    start line - never a guess, because the S/N calibration differs between
+    the two states and a wrong label is worse than no label.
+    """
+    starts = _bfcorr_starts(log_path)
+    if not starts:
+        return None
+    dated = [(t, ln) for t, ln in starts if t is not None]
+    line = max(dated, key=lambda tl: tl[0])[1] if dated else starts[-1][1]
+    return int("--sub_incoh" in line)
+
+
+def last_bfcorr_start(log_path=BFCORR_LOG) -> datetime | None:
+    """UTC of the most recent beamformer start, or None.
+
+    A restart is what leaves a stale per-beam std in Redis, so this is the
+    clock the staleness guard runs on.
+    """
+    stamps = [t for t, _ in _bfcorr_starts(log_path) if t is not None]
+    return max(stamps) if stamps else None
 
 
 def injection_neighbours(cfg: dict, utc: datetime, beam: int) -> tuple[set[int], bool]:
@@ -419,14 +550,18 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
             local_beam = int(force["beam"]) % 64
             stream = int(force["beam"]) // 64
         beam = stream * 64 + local_beam
-        dm = force.get("dm") or random.uniform(*icfg.get("dm_range", [100.0, 1000.0]))
+        # Shot parameters come from the `sample:` block; a CLI flag overrides.
+        dm = clamp_dm(force.get("dm")
+                      or sample_spec(icfg, "dm", random, "dm_range"))
         # Widths are FWHM everywhere except the generator call and the
         # sigma_ms ledger column, both of which want the Gaussian sigma.
-        fwhm_ms = force.get("fwhm_ms") or sample_fwhm_ms(
-            random, *icfg.get("fwhm_ms_range", [2.5, 30.0]))
+        fwhm_ms = clamp_fwhm_ms(
+            force.get("fwhm_ms")
+            or sample_spec(icfg, "fwhm_ms", random, "fwhm_ms_range"))
         sigma_ms = fwhm_ms / FWHM_PER_SIGMA
         solve = (force.get("inject_snr") is not None
                  or force.get("target_snr") is not None
+                 or (icfg.get("sample") or {}).get("inject_snr") is not None
                  or "inject_snr_range" in icfg or "target_rec_snr_range" in icfg)
         if solve:
             # The sampled quantity is the INJECTED (true, analytic) S/N: that
@@ -440,20 +575,46 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
             elif force.get("target_snr") is not None:
                 # manual shot given as a reported S/N: undo the table
                 inject_snr = float(force["target_snr"]) / rec_per_true(fwhm_ms, icfg)
-            elif "inject_snr_range" in icfg:
-                inject_snr = sample_inject_snr(random, *icfg["inject_snr_range"])
-            else:
+            elif "target_rec_snr_range" in icfg and not (
+                    (icfg.get("sample") or {}).get("inject_snr")):
                 # legacy config expressed as a reported-S/N range
                 inject_snr = random.uniform(
                     *icfg["target_rec_snr_range"]) / rec_per_true(fwhm_ms, icfg)
+            else:
+                inject_snr = sample_spec(icfg, "inject_snr", random,
+                                         "inject_snr_range")
             # Only the REPORTED S/N saturates hella, so predict it from the
             # per-width table and scale the injection down if it is over the
             # ceiling for this width.
             inject_snr, target_rec, clamped = clamp_inject_snr(
                 inject_snr, fwhm_ms, icfg)
             nchan_usable = int(icfg.get("nchan_usable", 2880))
+            try:
+                std, std_age = await asyncio.to_thread(
+                    wait_for_fresh_std, beam, icfg)
+            except StaleStdError as exc:
+                # Do not fire on a std we cannot trust: the amplitude would
+                # be wrong by whatever the std has drifted, and the shot
+                # would pollute the calibration it is meant to measure.
+                logger.error("injection skipped: %s", exc)
+                now = datetime.now(timezone.utc)
+                with conn:
+                    conn.execute(
+                        "INSERT INTO injections (inject_utc, stream, beam, dm,"
+                        " amp, sigma_ms, file_id, created_utc, fail_reason,"
+                        " outcome, sub_incoh) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        (now.isoformat(timespec="milliseconds"), stream, beam,
+                         dm, 0.0, sigma_ms, "", 
+                         now.isoformat(timespec="milliseconds"),
+                         f"live std stale (age {exc.age_s:.0f} s)",
+                         inject_outcome.FIRE_FAILED, current_sub_incoh()))
+                if once:
+                    return
+                i += 1
+                await asyncio.sleep(cadence_s)
+                continue
             amp, sigma_n = amp_for_target_snr(
-                inject_snr, sigma_ms, beam, nchan_usable)
+                inject_snr, sigma_ms, beam, nchan_usable, std=std)
             logger.info("injected S/N %.1f at FWHM %.1f ms (predicted reported "
                         "%.1f at rec_per_true %.2f, cap %.1f%s), live std %.2f "
                         "-> amp %.0f counts",
@@ -461,6 +622,9 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
                         rec_per_true(fwhm_ms, icfg),
                         reported_snr_cap(fwhm_ms, icfg),
                         ", CLAMPED" if clamped else "", sigma_n, amp)
+            if std_age:
+                logger.info("live std age %.0f s (max_std_age_s %.0f)",
+                            std_age, float(icfg.get("max_std_age_s", 30.0)))
         else:
             amp = random.uniform(*icfg.get("amp_range", [25.0, 45.0]))
             inject_snr = target_rec = sigma_n = nchan_usable = None
@@ -481,10 +645,11 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
             cur = conn.execute(
                 "INSERT INTO injections (inject_utc, stream, beam, dm, amp, sigma_ms,"
                 " est_snr, file_id, created_utc, target_snr, inject_snr, sigma_n,"
-                " nchan_usable) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " nchan_usable, sub_incoh) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (now.isoformat(timespec="milliseconds"), stream, beam, dm, amp,
                  sigma_ms, est_snr, file_id, now.isoformat(timespec="milliseconds"),
-                 target_rec, inject_snr, sigma_n, nchan_usable))
+                 target_rec, inject_snr, sigma_n, nchan_usable,
+                 current_sub_incoh()))
             inj_id = cur.lastrowid
         fifo = f"/tmp/beaminj.fifo.{stream}"
         try:

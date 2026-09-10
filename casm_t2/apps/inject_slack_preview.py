@@ -35,7 +35,8 @@ def _rows(conn, ids: list[int] | None, day: str) -> list[dict]:
 
 
 def preview(conn, ids: list[int] | None, day: str, out_dir: Path,
-            web_base: str = inject_slack.DEFAULT_WEB_BASE) -> list[Path]:
+            web_base: str = inject_slack.DEFAULT_WEB_BASE,
+            icfg: dict | None = None) -> list[Path]:
     """Write every message and figure into out_dir; returns the paths."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -49,7 +50,7 @@ def preview(conn, ids: list[int] | None, day: str, out_dir: Path,
     # to keep the reviewable files at the top level.
     poster = inject_slack.SlackPoster(enabled=True,
                                       dry_run_dir=out_dir / "dry_run",
-                                      web_base=web_base)
+                                      web_base=web_base, icfg=icfg)
 
     for row in rows:
         rid = row.get("id")
@@ -68,8 +69,8 @@ def preview(conn, ids: list[int] | None, day: str, out_dir: Path,
             line, color, out_dir / f"inj{rid}_outcome.png"))
 
     written.append(_write(out_dir / "summary.txt",
-                          inject_slack.summary_text(rows, day)))
-    written.extend(inject_slack.render_summary_figures(rows, out_dir))
+                          inject_slack.summary_text(rows, day, icfg)))
+    written.extend(inject_slack.render_summary_figures(rows, out_dir, icfg))
 
     n, sids, why = _streak(rows)
     if n:
@@ -110,13 +111,19 @@ def main() -> None:
     p.add_argument("--day", help="UTC day YYYY-MM-DD (default: today)")
     p.add_argument("--web-base", default=inject_slack.DEFAULT_WEB_BASE,
                    help="base URL of the t3 web app, for the recovered link")
+    p.add_argument("--config", help="t2d.yaml, for the summary DM bins")
     args = p.parse_args()
 
     ids = [int(x) for x in args.ids.split(",") if x.strip()] if args.ids else None
     day = args.day or inject_slack.utc_day()
     conn = db.connect(args.db)
     try:
-        paths = preview(conn, ids, day, Path(args.out), args.web_base)
+        icfg = None
+        if args.config:
+            import yaml
+            with open(args.config) as fh:
+                icfg = (yaml.safe_load(fh) or {}).get("injection")
+        paths = preview(conn, ids, day, Path(args.out), args.web_base, icfg)
     finally:
         conn.close()
     for path in paths:

@@ -136,6 +136,7 @@ CREATE TABLE IF NOT EXISTS injections (
     rec_lead_s    REAL,              -- cluster event_utc minus inject_utc, s
     rec_offset_arcsec REAL,          -- injected vs recovered beam pointing, arcsec
     n_t1_trials   INTEGER,           -- raw T1 trials matching the shot when no cluster did
+    sub_incoh     INTEGER,           -- IB subtraction on (1) / off (0) at fire time; NULL unknown
     slack_ts      TEXT,              -- ts of the Slack "sent" message, if posted
     outcome       TEXT               -- casm_t2.inject_outcome enum
 );
@@ -190,6 +191,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
                       ("rec_beam", "INTEGER"), ("rec_samp", "INTEGER"),
                       ("rec_lead_s", "REAL"),
                       ("rec_offset_arcsec", "REAL"), ("n_t1_trials", "INTEGER"),
+                      ("sub_incoh", "INTEGER"),
                       ("slack_ts", "TEXT"),
                       ("outcome", "TEXT")]:
         if icols and col not in icols:

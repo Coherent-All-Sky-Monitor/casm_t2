@@ -258,6 +258,7 @@ working from and what the matched cluster looked like:
 | rec_lead_s | cluster event time minus inject_utc, seconds |
 | rec_offset_arcsec | sky separation of the injected and recovered beams; shown only when they differ |
 | n_t1_trials | raw T1 trials matching the shot, counted only when no cluster did (NULL = not looked at, or the file was unreadable) |
+| sub_incoh | incoherent-beam subtraction on (1) / off (0) at fire time, from the beamformer log; NULL unknown |
 | slack_ts | ts of the Slack message for this shot, when posting is on |
 | outcome | closed enum, below |
 
@@ -325,6 +326,47 @@ prints it verbatim:
     lost at T1: no matching trial in beam 200 (+-2) within the window at DM 500 (+-75)
     lost at T1: no cluster in the window in beam 200 (+-2) at DM 500 (+-75) (T1 file unavailable (cands_....dat.3 not found))
 
+### Shot parameters
+
+Every drawn parameter is one entry in `injection.sample`, so what is being
+injected is readable in one place instead of spread over three range keys
+with three different implied distributions:
+
+```yaml
+sample:
+  dm:         {dist: uniform,    lo: 100.0, hi: 900.0}
+  fwhm_ms:    {dist: loguniform, lo: 2.5,   hi: 30.0}
+  inject_snr: {dist: loguniform, lo: 12.0,  hi: 18.0}
+```
+
+`dist` is `uniform`, `loguniform`, `choice` (with `values` and optional
+`weights`) or `fixed` (with `value`). `casm_t2.inject_calib.draw` validates
+the spec and raises on anything malformed - a bad spec should stop the
+daemon, not quietly inject at the wrong brightness for a week. The old
+`dm_range` / `fwhm_ms_range` / `inject_snr_range` keys still work and warn.
+The manual flags `--dm`, `--fwhm-ms` and `--inject-snr` override any of it.
+
+A calibration run is the same block expressed as a grid, which is the point
+of `choice` and `fixed`:
+
+```yaml
+sample:
+  fwhm_ms:    {dist: choice, values: [3.0, 8.0, 20.0]}
+  inject_snr: {dist: fixed,  value: 15.0}
+  dm:         {dist: fixed,  value: 300.0}
+```
+
+Two clamps are applied after the draw, both logged: FWHM at
+`MIN_RENDERABLE_FWHM_MS` (2.469 ms, the generator's own floor) and DM to
+hella's searched grid [0, 1000]. A draw outside either is a config that
+asked for something that cannot exist, so it is corrected and said out loud
+rather than silently rendered as something else.
+
+`injection.summary_dm_bins` gives the edges of the daily summary's per-DM
+tally and of the recovery figure's colour/marker bins; it defaults to
+`[100, 300, 500, 700, 900]`, matching the sampled DM range, with an
+under- and an over-flow bin so a DM outside the range still lands somewhere.
+
 ### Width
 
 Widths are FWHM everywhere a human reads them. The ledger column is still
@@ -379,6 +421,33 @@ falls as the pulse widens (2.24 at FWHM 4.7 ms, 2.08 at 11.8, 1.22 at 23.5,
 measured 2026-09-09 with T1 subtraction off). `rec_per_true_table` holds
 those pairs and the daemon interpolates linearly in log FWHM, holding the
 end values flat.
+
+### The live std, and what makes it stale
+
+The amplitude is solved from the beam's per-channel std read live from Redis
+(`bf_proc_stat`). What makes that value untrustworthy is a beamformer
+restart: Redis keeps whatever was last published, and after a restart it can
+sit unchanged for minutes. Injection 666 was fired 2.5 min after a restart on
+exactly such a value and came out a factor low; it is excluded from the
+`rec_per_true` seed for that reason.
+
+Redis carries no timestamp for these keys - `ts_hi`/`ts_lo` are PNG
+timeseries plots, not times - and the `age_s` that `query_live_noise_std`
+returns is the age of the *local disk cache*, which is always 0.0 on the
+`force_refresh` path the daemon uses. So freshness is decided from the
+beamformer log instead: no `START casm_bfcorr` within `max_std_age_s` and the
+value is trusted at once (the normal case, one Redis read); a recent restart
+and the daemon polls every `std_poll_s` until the value *changes*, which is
+proof the publisher is running again, giving up after `std_wait_s` and
+recording the shot as `fire_failed` with
+`live std stale (age N s)` rather than firing on a number it cannot trust.
+
+The same log gives `sub_incoh`, the incoherent-beam subtraction state at fire
+time, taken from the flag on the most recent start. The log interleaves the
+antenna nodes, so "most recent" means the largest timestamp, not the last
+line. The state matters because the reported/true S/N ratio differs between
+them: a Slack summary covering a day that mixes states splits its ratio line
+by state rather than averaging two different calibrations together.
 
 ### The saturation cap
 
