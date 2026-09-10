@@ -236,7 +236,12 @@ class T2Daemon:
             samp_scale=cc.get("samp_scale", 64.0),
             dm_idx_scale=cc.get("dm_idx_scale", 32.0),
             width_scale=cc.get("width_scale", 2.0),
+            sky_scale_deg=cc.get("sky_scale_deg", 4.4),
             beam_scale=cc.get("beam_scale", 4.0))
+        # Pointing tables, one per weights product, built lazily and reused:
+        # the table only changes when weights are uploaded (days apart), so a
+        # gulp costs one registry lookup and a dict hit.
+        self._sky_tables: dict[str, cluster.SkyTable] = {}
 
         tiers = cfg.get("tiers", {})
         self.tier_a = tiers.get("A", 30.0)
@@ -247,6 +252,12 @@ class T2Daemon:
         filt = cfg.get("filters", {})
         self.veto = set(filt.get("beam_veto", []))
         self.max_nbeam = filt.get("max_nbeam", 32)
+        # Sky-extent RFI cut (2026-09-09). n_beams alone is a count, not a
+        # footprint: on the non-sky-ordered beam grid a broadband burst lighting
+        # up 20 beams all over the sky never reached max_nbeam. A real source
+        # spans at most ~2 beam spacings (8 deg), so anything wider than this is
+        # not one source. 0 disables.
+        self.max_sky_extent_deg = float(filt.get("max_sky_extent_deg", 25.0))
         self.dm_floor = filt.get("dm_floor", 20.0)
         # DM-floor veto (2026-09-09): a bright zero-DM impulse of 10-20 ms
         # still gives S/N ~20 at the lowest DM trial (the dedispersed smear
@@ -317,6 +328,25 @@ class T2Daemon:
         self.ctx_max_members = ctx.get("max_members", 3000)
         self.context: deque[tuple[float, int, float, float, int]] = deque(maxlen=400_000)
 
+        # Gulp coalescing (2026-09-09). The eight hella jobs finish seconds
+        # apart, so a fixed hold after the FIRST batch split gulps into
+        # fragments and every per-gulp veto (occupancy footprint, the dm_floor
+        # coincidence spread, gulp_dup suppression) only ever saw its own
+        # fragment — how 260910fkmpyt dumped at 00:06:37 while the DM-floor
+        # fragment of the same impulse sat in another fragment. A key now
+        # flushes when all expected jobs have reported (and the short quiet
+        # hold has passed), or at coalesce_max_s, whichever comes first.
+        self.coalesce_s = float(cfg.get("coalesce_s", 0.25))
+        self.coalesce_jobs = int(cfg.get(
+            "coalesce_jobs", len(cfg.get("ports", list(range(12345, 12353))))))
+        # One gulp length. A job that has not reported within a whole gulp
+        # of the first one is stuck, not slow, and the dump ring cannot
+        # absorb the wait: the observed successful event-to-request lag is
+        # 36.5-50.8 s (207 dumps since 2026-09-01, mean 43.7; the one failure
+        # was at 206 s), and hella's own 13-25 s reporting delay already
+        # spends most of that budget.
+        self.coalesce_max_s = float(cfg.get("coalesce_max_s", 8.0))
+
         self.conn = db.connect(cfg.get("db", db.DEFAULT_PATH))
         # Beam pointings come from the weights live at the event time
         # (casm_t2.weights_registry); never from a static table.
@@ -324,6 +354,16 @@ class T2Daemon:
             cfg.get("weights_registry", weights_registry.REGISTRY_DIR))
         self.pending: dict[tuple, list[wire.Candidate]] = defaultdict(list)
         self.pending_jobs: dict[tuple, int] = {}
+        # coalescer bookkeeping: when the key opened, when its last batch
+        # landed, and an event the waiter sleeps on so a new batch wakes it
+        self.pending_first: dict[tuple, float] = {}
+        self.pending_last: dict[tuple, float] = {}
+        self.pending_event: dict[tuple, asyncio.Event] = {}
+        # keys already flushed, with the monotonic time of the flush, so a
+        # batch that arrives afterwards can be recognised and counted
+        self._flushed: dict[tuple, float] = {}
+        self.n_late_batches = 0
+        self.n_skipped_gulps = 0
         # width-vetoed trials per coalescer key: filtered per batch in
         # _handle, reported per gulp by _flush_later
         self.pending_vetoed: dict[tuple, int] = {}
@@ -394,11 +434,28 @@ class T2Daemon:
                 self.context.append((epoch + c.samp * tsamp, c.beam, c.dm, c.snr, c.width))
         if self.fast_path and cands:
             self._spawn(self._fast_path(dataclasses.replace(batch, cands=cands)))
+        now_mono = time.monotonic()
         first = key not in self.pending
+        if first and key in self._flushed:
+            # A ninth-or-later batch, or a batch after the coalesce timeout.
+            # It opens a fresh pending entry with the same key and is processed
+            # as its own (fragment) gulp, exactly as before — but it is no
+            # longer silent: it means a hella job is running late enough that
+            # the per-gulp vetoes did not see it.
+            self.n_late_batches += 1
+            logger.warning("late batch for gulp %s (job %d, %d candidates) "
+                           "%.1f s after that gulp flushed; it becomes its own "
+                           "fragment (occurrence %d)", key, job, len(cands),
+                           now_mono - self._flushed[key], self.n_late_batches)
         self.pending[key].extend(cands)
         self.pending_jobs[key] = self.pending_jobs.get(key, 0) + 1
+        self.pending_last[key] = now_mono
         if first:
+            self.pending_first[key] = now_mono
+            self.pending_event[key] = asyncio.Event()
             self._spawn(self._flush_later(key))
+        else:
+            self.pending_event[key].set()
 
     def _log_ingest_error(self, exc: BaseException) -> None:
         """Rate-limited ingest-error log: first of each kind, then every 100th.
@@ -419,25 +476,84 @@ class T2Daemon:
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
 
+    async def _wait_for_jobs(self, key: tuple) -> tuple[float, bool]:
+        """Hold a coalescer key open until the gulp is complete, or time out.
+
+        Returns (wait in seconds, whether all expected jobs reported). Two
+        deadlines race: all ``coalesce_jobs`` jobs reported AND ``coalesce_s``
+        of quiet since the last batch (the normal path), or ``coalesce_max_s``
+        since the key opened (a job died, is wedged, or never sent). The
+        waiter sleeps on an Event that every later batch sets, so a slow gulp
+        costs one wakeup per batch rather than a poll.
+
+        Completeness is read at exit, not inferred from which deadline fired:
+        a gulp whose batches keep trickling in can reach the maximum wait
+        with every job present, and that is a complete gulp.
+        """
+        ev = self.pending_event[key]
+        t0 = self.pending_first[key]
+        while True:
+            now = time.monotonic()
+            max_left = self.coalesce_max_s - (now - t0)
+            if max_left <= 0:
+                break
+            quiet_left = self.coalesce_s - (now - self.pending_last[key])
+            complete = self.pending_jobs.get(key, 0) >= self.coalesce_jobs
+            if complete and quiet_left <= 0:
+                break
+            timeout = min(max_left, quiet_left) if quiet_left > 0 else max_left
+            ev.clear()
+            try:
+                await asyncio.wait_for(ev.wait(), timeout=max(timeout, 0.0))
+            except asyncio.TimeoutError:
+                pass
+        return (time.monotonic() - t0,
+                self.pending_jobs.get(key, 0) >= self.coalesce_jobs)
+
     async def _flush_later(self, key: tuple) -> None:
-        await asyncio.sleep(self.cfg.get("coalesce_s", 2.0))
+        waited, complete = await self._wait_for_jobs(key)
+        coalesce_wait_ms = waited * 1e3
         cands = self.pending.pop(key, [])
         n_jobs = self.pending_jobs.pop(key, 0)
+        self.pending_first.pop(key, None)
+        self.pending_last.pop(key, None)
+        self.pending_event.pop(key, None)
+        # remember the flush so a later batch under the same key is spotted;
+        # keep the map bounded (a gulp key is never revisited after minutes)
+        self._flushed[key] = time.monotonic()
+        if len(self._flushed) > 512:
+            cutoff = time.monotonic() - 300
+            for k in [k for k, t in self._flushed.items() if t < cutoff]:
+                self._flushed.pop(k, None)
         # already applied per batch in _handle; this is the gulp total
         n_vetoed = self.pending_vetoed.pop(key, 0)
+        utc_start_s, gulp = key
+        if not complete:
+            # An incomplete gulp is DROPPED, not clustered on partial sky
+            # (2026-09-09, Vishnu). Every per-gulp veto — the occupancy
+            # footprint, the DM-floor coincidence spread, one-dump-per-gulp —
+            # reasons about the whole sky, and running them over a fraction of
+            # the jobs is how a broadband impulse dumps: the fragment that
+            # holds the bright beam does not hold the evidence against it.
+            self.n_skipped_gulps += 1
+            logger.warning("gulp %s skipped: only %d/%d jobs within %.1f s "
+                           "(%d candidates discarded, occurrence %d)",
+                           gulp, n_jobs, self.coalesce_jobs, waited,
+                           len(cands) + n_vetoed, self.n_skipped_gulps)
+            db.insert_gulp_stats(self.conn, utc_start_s or "", gulp,
+                                 self._gulp_utc(key), n_jobs,
+                                 len(cands) + n_vetoed, 0, 0, 0, 0.0,
+                                 n_vetoed=n_vetoed, n_shed=0,
+                                 coalesce_wait_ms=coalesce_wait_ms, skipped=1)
+            return
         if not cands:
             # quiet gulp: nothing survived from any job, but it was observed.
             # A gulp whose every trial was vetoed lands here too, so n_cands
             # is the veto count rather than zero.
-            utc_start_s, gulp = key
-            gulp_utc = ""
-            if utc_start_s:
-                utc_start = timing.parse_dada_utc(utc_start_s)
-                gulp_utc = timing.samp_to_utc(gulp * 8192, utc_start).isoformat(
-                    timespec="milliseconds")
-            db.insert_gulp_stats(self.conn, utc_start_s or "", gulp, gulp_utc,
-                                 n_jobs, n_vetoed, 0, 0, 0, 0.0,
-                                 n_vetoed=n_vetoed, n_shed=0)
+            db.insert_gulp_stats(self.conn, utc_start_s or "", gulp,
+                                 self._gulp_utc(key), n_jobs, n_vetoed,
+                                 0, 0, 0, 0.0, n_vetoed=n_vetoed, n_shed=0,
+                                 coalesce_wait_ms=coalesce_wait_ms)
             return
         # Beam footprint for the occupancy veto, from the FULL pre-shed set.
         footprint = (build_beam_footprint(cands)
@@ -468,12 +584,17 @@ class T2Daemon:
                         self.max_cands_per_gulp,
                         max(1, math.ceil(self.max_cands_per_gulp / BEAM_QUOTA_DIVISOR)),
                         BEAM_FLOOR, self._n_storm_caps)
+        # One pointing-table lookup per gulp, cached by weights id: DBSCAN
+        # clusters on sky position, not beam index.
+        sky = self._sky_table(key)
         t0 = time.monotonic()
-        clusters = await asyncio.to_thread(cluster.cluster_candidates, cands, self.params)
+        clusters = await asyncio.to_thread(cluster.cluster_candidates, cands,
+                                           self.params, sky)
         dt = time.monotonic() - t0
         try:
             await self._process(key, clusters, n_jobs, n_cands, dt * 1e3,
-                                n_vetoed, n_shed, footprint=footprint)
+                                n_vetoed, n_shed, footprint=footprint,
+                                coalesce_wait_ms=coalesce_wait_ms)
         except Exception:
             logger.exception("processing gulp %s failed", key)
 
@@ -581,7 +702,9 @@ class T2Daemon:
             tags.append("injection")
         if cl.peak.beam in self.veto:
             tags.append("veto")
-        if cl.n_beams > self.max_nbeam:
+        if (cl.n_beams > self.max_nbeam
+                or (self.max_sky_extent_deg > 0
+                    and cl.sky_extent_deg > self.max_sky_extent_deg)):
             tags.append("rfi_wide")
         if self._is_dm_floor_leak(cl):
             tags.append("dm_floor")
@@ -612,7 +735,7 @@ class T2Daemon:
                        n_jobs: int, n_cands: int, clustering_ms: float,
                        n_vetoed: int = 0, n_shed: int = 0,
                        footprint: tuple[list[int], list[int]] | None = None,
-                       ) -> None:
+                       coalesce_wait_ms: float = 0.0) -> None:
         utc_start_s, gulp = key
         utc_start = timing.parse_dada_utc(utc_start_s) if utc_start_s else None
         self._refresh_injections()
@@ -692,7 +815,8 @@ class T2Daemon:
                     .isoformat(timespec="milliseconds") if clusters and utc_start else "")
         db.insert_gulp_stats(self.conn, utc_start_s or "", gulp, gulp_utc, n_jobs,
                              n_cands, len(clusters), n_stored, len(to_trigger),
-                             clustering_ms, n_vetoed, n_shed)
+                             clustering_ms, n_vetoed, n_shed,
+                             coalesce_wait_ms=coalesce_wait_ms)
 
         # One dump per gulp: the same physical event can fragment into a few
         # clusters; fire only the strongest and audit the rest, so duplicates
@@ -720,8 +844,10 @@ class T2Daemon:
         now = datetime.now(timezone.utc)
         start_s, stop_s = timing.format_dada_utc(start), timing.format_dada_utc(stop)
 
-        logger.info("trigger candidate %s (%s): snr=%.1f dm=%.2f beam=%d nbeam=%d",
-                    name, reason, c.snr, c.dm, c.beam, cl.n_beams)
+        logger.info("trigger candidate %s (%s): snr=%.1f dm=%.2f beam=%d nbeam=%d "
+                    "sky_extent=%.1f deg",
+                    name, reason, c.snr, c.dm, c.beam, cl.n_beams,
+                    cl.sky_extent_deg)
 
         # Two ways to suppress a dump, both recording the decision in full so
         # the audit trail is identical to a live run: --shadow / shadow: true
@@ -805,6 +931,48 @@ class T2Daemon:
             logger.exception("weights registry lookup failed")
             return None
 
+    def _gulp_utc(self, key: tuple) -> str:
+        """ISO arrival time of a gulp's first sample, or '' without a UTC_START."""
+        utc_start_s, gulp = key
+        if not utc_start_s:
+            return ""
+        return timing.samp_to_utc(
+            int(gulp or 0) * 8192,
+            timing.parse_dada_utc(utc_start_s)).isoformat(timespec="milliseconds")
+
+    def _sky_table(self, key: tuple) -> cluster.SkyTable | None:
+        """Beam pointing table for one gulp, or None to fall back to beam index.
+
+        Resolved once per gulp from the weights live at the gulp's own start
+        time and cached by weights id, so the common case is a dict hit. A
+        registry that cannot name a single product for the time (no event,
+        partial deploy, unregistered payload) returns None: clustering then
+        degrades to the beam-index axis and tags nothing on a sky extent it
+        never measured. Fail-safe, never fail-shut.
+        """
+        utc_start_s, gulp = key
+        if not utc_start_s:
+            return None
+        try:
+            gulp_utc = timing.samp_to_utc(int(gulp or 0) * 8192,
+                                          timing.parse_dada_utc(utc_start_s))
+            pointings = self.registry.pointings_for(gulp_utc)
+        except Exception:
+            logger.exception("weights registry pointings lookup failed")
+            return None
+        if not pointings:
+            return None
+        wid = pointings.get("weights_id") or ""
+        table = self._sky_tables.get(wid)
+        if table is None:
+            table = cluster.SkyTable.from_pointings(pointings)
+            if table is None:
+                return None
+            self._sky_tables[wid] = table
+            logger.info("beam pointing table loaded for weights %s (%d beams)",
+                        wid or "<unnamed>", table.n)
+        return table
+
     def _pointings(self, event_utc: datetime | None) -> dict | None:
         if event_utc is None:
             return None
@@ -822,9 +990,10 @@ class T2Daemon:
         c = cl.peak
         # fast-path cards start as single trials; by now the cluster row
         # usually exists, so take the envelope numbers from it.
-        row = self.conn.execute("SELECT n_members, n_beams FROM clusters"
-                                " WHERE name = ?", (name,)).fetchone()
-        n_members, n_beams = row if row else (cl.n_members, cl.n_beams)
+        row = self.conn.execute("SELECT n_members, n_beams, sky_extent_deg"
+                                " FROM clusters WHERE name = ?", (name,)).fetchone()
+        n_members, n_beams, sky_extent = (
+            row if row else (cl.n_members, cl.n_beams, cl.sky_extent_deg))
         card = {
             "candname": name,
             "source": reason.split(":", 1)[1] if reason.startswith("known_source") else "blind",
@@ -838,6 +1007,9 @@ class T2Daemon:
             "samp": c.samp,
             "n_members": n_members,
             "n_beams": n_beams,
+            # largest pairwise sky separation of the cluster's beams, degrees;
+            # null when no pointing table was available at clustering time
+            "sky_extent_deg": sky_extent,
             "sky": self._sky(event_utc, c.beam, sun=True),
             # full pointing table of the weights live at the event, so the plotter on
             # either node can draw the footprint without reaching the registry
@@ -892,9 +1064,10 @@ class T2Daemon:
             mode = (" [SHADOW]" if self.shadow else
                     "" if self.dumps_enabled else " [DUMPS DISABLED]")
             logger.info("heartbeat: %d batches, %d cands -> %d clusters stored, "
-                        "%d trigger decisions (last minute)%s",
+                        "%d trigger decisions (last minute), %d gulps skipped "
+                        "incomplete / %d late batches (totals)%s",
                         self.n_batches, self.n_cands, self.n_clusters, n_trig,
-                        mode)
+                        self.n_skipped_gulps, self.n_late_batches, mode)
             self.n_batches = self.n_cands = self.n_clusters = 0
 
 

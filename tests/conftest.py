@@ -4,13 +4,58 @@ Nothing here opens a socket, sleeps, or touches the real database.
 """
 
 import asyncio
+import math
+import random
 from datetime import datetime, timezone
 
 import pytest
 
 from casm_t2 import db, timing
-from casm_t2.cluster import Cluster
+from casm_t2.cluster import Cluster, SkyTable
 from casm_t2.wire import Candidate
+
+SKY_ROWS, SKY_COLS, SKY_SPACING_DEG = 16, 32, 3.1
+
+
+def _synthetic_pointings(seed: int = 0) -> tuple[dict, dict]:
+    """A 512-beam pointing table whose index order is NOT sky order.
+
+    Beams sit on a 16 x 32 grid of 3.1 deg spacing about the zenith — the
+    real grid's spacing — but the grid cell each beam index lands on is a
+    seeded shuffle, so index adjacency says nothing about sky adjacency.
+    That is the property the deployed grid has (consecutive indices a median
+    16 deg apart) and the one every sky-clustering test needs.
+
+    Returns (pointings dict as weights_registry.pointings_for gives it,
+    {(row, col): beam}).
+    """
+    cells = [(r, c) for r in range(SKY_ROWS) for c in range(SKY_COLS)]
+    order = list(range(len(cells)))
+    random.Random(seed).shuffle(order)
+    alt = [0.0] * len(order)
+    az = [0.0] * len(order)
+    beam_at: dict[tuple[int, int], int] = {}
+    for beam, cell_i in enumerate(order):
+        row, col = cells[cell_i]
+        x = (col - (SKY_COLS - 1) / 2) * SKY_SPACING_DEG
+        y = (row - (SKY_ROWS - 1) / 2) * SKY_SPACING_DEG
+        alt[beam] = 90.0 - math.hypot(x, y)
+        az[beam] = math.degrees(math.atan2(x, y)) % 360.0
+        beam_at[(row, col)] = beam
+    return ({"weights_id": "synthetic", "alt_deg": alt, "az_deg": az}, beam_at)
+
+
+@pytest.fixture
+def pointings():
+    """The synthetic 512-beam alt/az table, as the registry would return it."""
+    return _synthetic_pointings()[0]
+
+
+@pytest.fixture
+def sky():
+    """(SkyTable, {(row, col): beam}) for the synthetic grid."""
+    p, beam_at = _synthetic_pointings()
+    return SkyTable.from_pointings(p), beam_at
 
 
 @pytest.fixture
@@ -66,8 +111,15 @@ def daemon(tmp_path):
     made = []
 
     def _make(**overrides):
+        # coalesce_jobs 1: the `ingest` fixture drives every batch through
+        # job 0 and awaits the flush itself, so "all expected jobs reported"
+        # is true as soon as the first batch lands and the flush is immediate
+        # (coalesce_s 0). Tests that exercise the coalescer set their own.
         cfg = {"db": str(tmp_path / f"t2_{len(made)}.sqlite"),
-               "coalesce_s": 0.0, "dumps_enabled": False,
+               "coalesce_s": 0.0, "coalesce_jobs": 1, "dumps_enabled": False,
+               # never read the production weights registry from a test;
+               # tests that want pointings monkeypatch registry.pointings_for
+               "weights_registry": str(tmp_path / "registry"),
                "tiers": {"A": 30.0, "B": 18.0, "C": 12.0},
                "trigger": {"fast_path": False}, "known_sources": []}
         cfg.update(overrides)

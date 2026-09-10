@@ -38,6 +38,10 @@ CREATE TABLE IF NOT EXISTS clusters (
     n_beams       INTEGER NOT NULL,
     beam_lo       INTEGER NOT NULL,
     beam_hi       INTEGER NOT NULL,
+    -- largest pairwise sky separation of the member beams, degrees. NULL for
+    -- rows written before 2026-09-09 and for clusters made without a pointing
+    -- table (beam-index fallback), where the extent was never measured.
+    sky_extent_deg REAL,
     dm_lo         REAL NOT NULL,
     dm_hi         REAL NOT NULL,
     samp_lo       INTEGER NOT NULL,
@@ -74,6 +78,13 @@ CREATE TABLE IF NOT EXISTS gulp_stats (
     clustering_ms REAL NOT NULL,
     n_vetoed      INTEGER NOT NULL DEFAULT 0,  -- dropped by the width veto
     n_shed        INTEGER NOT NULL DEFAULT 0,  -- dropped by the storm cap
+    -- how long the coalescer held the key open before flushing, ms: short
+    -- when all eight jobs reported, at coalesce_max_s when one never did
+    coalesce_wait_ms REAL NOT NULL DEFAULT 0,
+    -- 1 when the gulp was DROPPED because coalesce_max_s expired with fewer
+    -- than the expected jobs reported: never clustered, never triggered. The
+    -- row exists so the gap is visible in the duty cycle.
+    skipped        INTEGER NOT NULL DEFAULT 0,
     created_utc   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_gulp_stats_utc ON gulp_stats(gulp_utc);
@@ -148,7 +159,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_clusters_name"
                      " ON clusters(name) WHERE name IS NOT NULL")
     for col, decl in [("weights_id", "TEXT"), ("alt_deg", "REAL"), ("az_deg", "REAL"),
-                      ("ra_deg", "REAL"), ("dec_deg", "REAL")]:
+                      ("ra_deg", "REAL"), ("dec_deg", "REAL"),
+                      ("sky_extent_deg", "REAL")]:
         if cols and col not in cols:
             conn.execute(f"ALTER TABLE clusters ADD COLUMN {col} {decl}")
     tcols = {r[1] for r in conn.execute("PRAGMA table_info(triggers)")}
@@ -159,7 +171,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE triggers ADD COLUMN {col} {decl}")
     gcols = {r[1] for r in conn.execute("PRAGMA table_info(gulp_stats)")}
     for col, decl in [("n_vetoed", "INTEGER NOT NULL DEFAULT 0"),
-                      ("n_shed", "INTEGER NOT NULL DEFAULT 0")]:
+                      ("n_shed", "INTEGER NOT NULL DEFAULT 0"),
+                      ("coalesce_wait_ms", "REAL NOT NULL DEFAULT 0"),
+                      ("skipped", "INTEGER NOT NULL DEFAULT 0")]:
         if gcols and col not in gcols:
             conn.execute(f"ALTER TABLE gulp_stats ADD COLUMN {col} {decl}")
 
@@ -204,14 +218,14 @@ def insert_clusters(conn: sqlite3.Connection,
                 cur = conn.execute(
                     "INSERT INTO clusters (obs_utc_start, gulp, event_utc, samp, snr, dm,"
                     " dm_idx, width, beam, n_members, n_beams, beam_lo, beam_hi, dm_lo,"
-                    " dm_hi, samp_lo, samp_hi, tier, tags, name, created_utc,"
-                    " weights_id, alt_deg, az_deg, ra_deg, dec_deg)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " dm_hi, samp_lo, samp_hi, sky_extent_deg, tier, tags, name,"
+                    " created_utc, weights_id, alt_deg, az_deg, ra_deg, dec_deg)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (obs, gulp, event_utc, cl.peak.samp, cl.peak.snr, cl.peak.dm,
                      cl.peak.dm_idx, cl.peak.width, cl.peak.beam, cl.n_members,
                      cl.n_beams, cl.beam_lo, cl.beam_hi, cl.dm_lo, cl.dm_hi,
-                     cl.samp_lo, cl.samp_hi, tier, tags, name, now,
-                     sky.get("weights_id"), sky.get("alt_deg"), sky.get("az_deg"),
+                     cl.samp_lo, cl.samp_hi, cl.sky_extent_deg, tier, tags, name,
+                     now, sky.get("weights_id"), sky.get("alt_deg"), sky.get("az_deg"),
                      sky.get("ra_deg"), sky.get("dec_deg")))
             except sqlite3.IntegrityError as exc:
                 conn.execute("ROLLBACK TO cluster_row")
@@ -242,18 +256,29 @@ def insert_trigger(conn: sqlite3.Connection, cluster_id: int | None, candname: s
 def insert_gulp_stats(conn: sqlite3.Connection, obs_utc_start: str, gulp: int | None,
                       gulp_utc: str, n_jobs: int, n_cands: int, n_clusters: int,
                       n_stored: int, n_would: int, clustering_ms: float,
-                      n_vetoed: int = 0, n_shed: int = 0) -> None:
+                      n_vetoed: int = 0, n_shed: int = 0,
+                      coalesce_wait_ms: float = 0.0, skipped: int = 0) -> None:
     """One accounting row per coalesced gulp: the T1->T2 survival funnel.
 
     ``n_cands`` is the raw count that arrived from the jobs. ``n_vetoed``
     (width veto) and ``n_shed`` (storm cap) are removed before clustering,
     so DBSCAN saw ``n_cands - n_vetoed - n_shed`` trials.
+
+    ``skipped`` marks a gulp that was dropped whole because
+    ``coalesce_max_s`` expired with fewer than the expected jobs reported.
+    Such a row carries the counts that did arrive but ``n_clusters`` 0: the
+    gulp was never clustered and could not have triggered. A job more than a
+    gulp late is stuck, not slow, and half a sky is not worth a dump
+    decision — but the row must exist, or the gap silently inflates the
+    duty cycle.
     """
     now = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
     with conn:
         conn.execute(
             "INSERT INTO gulp_stats (obs_utc_start, gulp, gulp_utc, n_jobs, n_cands,"
             " n_clusters, n_stored, n_would, clustering_ms, n_vetoed, n_shed,"
-            " created_utc) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            " coalesce_wait_ms, skipped, created_utc)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (obs_utc_start, gulp, gulp_utc, n_jobs, n_cands, n_clusters,
-             n_stored, n_would, round(clustering_ms, 1), n_vetoed, n_shed, now))
+             n_stored, n_would, round(clustering_ms, 1), n_vetoed, n_shed,
+             round(coalesce_wait_ms, 1), int(skipped), now))

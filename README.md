@@ -15,14 +15,23 @@ recorded so the misses can be audited as honestly as the hits.
 
 `t2d` owns eight TCP ports, one per hella job. Each gulp it coalesces the
 per-job batches, deduplicates, and clusters with DBSCAN over (time, DM,
-width, beam) — beam count is the main RFI discriminator, since a real
-pulse is compact in beam and RFI is not. Clusters then run a filter
-chain: injection match (stored, never dumped), beam veto, wide-beam RFI
-cut, known-source DM-range match, and S/N tiers (A >= 30, B >= 15,
-C >= 12; blind triggers need A/B plus DM >= 20). Survivors hit the
-trigger budgets — minimum spacing, daily caps, one dump per gulp in a
-storm, and a free-disk floor — before a dump command goes to the owning
-backend node.
+width, sky position) — how far apart on the sky a cluster's beams are is
+the main RFI discriminator, since a real pulse is compact on the sky and
+RFI is not. Beams enter as degrees on a tangent plane about the zenith,
+taken from the weights live at that moment, because the beam *index* is
+not sky-ordered: consecutive indices are a median 16 deg apart while true
+sky neighbours are 3.1 deg. Clusters then run a filter chain: injection
+match (stored, never dumped), beam veto, wide-beam RFI cut (too many
+beams, or too wide on the sky), known-source DM-range match, and S/N
+tiers (A >= 30, B >= 15, C >= 12; blind triggers need A/B plus DM >= 20).
+
+Survivors hit the trigger budgets — minimum spacing, daily caps, one dump
+per gulp in a storm, and a free-disk floor — before a dump command goes to
+the owning backend node.
+
+A gulp is not clustered until all eight jobs have reported it or the
+coalescer's maximum wait runs out, so the per-gulp vetoes see the whole
+sky rather than whichever jobs happened to be quick.
 
 Everything lands in one SQLite database: stored clusters, the full
 trigger audit (refusals with reasons, including ring-window misses), the

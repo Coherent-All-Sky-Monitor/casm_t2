@@ -21,8 +21,34 @@ DB.
 `config/t2d.yaml` is the only user config. The blocks you'll actually
 touch:
 
+`cluster` sets the DBSCAN axis scales. `sky_scale_deg` (4.0, one beam
+spacing) is the sky axis: beams enter clustering as their position on the
+sky, not as a beam index, because the beam grid is not sky-ordered.
+4.4 is the smallest 0.1 step at which 95% of beams reach their
+own sky-nearest neighbour within one eps under the Euclidean metric (96.7%;
+4.0 would reach 90.4%). `beam_scale` is the fallback used only when the
+weights registry cannot name a pointing table for the gulp — the log says so when that happens,
+and `sky_extent_deg` is then left at 0 and nothing is tagged on it.
+
+`coalesce_jobs` (8), `coalesce_max_s` (8.0) and `coalesce_s` (0.25)
+control when a gulp flushes: all jobs in, plus a short quiet hold. A gulp
+that hits `coalesce_max_s` with jobs still missing is **dropped whole** —
+not clustered, not triggered — and recorded with `skipped: 1`. Do not raise
+`coalesce_max_s` on the assumption that there is slack: the dump ring's
+observed successful lag tops out at 50.8 s and retention beyond that is
+unmeasured, while hella already spends 13-25 s of it.
+
+The two numbers to watch are the heartbeat's skipped-gulp and late-batch
+counters, and `SELECT count(*) FROM gulp_stats WHERE skipped = 1` over the
+last hour. A rising skipped count is a hella job dying, not T2 being
+cautious — find the job before assuming the sky was quiet.
+
 `tiers` and `filters` (S/N thresholds, `beam_veto`, `max_nbeam`,
-`dm_floor`, `dm_floor_veto`) shape what counts as an event. The DM-floor
+`max_sky_extent_deg`, `dm_floor`, `dm_floor_veto`) shape what counts as an
+event. `max_sky_extent_deg` (25.0) tags a cluster `rfi_wide` when its
+member beams span more than that on the sky; a real source spans at most
+about two beam spacings, 8 deg, so a wider cluster is broadband RFI no
+matter how few beams it happens to occupy. The DM-floor
 veto tags a cluster `dm_floor` when its lowest member DM sits at hella's
 first trial (`max_dm_lo`, 20.6 for DM_MIN 20) with boxcar index at or
 above `min_width`; that is a zero-DM impulse leaking up the bowtie. The

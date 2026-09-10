@@ -4,9 +4,44 @@
 
 Eight hella jobs — one per 64-beam stream, jobs 0-3 on the first backend
 node and 4-7 on the second — connect per gulp and send their candidate
-list. t2d coalesces the batches (with a short wait for stragglers),
-deduplicates and clusters, classifies, fires whatever dumps survive the
-policy, and writes the whole decision chain to SQLite.
+list. t2d coalesces the batches, deduplicates and clusters, classifies,
+fires whatever dumps survive the policy, and writes the whole decision
+chain to SQLite.
+
+## Coalescing
+
+A gulp is only a gulp once all eight jobs have reported. They finish
+seconds apart, so the coalescer holds a (utc_start, gulp) key open until
+every expected job has arrived and `coalesce_s` of quiet has passed. The
+wait is recorded in `gulp_stats.coalesce_wait_ms` next to `n_jobs`.
+
+If `coalesce_max_s` elapses first with jobs still missing, the gulp is
+**dropped whole**: not clustered, not triggered, recorded with `skipped: 1`
+and the counts that did arrive. Half a sky is not worth a dump decision —
+every per-gulp veto reasons about the whole sky, and the fragment holding
+the bright beam is generally not the one holding the evidence against it.
+The row still goes in so the gap stays visible in the duty cycle, and the
+heartbeat counts skipped gulps; a rising count means a hella job is dying.
+Completeness is read when the wait ends, not from which deadline fired, so
+a gulp whose batches merely trickle in is complete, not skipped.
+
+Before 2026-09-09 the key flushed a fixed `coalesce_s` after the *first*
+batch, which split gulps into fragments — gulp 1218 of obs
+2026-09-09-21:12:15 arrived 3+2+1+1+1 — and every per-gulp veto (the
+occupancy footprint, the dm_floor coincidence spread, one-dump-per-gulp)
+saw only its own fragment. That is how 260910fkmpyt dumped while the
+DM-floor fragment of the same impulse sat in a different fragment.
+
+A batch that turns up after its key has flushed still gets processed, as
+its own fragment, but it is logged as a late batch and counted in the
+heartbeat: a job running that late means the vetoes did not see the whole
+sky. `coalesce_max_s` ships at 8.0 s, one gulp length. A job that has not
+reported within a whole gulp of the first one is stuck, not slow. The
+budget is not elastic either: the observed successful event-to-request lag
+is 36.5-50.8 s (207 dumps since 2026-09-01, mean 43.7; the one failure was
+at 206 s), retention behind the ring's read pointer beyond that 51 s is
+unmeasured, and hella's own 13-25 s reporting delay already spends most of
+it.
 
 The deadline matters more than the throughput. The intensity ring buffer
 upstream holds a limited look-back; a dump command that arrives after the
@@ -59,12 +94,47 @@ single-beam FRB this daemon exists to catch. Worst case kept is
 
 ## Clustering
 
-DBSCAN, cityblock metric, over scaled (samp, dm_idx, log2(width), beam).
-Each cluster keeps its peak trial and the membership envelope: time, DM
-and beam ranges, member count, distinct-beam count. Noise points survive
-as singleton clusters rather than being dropped — a lone bright pulse in
-one beam is exactly what an FRB looks like. Beam count is the primary
-RFI discriminator.
+DBSCAN, Euclidean metric, over scaled (samp, dm_idx, log2(width), x, y)
+where (x, y) is the beam's position in degrees on a tangent plane about
+the zenith, scaled by `sky_scale_deg`. An offset of exactly one scale on
+any single axis is a distance of exactly 1, so eps 1.0 keeps its meaning;
+offsets on several axes now add in quadrature rather than linearly.
+
+Each cluster keeps its peak trial and the membership envelope: time, DM and beam ranges, member count,
+distinct-beam count, and `sky_extent_deg` — the largest pairwise
+great-circle separation of its member beams. Noise points survive as
+singleton clusters rather than being dropped — a lone bright pulse in one
+beam is exactly what an FRB looks like.
+
+The sky axis replaced a raw `beam / beam_scale` axis on 2026-09-09. The
+deployed 512-beam grid is not sky-ordered: consecutive beam indices are a
+median 16 deg apart while true sky neighbours are 3.1 deg, and only 11% of
+a beam's six sky-nearest neighbours lie within +-4 index. Clustering on the
+index therefore split point sources that spanned two adjacent sky beams,
+understated every footprint in `n_beams`, and left `rfi_wide` (n_beams >
+32) unable to fire on broadband RFI that was lit across the whole sky.
+
+The metric was cityblock until 2026-09-09. The sky pair is two
+coordinates of one physical quantity, so under L1 a cross-beam link cost
+`|dx| + |dy|` — up to sqrt(2) times the real separation, and dependent on
+how the pair happened to lie against the projection axes. At a 4 deg scale
+only 61% of beams could reach their own nearest neighbour even for two
+otherwise identical trials. Under Euclidean the sky term is the
+tangent-plane separation itself, and `sky_scale_deg` ships at 4.4 — the
+smallest 0.1 step at which 95% of beams reach their nearest neighbour
+(96.7%; 4.0 reaches only 90.4%, because the grid's spacing is not uniform).
+
+The pointing table comes from the weights live at the gulp's own time
+(`weights_registry.pointings_for`), fetched once per gulp and cached by
+weights id. When the registry cannot name a single product for the time —
+no event, a partial deploy, an unregistered payload — clustering falls back
+to the beam-index axis and `beam_scale`, warns once, and leaves
+`sky_extent_deg` at 0 so nothing is ever tagged on a number that was not
+measured. Fail-safe, never fail-shut.
+
+Sky extent, not beam count, is now the primary RFI discriminator: a real
+source spans at most about two beam spacings (8 deg), so anything wider
+than `filters.max_sky_extent_deg` is not one source.
 
 ## Decision chain
 
@@ -75,7 +145,10 @@ stored, never dumped: the dump ring taps the data upstream of the
 injection merge, so a dump physically cannot contain the injected pulse.
 
 beam veto, then wide-beam RFI — configured noisy beams, then anything
-spanning more than `max_nbeam` distinct beams.
+spanning more than `max_nbeam` distinct beams **or** more than
+`max_sky_extent_deg` on the sky. Both tag `rfi_wide`; the sky test is the
+one that catches a burst in a dozen beams scattered right across the sky,
+which the count alone never could.
 
 known-source match — beam inside a scheduled transit window and the
 cluster's DM *range* overlapping the source DM. Range, not peak: a storm
@@ -130,7 +203,7 @@ One SQLite file, WAL mode (db.py):
 
 | table | holds |
 |---|---|
-| clusters | every stored event: name, tier, tags, peak, envelope |
+| clusters | every stored event: name, tier, tags, peak, envelope, sky |
 | triggers | the dump audit: action, detail, bytes, cleanup state |
 | injections | the ledger, with per-gate recovery columns |
 | gulp_stats | per-gulp funnel counters |
@@ -142,7 +215,14 @@ and `suppressed_commissioning` (`dumps_enabled: false`).
 
 `gulp_stats.n_cands` is the raw count in; `n_vetoed` and `n_shed` are what
 the width veto and the storm cap dropped before clustering, so DBSCAN saw
-`n_cands - n_vetoed - n_shed`.
+`n_cands - n_vetoed - n_shed`. `gulp_stats.skipped` is 1 for a gulp dropped because
+`coalesce_max_s` expired with jobs missing; such a row carries the counts
+that arrived but `n_clusters` 0, and nothing downstream ran for it.
+
+`clusters.sky_extent_deg` is the largest pairwise separation of a
+cluster's member beams in degrees; 0 for a single-beam cluster, and NULL
+for rows written before 2026-09-09. Trigger cards carry the same number as
+`sky_extent_deg` alongside `n_beams`.
 
 Timestamps are ISO-8601 UTC with a `T` separator. sqlite's
 `datetime('now')` renders with a space, which string-compares wrongly

@@ -3,8 +3,15 @@
 Reads a UTC slice of the hella .dat output files, clusters it in
 gulp-sized chunks exactly as the live daemon would, and reports what the
 trigger logic would have seen: cluster rate, noise fraction, the beam-span
-distribution (the RFI discriminator), runtime per chunk versus real time,
-and the top clusters. Purely offline — reads files, writes nothing but an
+and sky-extent distributions (the RFI discriminators), runtime per chunk
+versus real time, and the top clusters.
+
+Clustering uses the sky axis when a pointing table is given with
+``--pointings`` (any JSON carrying a ``pointings`` block, such as a T3
+trigger card, or a weights-registry product file with alt_deg/az_deg).
+Without one it falls back to the beam-index axis, which the live daemon
+only does when the registry cannot name a product, so pass one if the
+replay is meant to match production. Purely offline — reads files, writes nothing but an
 optional CSV of clusters for HiPlot.
 
     t2-replay --from 2026-06-10T18:00 --to 2026-06-10T19:00 \\
@@ -15,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import sys
 import time
 from collections import Counter, defaultdict
@@ -49,7 +57,12 @@ def main() -> None:
     p.add_argument("--samp-scale", type=float, default=64.0)
     p.add_argument("--dm-idx-scale", type=float, default=32.0)
     p.add_argument("--width-scale", type=float, default=2.0)
-    p.add_argument("--beam-scale", type=float, default=4.0)
+    p.add_argument("--sky-scale-deg", type=float, default=4.4)
+    p.add_argument("--beam-scale", type=float, default=4.0,
+                   help="fallback beam-index scale, used only without --pointings")
+    p.add_argument("--pointings",
+                   help="JSON file with a 512-beam alt/az table (T3 trigger card "
+                        "or weights-registry product)")
     p.add_argument("--csv", help="write one row per cluster to this CSV")
     p.add_argument("--top", type=int, default=15, help="clusters to print")
     args = p.parse_args()
@@ -65,7 +78,18 @@ def main() -> None:
     params = cluster.ClusterParams(
         eps=args.eps, min_samples=args.min_samples,
         samp_scale=args.samp_scale, dm_idx_scale=args.dm_idx_scale,
-        width_scale=args.width_scale, beam_scale=args.beam_scale)
+        width_scale=args.width_scale, sky_scale_deg=args.sky_scale_deg,
+        beam_scale=args.beam_scale)
+
+    sky = None
+    if args.pointings:
+        blob = json.loads(Path(args.pointings).read_text())
+        sky = cluster.SkyTable.from_pointings(blob.get("pointings", blob))
+        if sky is None:
+            sys.exit(f"no usable pointing table in {args.pointings}")
+        print(f"pointings: weights {sky.weights_id or 'unnamed'}, {sky.n} beams")
+    else:
+        print("pointings: NONE -> beam-index fallback (not what t2d does live)")
 
     print(f"obs {utc_start:%Y-%m-%d-%H:%M:%S}  samp [{samp_min}, {samp_max}] "
           f"({(samp_max - samp_min) * timing.TSAMP_S:.0f} s)")
@@ -97,7 +121,7 @@ def main() -> None:
     worst = 0.0
     for key in sorted(chunks):
         tc = time.monotonic()
-        cls = cluster.cluster_candidates(chunks[key], params)
+        cls = cluster.cluster_candidates(chunks[key], params, sky)
         dt = time.monotonic() - tc
         t_cluster += dt
         worst = max(worst, dt)
@@ -123,27 +147,35 @@ def main() -> None:
         n = sum(v for k, v in nbeam_hist.items() if lo <= k <= hi)
         print(f"  {label:>5} beams: {n:7d}  ({n / max(n_real, 1) * 100:.1f}%)")
 
+    if sky is not None:
+        print("\nsky-extent distribution (max pairwise separation of member beams):")
+        for lo, hi, label in [(0.0, 0.01, "0 (one beam)"), (0.01, 8.0, "<=8"),
+                              (8.0, 25.0, "8-25"), (25.0, 1e9, ">25 (rfi_wide)")]:
+            n = sum(1 for cl in all_clusters if lo <= cl.sky_extent_deg < hi)
+            print(f"  {label:>15} deg: {n:7d}  ({n / max(n_real, 1) * 100:.1f}%)")
+
     all_clusters.sort(key=lambda cl: -cl.peak.snr)
     print(f"\ntop {args.top} clusters:")
-    print("   snr     dm  width beam nmemb nbeam  dm_span        event_utc")
+    print("   snr     dm  width beam nmemb nbeam   sky  dm_span        event_utc")
     for cl in all_clusters[:args.top]:
         ev = timing.samp_to_utc(cl.peak.samp, utc_start)
         print(f"  {cl.peak.snr:5.1f} {cl.peak.dm:6.1f}  {cl.peak.width:4d} "
               f"{cl.peak.beam:4d} {cl.n_members:5d} {cl.n_beams:5d} "
-              f"{cl.dm_lo:6.1f}-{cl.dm_hi:<6.1f} {ev:%H:%M:%S.%f}"[:79])
+              f"{cl.sky_extent_deg:5.1f} "
+              f"{cl.dm_lo:6.1f}-{cl.dm_hi:<6.1f} {ev:%H:%M:%S.%f}"[:88])
 
     if args.csv:
         with open(args.csv, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["snr", "dm", "width", "beam", "samp", "event_utc",
                         "n_members", "n_beams", "beam_lo", "beam_hi",
-                        "dm_lo", "dm_hi"])
+                        "sky_extent_deg", "dm_lo", "dm_hi"])
             for cl in all_clusters:
                 ev = timing.samp_to_utc(cl.peak.samp, utc_start)
                 w.writerow([cl.peak.snr, cl.peak.dm, cl.peak.width, cl.peak.beam,
                             cl.peak.samp, ev.isoformat(timespec="milliseconds"),
                             cl.n_members, cl.n_beams, cl.beam_lo, cl.beam_hi,
-                            cl.dm_lo, cl.dm_hi])
+                            cl.sky_extent_deg, cl.dm_lo, cl.dm_hi])
         print(f"\nwrote {len(all_clusters)} clusters to {args.csv}")
 
 

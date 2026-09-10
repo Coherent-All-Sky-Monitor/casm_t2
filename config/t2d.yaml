@@ -3,7 +3,29 @@
 
 listen_host: 0.0.0.0
 ports: [12345, 12346, 12347, 12348, 12349, 12350, 12351, 12352]
-coalesce_s: 0.75
+# GULP COALESCING (2026-09-09). The eight hella jobs finish seconds apart, so
+# a fixed hold after the FIRST batch split gulps into fragments (gulp 1218 of
+# obs 2026-09-09-21:12:15 arrived as 3+2+1+1+1 jobs) and every per-gulp veto —
+# the occupancy footprint, the dm_floor coincidence spread, the one-dump-per-
+# gulp rule — only ever saw its own fragment. A key now flushes when all
+# `coalesce_jobs` jobs have reported and `coalesce_s` of quiet has passed, or
+# at `coalesce_max_s`, whichever comes first. Both are recorded per gulp
+# (gulp_stats.n_jobs, gulp_stats.coalesce_wait_ms).
+coalesce_s: 0.25        # quiet hold after the LAST batch, not the first
+coalesce_jobs: 8        # jobs expected per gulp; defaults to len(ports)
+# 8.0 = one gulp length. A job that has not reported within a whole gulp of
+# the first one is stuck, not slow, and the dump ring cannot absorb the wait:
+# the observed successful event-to-request lag is 36.5-50.8 s (207 dumps since
+# 2026-09-01, mean 43.7 s; the one failure was at 206 s), and hella's own
+# 13-25 s reporting delay already spends most of that budget. Retention behind
+# the read pointer beyond that 51 s is not known, so do not raise this on the
+# assumption that there is slack.
+coalesce_max_s: 8.0
+# A gulp that hits coalesce_max_s with fewer than coalesce_jobs jobs is DROPPED
+# WHOLE: not clustered, not triggered, recorded with skipped=1 in gulp_stats.
+# Every per-gulp veto reasons about the whole sky; half a sky is not worth a
+# dump decision. Watch the skipped count in the heartbeat — a rising one means
+# a hella job is dying, not that T2 is being cautious.
 db: /mnt/nvme5/casm_pipeline/db/t2.sqlite
 
 # Set true (or run with --shadow) for a full dry-run: clusters, names, DB
@@ -56,7 +78,23 @@ cluster:
   samp_scale: 64.0      # samples (~67 ms)
   dm_idx_scale: 32.0    # DM trials (~12 pc/cc)
   width_scale: 2.0      # log2(width) steps
-  beam_scale: 4.0       # adjacent beams
+  # SKY AXIS (2026-09-09). Beams enter clustering as two tangent-plane degree
+  # axes about the zenith, not as a beam index: the deployed 512-beam grid is
+  # not sky-ordered (consecutive indices are a median 16 deg apart, true sky
+  # neighbours 3.1 deg, and only 11% of a beam's six sky-nearest neighbours lie
+  # within +-4 index).
+  #
+  # 4.4 deg (2026-09-09): the distance metric is Euclidean, so the cost of a
+  # cross-beam link is the tangent-plane separation itself. 4.4 is the smallest
+  # 0.1 step at which >= 95% of beams can reach their own sky-nearest neighbour
+  # within one eps (96.7%; the 95th percentile of that distance is 4.29 deg, and
+  # 4.3 gives 94.9%). The obvious "one beam spacing" value of 4.0 reaches only
+  # 90.4% -- the grid's nearest-neighbour spacing is not uniform.
+  sky_scale_deg: 4.4
+  # FALLBACK ONLY: the old beam-index axis, used when the weights registry
+  # cannot name a pointing table for the gulp. Logs a warning; sky_extent_deg
+  # is then left unmeasured (0) and nothing is tagged on it.
+  beam_scale: 4.0
 
 tiers:                  # peak-SNR thresholds
   A: 30.0
@@ -73,7 +111,12 @@ filters:
   beam_veto: [2]        # RFI hotspot. (beam-64 veto removed 2026-06-12
                         # after the railed N21-E3 input was zeroed from the
                         # weights — the first-beam artifact died with it)
-  max_nbeam: 32         # wider clusters are tagged rfi_wide, never trigger
+  max_nbeam: 32         # more distinct beams than this: rfi_wide, never triggers
+  # Sky-extent cut (2026-09-09): a cluster whose member beams span more than
+  # this on the sky is not one source (a real one spans at most ~2 beam
+  # spacings, 8 deg), so it is tagged rfi_wide too. This is the cut n_beams
+  # could not make on a non-sky-ordered grid. 0 disables.
+  max_sky_extent_deg: 25.0
   dm_floor: 20.0        # blind (tier) triggers require peak DM >= this
   # DM-floor veto (2026-09-09, Vishnu): clusters whose lowest member DM sits
   # at hella's first reported trial (20.5 at DM_MIN 20) with boxcar index
