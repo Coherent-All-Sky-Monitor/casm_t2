@@ -275,7 +275,7 @@ def test_config_uses_the_new_keys():
     assert icfg["sample"]["dm"] == {"dist": "uniform", "lo": 100.0, "hi": 900.0}
     assert icfg["sample"]["fwhm_ms"] == {"dist": "loguniform", "lo": 2.5,
                                          "hi": 30.0}
-    assert icfg["sample"]["inject_snr"] == {"dist": "loguniform", "lo": 12.0,
+    assert icfg["sample"]["inject_snr"] == {"dist": "loguniform", "lo": 15.0,
                                             "hi": 18.0}
     assert icfg["summary_dm_bins"] == [100.0, 300.0, 500.0, 700.0, 900.0]
     assert icfg["reported_snr_cap"]["narrow"] == 50.0
