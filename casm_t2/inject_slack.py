@@ -147,6 +147,17 @@ def display_id(row) -> str:
     return str(_g(row, "file_id") or _g(row, "id", "?"))
 
 
+def display_id_md(row) -> str:
+    """`display_id`, backticked for Slack mrkdwn so it renders as inline code.
+
+    The single formatter for the id in Slack TEXT: every message body, bar,
+    caption, and fallback goes through this (not the plot title - that is a
+    matplotlib figure in casm_t3 - and not log lines or the ledger, which
+    stay bare so they still `grep` and compare on the plain id).
+    """
+    return f"`{display_id(row)}`"
+
+
 def injected_fwhm_ms(row) -> float | None:
     """The injected width as FWHM. The ledger stores the Gaussian sigma."""
     sigma = _f(row, "sigma_ms")
@@ -184,7 +195,7 @@ def sent_text(row, icfg: dict | None = None) -> str:
     # The standing state is subtraction ON, so it adds nothing to the line;
     # only the unusual state is called out.
     suffix = " (IB sub off)" if _g(row, "sub_incoh") == 0 else ""
-    return (f"injection {display_id(row)} sent: " + ", ".join(bits) + suffix
+    return (f"injection {display_id_md(row)} sent: " + ", ".join(bits) + suffix
             + "\n_awaiting recovery..._")
 
 
@@ -875,7 +886,7 @@ class SlackPoster:
                 return got
             logger.warning("slack edit of injection %s failed; posting fresh",
                            _g(row, "id"))
-        return self._post(f"`{_g(row, 'id')}`: {line}", attachments=[attachment])
+        return self._post(f"{display_id_md(row)}: {line}", attachments=[attachment])
 
     def post_injection(self, row, png=None) -> str | None:
         """Complete (or post) the shot's message; returns its ts.
@@ -936,7 +947,7 @@ class SlackPoster:
                 got, err2 = self._update(ts, sent, attachments=attachments,
                                          blocks=plain, want_error=True)
                 if got:
-                    self._post_file(Path(png), inj_id, comment=inj_id)
+                    self._post_file(Path(png), inj_id, comment=f"`{inj_id}`")
                     logger.info("injection %s completed (form=bar+image)",
                                 inj_id)
                     return got
@@ -955,7 +966,7 @@ class SlackPoster:
                            "the bar and the plot separately", inj_id, err)
             got, _ = self._post(sent, attachments=attachments, want_error=True)
             if got:
-                self._post_file(Path(png), inj_id, comment=inj_id)
+                self._post_file(Path(png), inj_id, comment=f"`{inj_id}`")
                 logger.info("injection %s posted (form=bar+image)", inj_id)
                 return got
         logger.warning("injection %s: falling back to plain text", inj_id)

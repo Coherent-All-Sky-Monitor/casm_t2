@@ -117,7 +117,7 @@ NBSP = inject_slack.NBSP
 def test_sent_text_is_the_short_form():
     text = inject_slack.sent_text(RECOVERED_ROW)
     assert text.split("\n")[0] == (
-        f"injection inj_20260909_0005 sent: beam 90, DM 300, "
+        f"injection `inj_20260909_0005` sent: beam 90, DM 300, "
         f"FWHM 11.8{NBSP}ms, injected S/N 12")
     assert text.endswith("_awaiting recovery..._")
     # sigma, the live std, the stream and the raw counts are all gone
@@ -241,6 +241,44 @@ def test_fire_failed_is_not_phrased_as_a_miss():
     assert inject_slack.outcome_text(row) == (
         "injection not fired: FIFO write failed")
     assert inject_slack.outcome_color(row) == inject_slack.COLOR_NEUTRAL
+
+
+def test_display_id_md_backticks_the_display_id():
+    assert inject_slack.display_id_md(RECOVERED_ROW) == "`inj_20260909_0005`"
+
+
+def test_the_display_id_is_backticked_everywhere_it_reaches_slack_text():
+    """The one thing this whole test is guarding: no bare id in a message.
+
+    A bare id followed by a space is the shape Slack would NOT render as
+    inline code (e.g. "injection inj_20260909_0005 sent"); every site that
+    puts the id into text sent to Slack must wrap it first.
+    """
+    bare = "inj_20260909_0005"
+    ticked = f"`{bare}`"
+    texts = [
+        inject_slack.sent_text(RECOVERED_ROW),
+        inject_slack.injection_text(RECOVERED_ROW),
+    ]
+    for text in texts:
+        assert ticked in text
+        assert f"{bare} " not in text
+
+
+def test_post_outcome_fallback_backticks_the_id(monkeypatch):
+    """The fresh-post fallback (edit of the sent message failed) also ticks it."""
+    poster = inject_slack.SlackPoster(enabled=True)
+    monkeypatch.setattr(poster, "_update", lambda *a, **k: None)
+    captured = {}
+
+    def fake_post(text, attachments=None):
+        captured["text"] = text
+        return "ts1"
+
+    monkeypatch.setattr(poster, "_post", fake_post)
+    row = dict(RECOVERED_ROW, slack_ts="1757000000.661")
+    assert poster.post_outcome(row) == "ts1"
+    assert captured["text"].startswith("`inj_20260909_0005`: recovered")
 
 
 def test_streak_uses_the_same_phrases():
@@ -501,7 +539,7 @@ def test_sent_then_update_posts_the_sent_line_at_fire_time(tmp_path,
     assert poster.post_sent(RECOVERED_ROW) is not None
     written, = list(tmp_path.glob("*_inject_inj_20260909_0005_sent.txt"))
     payload = json.loads(written.read_text())
-    assert payload["text"].startswith("injection inj_20260909_0005 sent:")
+    assert payload["text"].startswith("injection `inj_20260909_0005` sent:")
     assert payload["text"].endswith("_awaiting recovery..._")
     assert "attachments" not in payload      # nothing to colour yet
 
@@ -509,7 +547,7 @@ def test_sent_then_update_posts_the_sent_line_at_fire_time(tmp_path,
 def test_the_caption_is_the_sent_line_then_the_outcome_line():
     text = inject_slack.injection_text(RECOVERED_ROW, "http://host:8050")
     first, second = text.split("\n")
-    assert first == (f"injection inj_20260909_0005 sent: beam 90, DM 300, "
+    assert first == (f"injection `inj_20260909_0005` sent: beam 90, DM 300, "
                      f"FWHM 11.8{NBSP}ms, injected S/N 12")
     assert second.startswith("recovered -> SNR 35.5 (ratio 2.96)")
     assert "SNR 35.5 (ratio 2.96)" in second
@@ -631,7 +669,7 @@ def test_rejected_blocks_post_the_bar_then_the_image(tmp_path, monkeypatch,
     assert ts == "ts2"
     assert seen["posts"][1]["blocks"] is None
     assert seen["shares"][0]["thread_ts"] is None
-    assert seen["shares"][0]["comment"] == "inj_20260909_0005"
+    assert seen["shares"][0]["comment"] == "`inj_20260909_0005`"
     assert "invalid_blocks" in caplog.text
     assert "form=bar+image" in caplog.text
 
@@ -663,7 +701,7 @@ def test_single_mode_dry_run_writes_the_payload(tmp_path):
     written, = list(tmp_path.glob("*_inject_inj_20260909_0005.txt"))
     body = written.read_text()
     payload = json.loads(body.split("\n\n[uploaded")[0])
-    assert payload["text"].startswith("injection inj_20260909_0005 sent:")
+    assert payload["text"].startswith("injection `inj_20260909_0005` sent:")
     att, = payload["attachments"]
     assert att["color"] == inject_slack.COLOR_RECOVERED
     assert [b["type"] for b in payload["blocks"]] == ["section", "image"]
@@ -762,7 +800,7 @@ def test_rejected_blocks_post_the_plot_at_top_level(tmp_path, monkeypatch,
     assert [b["type"] for b in second["blocks"]] == ["section"]
     # the plot gets its own TOP-LEVEL message, never a thread reply
     assert seen["shares"][0]["thread_ts"] is None
-    assert seen["shares"][0]["comment"] == "inj_20260909_0005"
+    assert seen["shares"][0]["comment"] == "`inj_20260909_0005`"
     assert "form=bar+image" in caplog.text
 
 

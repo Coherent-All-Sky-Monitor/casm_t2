@@ -707,7 +707,7 @@ def do_replay(conn, cfg: dict, poster, inj_id: int, dump_dir) -> Path | None:
                          (int(posted), inj_id))
     elif png is not None:
         posted = bool(poster.post_replay(
-            row, png, inject_slack.display_id(row)))
+            row, png, inject_slack.display_id_md(row)))
         with conn:
             conn.execute("UPDATE injections SET replay_posted=? WHERE id=?",
                          (int(posted), inj_id))
