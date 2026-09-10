@@ -3,6 +3,10 @@ Description=CASM scheduled live injections (gate ledger)
 After=network-online.target
 
 [Service]
+# Slack is only reachable from the correlator nodes through the zapdos
+# proxy; without it every Slack post fails with NameResolutionError.
+Environment=https_proxy=http://10.70.0.1:8118
+Environment=http_proxy=http://10.70.0.1:8118
 ExecStart=/home/casm/software/dev/casm_venvs/casm_offline_env/bin/t2-inject /home/casm/software/dev/casm_t2/config/t2d.yaml
 Restart=always
 RestartSec=60
