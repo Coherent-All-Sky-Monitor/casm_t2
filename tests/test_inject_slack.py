@@ -118,7 +118,7 @@ def test_sent_text_is_the_short_form():
     text = inject_slack.sent_text(RECOVERED_ROW)
     assert text.split("\n")[0] == (
         f"injection inj_20260909_0005 sent: beam 90, DM 300, "
-        f"FWHM 11.8{NBSP}ms, injected S/N 20")
+        f"FWHM 11.8{NBSP}ms, injected S/N 12")
     assert text.endswith("_awaiting recovery..._")
     # sigma, the live std, the stream and the raw counts are all gone
     assert "sigma" not in text
@@ -127,12 +127,18 @@ def test_sent_text_is_the_short_form():
     assert "counts" not in text
 
 
-def test_injected_snr_prefers_the_generator_estimate():
-    """est_snr describes the pulse as WRITTEN; inject_snr is what was asked for."""
-    assert inject_slack.injected_snr(RECOVERED_ROW) == pytest.approx(19.662)
+def test_injected_snr_prefers_the_solver_value():
+    """The solver's target is what the card prints.
+
+    `est_snr` reads a different noise sample and disagreed with the solver by
+    up to 2x on the live cards (shot 671 printed 36 against a target of 19),
+    so `inject_snr` wins where there is one.
+    """
+    assert inject_slack.injected_snr(RECOVERED_ROW) == pytest.approx(12.0)
+    # a legacy row with no solver value still shows something
     assert inject_slack.injected_snr(
-        dict(RECOVERED_ROW, est_snr=None)) == pytest.approx(12.0)
-    assert inject_slack.injected_snr({"est_snr": None}) is None
+        dict(RECOVERED_ROW, inject_snr=None)) == pytest.approx(19.662)
+    assert inject_slack.injected_snr({"inject_snr": None}) is None
 
 
 def test_no_slack_text_says_target_or_expected():
@@ -155,9 +161,9 @@ def test_injected_fwhm_is_2355_sigma():
 
 def test_outcome_text_recovered_is_the_dsa_shape():
     text = inject_slack.outcome_text(RECOVERED_ROW, "http://host:8050")
-    # ratio 35.5246/19.662 = 1.81; ibox 4 kernel FWHM 11.5 ms, not 2^4=16.8
+    # ratio 35.5246/12.0 = 2.96; ibox 4 kernel FWHM 11.5 ms, not 2^4=16.8
     assert text == (
-        "recovered -> SNR 35.5 (ratio 1.81) | DM 299.8 (delta -0.2) | "
+        "recovered -> SNR 35.5 (ratio 2.96) | DM 299.8 (delta -0.2) | "
         f"beam 90 | width 11.5{NBSP}ms (ibox 4)")
     # the plot is in the card; a link to it would be noise
     assert "http" not in text
@@ -251,7 +257,7 @@ def test_streak_and_summary_text():
     text = inject_slack.summary_text([RECOVERED_ROW, MISSED_ROW], "2026-09-09")
     assert "2 injected, 1 recovered" in text
     assert "missed: 1 missed by hella (T1)" in text
-    assert "recovered/injected S/N: median 1.81" in text  # 35.5246 / 19.662
+    assert "recovered/injected S/N: median 2.96" in text  # 35.5246 / 12.0
 
 
 # --- figures ----------------------------------------------------------------
@@ -404,15 +410,15 @@ def test_sent_line_is_silent_when_subtraction_is_on():
 
 def test_sent_line_calls_out_subtraction_off():
     text = inject_slack.sent_text(dict(RECOVERED_ROW, sub_incoh=0))
-    assert text.split("\n")[0].endswith("injected S/N 20 (IB sub off)")
+    assert text.split("\n")[0].endswith("injected S/N 12 (IB sub off)")
 
 
 def test_summary_splits_the_ratio_line_when_a_day_mixes_states():
-    on = dict(RECOVERED_ROW, sub_incoh=1, rec_snr=25.6)      # ratio 1.30
-    off = dict(RECOVERED_ROW, sub_incoh=0, rec_snr=40.9)     # ratio 2.08
+    on = dict(RECOVERED_ROW, sub_incoh=1, rec_snr=25.6)      # 25.6/12 = 2.13
+    off = dict(RECOVERED_ROW, sub_incoh=0, rec_snr=40.9)     # 40.9/12 = 3.41
     text = inject_slack.summary_text([on, off], "2026-09-10")
-    assert "recovered/injected S/N (IB sub on): median 1.30" in text
-    assert "recovered/injected S/N (IB sub off): median 2.08" in text
+    assert "recovered/injected S/N (IB sub on): median 2.13" in text
+    assert "recovered/injected S/N (IB sub off): median 3.41" in text
 
 
 def test_summary_keeps_one_ratio_line_for_a_single_state():
@@ -504,9 +510,9 @@ def test_the_caption_is_the_sent_line_then_the_outcome_line():
     text = inject_slack.injection_text(RECOVERED_ROW, "http://host:8050")
     first, second = text.split("\n")
     assert first == (f"injection inj_20260909_0005 sent: beam 90, DM 300, "
-                     f"FWHM 11.8{NBSP}ms, injected S/N 20")
-    assert second.startswith("recovered -> SNR 35.5")
-    assert "SNR 35.5 (ratio 1.81)" in second
+                     f"FWHM 11.8{NBSP}ms, injected S/N 12")
+    assert second.startswith("recovered -> SNR 35.5 (ratio 2.96)")
+    assert "SNR 35.5 (ratio 2.96)" in second
     # nothing is being awaited by the time this posts
     assert "awaiting recovery" not in text
 
@@ -802,3 +808,24 @@ def test_sent_then_update_dry_run_writes_both_payloads(tmp_path):
     assert "awaiting recovery" not in upd_payload["text"]
     assert [b["type"] for b in upd_payload["blocks"]] == ["section", "image"]
     assert "/events/inj661/inj661.png" in body
+
+
+def test_the_summary_ratio_uses_the_same_injected_snr(monkeypatch):
+    """The sent line and the summary must never disagree about what went in.
+
+    They both route through injected_snr(), so a change of preference moves
+    them together; this fails if the summary ever grows its own idea.
+    """
+    monkeypatch.setattr(inject_slack, "injected_snr", lambda row: 10.0)
+    text = inject_slack.summary_text([dict(RECOVERED_ROW, rec_snr=25.0)],
+                                     "2026-09-10")
+    assert "recovered/injected S/N: median 2.50" in text
+
+
+def test_the_solver_value_wins_in_the_sent_line_and_the_ratio_together():
+    """One number, both places: inject_snr 12, rec_snr 35.5 -> 2.96."""
+    sent = inject_slack.sent_text(RECOVERED_ROW).split("\n")[0]
+    assert sent.endswith("injected S/N 12")
+    assert "(ratio 2.96)" in inject_slack.outcome_text(RECOVERED_ROW)
+    assert "median 2.96" in inject_slack.summary_text([RECOVERED_ROW],
+                                                      "2026-09-10")

@@ -156,13 +156,13 @@ def injected_fwhm_ms(row) -> float | None:
 def injected_snr(row) -> float | None:
     """The S/N of the pulse that was actually written into the stream.
 
-    `est_snr` is the generator's own INJECTED_SNR_ESTIMATE for the rendered
-    filterbank (its canonical matched filter), so it describes the pulse as
-    written rather than as requested. `inject_snr` is the value the solver
-    aimed at and stands in when the generator printed nothing.
+    `inject_snr` is the value the amplitude solver aimed at from the live
+    noise; it is what the card prints (Vishnu, 2026-09-10: the generator's
+    own `est_snr` reads a different noise sample and disagreed by up to 2x
+    on the live cards). `est_snr` stands in for rows without a solver value.
     """
-    est = _f(row, "est_snr")
-    return est if est is not None else _f(row, "inject_snr")
+    inj = _f(row, "inject_snr")
+    return inj if inj is not None else _f(row, "est_snr")
 
 
 def sent_text(row, icfg: dict | None = None) -> str:
