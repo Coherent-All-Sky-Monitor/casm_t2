@@ -193,7 +193,7 @@ context:                # T1 neighbourhood embedded in trigger cards
 # Ledger rows are written before the FIFO write; t2d tags matching clusters
 # 'injection' and never dumps them. Gates reconcile ~3 min after each shot.
 injection:
-  cadence_min: 120
+  cadence_min: 180
   streams: [0, 1, 2, 3]
   # Shot parameters, one entry per drawn quantity. Each is
   #   {dist: uniform|loguniform|choice|fixed, ...}
@@ -291,7 +291,7 @@ injection:
   # after writing, and a 14 s window took ~20 s on 2026-09-09, hence the
   # timeout. Dumps are deleted after the plot unless keep_dump.
   replay:
-    post: daily
+    post: always
     dump_pre_s: 24
     dump_post_s: 10
     dump_timeout_s: 60
@@ -309,6 +309,19 @@ injection:
   # consecutive missed shots. Preview it first: t2-inject-slack-preview.
   slack:
     enabled: false
+    # sent_then_update  the sent line posts the moment the pulse goes in, so
+    #                   the channel shows a shot in flight; that same message
+    #                   is COMPLETED ~100 s later with a bar coloured by
+    #                   outcome, carrying the result line and the replay plot
+    #                   inline. One message per shot.
+    # single            nothing at fire time; one finished card once the
+    #                   outcome and the plot both exist.
+    # sent_then_edit    the original two-step shape: a "sent" message, edited
+    #                   with a coloured outcome bar, replay threaded under it.
+    mode: sent_then_update
+    # The daily summary is text only. The injected-vs-recovered S/N figure
+    # is still built if this is true, and threaded under the summary.
+    summary_figures: false
     dry_run_dir: null
     channel: null
     streak_every: 5

@@ -69,9 +69,11 @@ for that gulp. Recovered widths are quoted as the FWHM of hella's kernel
 (`casm_t2.hella_kernel`), which is about two thirds of the `2**ibox` trial
 label.
 
-The injection daemon can post one Slack message per shot, edited in place
-with the outcome when reconciliation finishes. It ships disabled
-(`injection.slack.enabled: false`); `t2-inject-slack-preview` renders the
+The injection daemon can post one Slack message per shot: the sent line when
+the pulse goes in, completed in place a couple of minutes later with a
+coloured bar carrying the outcome and the replay plot. It ships disabled
+(`injection.slack.enabled: false`);
+`t2-inject-slack-preview` renders the
 same messages and figures to a directory with no token and no network, so
 they can be reviewed before it is turned on. Columns, the outcome enum and
 the flags are in `docs/architecture.md` and `docs/operations.md`.

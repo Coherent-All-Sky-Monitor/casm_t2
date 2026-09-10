@@ -329,7 +329,8 @@ def test_disabled_poster_is_a_noop(no_network):
 
 def test_dry_run_writes_files_and_never_posts(tmp_path, no_network):
     out = tmp_path / "dry"
-    poster = inject_slack.SlackPoster(enabled=True, dry_run_dir=out)
+    poster = inject_slack.SlackPoster(enabled=True, dry_run_dir=out,
+                                      mode=inject_slack.MODE_SENT_THEN_EDIT)
     ts = poster.post_sent(RECOVERED_ROW)
     assert ts and ts.startswith("dry-")
     poster.post_outcome(RECOVERED_ROW)
@@ -339,10 +340,11 @@ def test_dry_run_writes_files_and_never_posts(tmp_path, no_network):
     # The numeric prefix keeps the files in posting order.
     names = sorted(p.name for p in out.glob("*.txt"))
     assert [n.split("_", 1)[1] for n in names] == [
-        "sent_661.txt", "outcome_661.txt", "streak_5.txt",
+        "inject_661_sent.txt", "outcome_661.txt", "streak_5.txt",
         "summary_2026-09-09.txt"]
     assert "SNR 35.5" in (out / names[1]).read_text()
-    assert (out / "snr_recovery.png").is_file()
+    # the summary figure is behind slack.summary_figures, off by default
+    assert not (out / "snr_recovery.png").exists()
 
 
 def test_miss_streak_reads_the_ledger(conn):
@@ -378,14 +380,16 @@ def test_check_streak_posts_at_multiples(tmp_path, conn, no_network):
 def test_summary_posts_one_message_with_the_figure_in_its_thread(tmp_path,
                                                                  monkeypatch):
     """One top-level text message; the figure a reply carrying its ts."""
-    poster = inject_slack.SlackPoster(enabled=True)
+    poster = inject_slack.SlackPoster(
+        enabled=True, icfg={"slack": {"summary_figures": True}})
     calls = {"posts": [], "files": []}
 
     def fake_post(text, attachments=None, thread_ts=None):
         calls["posts"].append((text, thread_ts))
         return "1757000000.001"
 
-    def fake_post_file(png, title, thread_ts=None):
+    def fake_post_file(png, title, thread_ts=None, comment=None,
+                       want_ts=False):
         calls["files"].append((png.name, thread_ts))
         return True
 
@@ -470,3 +474,342 @@ def test_the_default_dm_bins_all_get_distinct_styles():
     styles = [inject_slack.DM_STYLES[i % len(inject_slack.DM_STYLES)]
               for i in range(len(labels))]
     assert len(set(styles)) == len(labels)
+
+
+# --- single-message mode -----------------------------------------------------
+
+def test_sent_then_update_is_the_default_mode():
+    assert inject_slack.SlackPoster().mode == inject_slack.MODE_SENT_THEN_UPDATE
+    import yaml
+    with open("config/t2d.yaml") as fh:
+        scfg = yaml.safe_load(fh)["injection"]["slack"]
+    assert scfg["mode"] == "sent_then_update"
+    assert scfg["summary_figures"] is False
+
+
+def test_an_unknown_mode_falls_back_to_the_default(caplog):
+    with caplog.at_level("WARNING"):
+        poster = inject_slack.SlackPoster(mode="whatever")
+    assert poster.mode == inject_slack.MODE_SENT_THEN_UPDATE
+    assert "not one of" in caplog.text
+
+
+def test_single_mode_posts_nothing_at_fire_time(tmp_path, no_network):
+    poster = inject_slack.SlackPoster(enabled=True, dry_run_dir=tmp_path,
+                                      mode=inject_slack.MODE_SINGLE)
+    assert poster.post_sent(RECOVERED_ROW) is None
+    assert poster.post_outcome(RECOVERED_ROW) is None
+    assert list(tmp_path.glob("*.txt")) == []
+
+
+def test_sent_then_update_posts_the_sent_line_at_fire_time(tmp_path,
+                                                           no_network):
+    """The channel must show a shot is in flight before the result exists."""
+    import json
+    poster = inject_slack.SlackPoster(enabled=True, dry_run_dir=tmp_path)
+    assert poster.post_sent(RECOVERED_ROW) is not None
+    written, = list(tmp_path.glob("*_inject_661_sent.txt"))
+    payload = json.loads(written.read_text())
+    assert payload["text"].startswith("injection 661 sent:")
+    assert payload["text"].endswith("_awaiting recovery..._")
+    assert "attachments" not in payload      # nothing to colour yet
+
+
+def test_the_caption_is_the_sent_line_then_the_outcome_line():
+    text = inject_slack.injection_text(RECOVERED_ROW, "http://host:8050")
+    first, second = text.split("\n")
+    assert first == (f"injection 661 sent: beam 90, DM 300, "
+                     f"FWHM 11.8{NBSP}ms, injected S/N 20")
+    assert second.startswith("recovered -> <http://host:8050/injections/plot/")
+    assert "SNR 35.5 (ratio 1.81)" in second
+    # nothing is being awaited by the time this posts
+    assert "awaiting recovery" not in text
+
+
+def test_the_caption_on_a_miss():
+    row = dict(MISSED_ROW, fail_reason="lost at T1: no matching trial")
+    text = inject_slack.injection_text(row)
+    assert text.split("\n")[1] == "NOT recovered: lost at T1: no matching trial"
+
+
+def _fake_transport(poster, monkeypatch, *, upload="F123", post_err=None,
+                    shared=None):
+    """Record what the poster would send, without a socket in sight."""
+    seen = {"posts": [], "uploads": [], "shares": []}
+
+    def fake_upload(png, title):
+        seen["uploads"].append((str(png), title))
+        return upload
+
+    def fake_post(text, attachments=None, thread_ts=None, want_error=False):
+        seen["posts"].append({"text": text, "attachments": attachments})
+        err = post_err if attachments else None
+        ts = None if err else f"ts{len(seen['posts'])}"
+        return (ts, err) if want_error else ts
+
+    def fake_post_file(png, title, thread_ts=None, comment=None,
+                       want_ts=False):
+        seen["shares"].append({"png": str(png), "comment": comment})
+        return shared
+
+    monkeypatch.setattr(poster, "_upload_unshared", fake_upload)
+    monkeypatch.setattr(poster, "_post", fake_post)
+    monkeypatch.setattr(poster, "_post_file", fake_post_file)
+    return seen
+
+
+def test_the_inline_payload_shape(tmp_path, monkeypatch):
+    """text = the sent line; one coloured bar holding the result then image."""
+    poster = inject_slack.SlackPoster(enabled=True,
+                                      mode=inject_slack.MODE_SINGLE)
+    seen = _fake_transport(poster, monkeypatch)
+    ts = poster.post_injection(RECOVERED_ROW, tmp_path / "inj661.png")
+
+    assert ts == "ts1"
+    assert seen["uploads"] == [(str(tmp_path / "inj661.png"), "inj661")]
+    payload = seen["posts"][0]
+    # the notification reads as the sent line, not as JSON or a result
+    assert payload["text"] == inject_slack.sent_text(
+        RECOVERED_ROW, None).split("\n")[0]
+    assert "\n" not in payload["text"]
+
+    att, = payload["attachments"]
+    assert att["color"] == inject_slack.COLOR_RECOVERED
+    section, image = att["blocks"]
+    assert section["type"] == "section"
+    assert section["text"]["type"] == "mrkdwn"
+    assert section["text"]["text"] == inject_slack.outcome_text(
+        RECOVERED_ROW, poster.web_base)
+    assert image == {"type": "image", "slack_file": {"id": "F123"},
+                     "alt_text": "injection replay"}
+
+
+@pytest.mark.parametrize("outcome,color", [
+    (oc.RECOVERED, inject_slack.COLOR_RECOVERED),
+    (oc.MISSED_T1, inject_slack.COLOR_MISSED),
+    (oc.MISSED_T2, inject_slack.COLOR_MISSED),
+    (oc.FIRE_FAILED, inject_slack.COLOR_NEUTRAL),
+])
+def test_the_bar_colour_follows_the_outcome(outcome, color):
+    row = dict(RECOVERED_ROW, outcome=outcome)
+    att, = inject_slack.injection_attachments(row, "F1")
+    assert att["color"] == color
+
+
+def test_no_image_block_without_an_upload():
+    att, = inject_slack.injection_attachments(RECOVERED_ROW, None)
+    assert [b["type"] for b in att["blocks"]] == ["section"]
+
+
+def test_a_failed_upload_still_posts_the_coloured_bar(tmp_path, monkeypatch,
+                                                     caplog):
+    poster = inject_slack.SlackPoster(enabled=True,
+                                      mode=inject_slack.MODE_SINGLE)
+    seen = _fake_transport(poster, monkeypatch, upload=None)
+    with caplog.at_level("INFO"):
+        ts = poster.post_injection(RECOVERED_ROW, tmp_path / "x.png")
+    assert ts == "ts1"
+    att, = seen["posts"][0]["attachments"]
+    assert [b["type"] for b in att["blocks"]] == ["section"]   # no image
+    assert att["color"] == inject_slack.COLOR_RECOVERED
+    assert "form=bar" in caplog.text
+    assert seen["shares"] == []
+
+
+def test_rejected_blocks_fall_back_to_the_caption_form(tmp_path, monkeypatch,
+                                                       caplog):
+    """invalid_blocks: the app may not reference slack_file images."""
+    poster = inject_slack.SlackPoster(enabled=True,
+                                      mode=inject_slack.MODE_SINGLE)
+    seen = _fake_transport(poster, monkeypatch, post_err="invalid_blocks",
+                           shared="ts_shared")
+    with caplog.at_level("INFO"):
+        ts = poster.post_injection(RECOVERED_ROW, tmp_path / "x.png")
+    assert ts == "ts_shared"
+    assert seen["shares"][0]["comment"] == inject_slack.injection_text(
+        RECOVERED_ROW, poster.web_base, None)
+    assert "invalid_blocks" in caplog.text
+    assert "form=caption" in caplog.text
+
+
+def test_everything_failing_still_posts_the_two_lines(tmp_path, monkeypatch,
+                                                     caplog):
+    poster = inject_slack.SlackPoster(enabled=True,
+                                      mode=inject_slack.MODE_SINGLE)
+    seen = _fake_transport(poster, monkeypatch, post_err="invalid_blocks",
+                           shared=None)
+    with caplog.at_level("INFO"):
+        ts = poster.post_injection(RECOVERED_ROW, tmp_path / "x.png")
+    # the last post carries no attachments, so the fake gives it a ts
+    assert ts is not None
+    assert seen["posts"][-1]["attachments"] is None
+    assert seen["posts"][-1]["text"] == inject_slack.injection_text(
+        RECOVERED_ROW, poster.web_base, None)
+    assert "form=text" in caplog.text
+
+
+def test_no_png_at_all_posts_the_bar_then_text(monkeypatch, caplog):
+    poster = inject_slack.SlackPoster(enabled=True,
+                                      mode=inject_slack.MODE_SINGLE)
+    seen = _fake_transport(poster, monkeypatch)
+    ts = poster.post_injection(RECOVERED_ROW, None)
+    assert ts == "ts1"
+    assert seen["uploads"] == []                     # nothing to upload
+    att, = seen["posts"][0]["attachments"]
+    assert [b["type"] for b in att["blocks"]] == ["section"]
+
+
+def test_single_mode_dry_run_writes_the_payload(tmp_path):
+    import json
+    poster = inject_slack.SlackPoster(enabled=True, dry_run_dir=tmp_path,
+                                      mode=inject_slack.MODE_SINGLE)
+    poster.post_injection(RECOVERED_ROW, "/events/inj661/inj661.png")
+    written, = list(tmp_path.glob("*_inject_661.txt"))
+    body = written.read_text()
+    payload = json.loads(body.split("\n\n[uploaded")[0])
+    assert payload["text"].startswith("injection 661 sent:")
+    att, = payload["attachments"]
+    assert att["color"] == inject_slack.COLOR_RECOVERED
+    assert [b["type"] for b in att["blocks"]] == ["section", "image"]
+    assert "/events/inj661/inj661.png" in body
+
+
+def test_summary_figures_are_off_by_default(tmp_path, monkeypatch, no_network):
+    poster = inject_slack.SlackPoster(enabled=True, dry_run_dir=tmp_path,
+                                      mode=inject_slack.MODE_SINGLE)
+    monkeypatch.setattr(
+        inject_slack, "render_summary_figures",
+        lambda *a, **k: pytest.fail("rendered a figure with the flag off"))
+    poster.post_summary([RECOVERED_ROW], "2026-09-10", tmp_path)
+    assert list(tmp_path.glob("*summary*.txt"))
+
+
+# --- sent_then_update: the card is completed in place ------------------------
+
+SENT_ROW = dict(RECOVERED_ROW, slack_ts="1757000000.661")
+
+
+def _fake_update_transport(poster, monkeypatch, *, upload="F123",
+                           update_err=None, second_err=None, post_ts="tsnew"):
+    seen = {"updates": [], "posts": [], "shares": []}
+
+    def fake_update(ts, text, attachments=None, want_error=False):
+        seen["updates"].append({"ts": ts, "text": text,
+                                "attachments": attachments})
+        err = update_err if len(seen["updates"]) == 1 else second_err
+        got = None if err else ts
+        return (got, err) if want_error else got
+
+    def fake_post(text, attachments=None, thread_ts=None, want_error=False):
+        seen["posts"].append({"text": text, "attachments": attachments})
+        return (post_ts, None) if want_error else post_ts
+
+    def fake_post_file(png, title, thread_ts=None, comment=None,
+                       want_ts=False):
+        seen["shares"].append({"thread_ts": thread_ts, "comment": comment})
+        return "shared"
+
+    monkeypatch.setattr(poster, "_upload_unshared", lambda p, t: upload)
+    monkeypatch.setattr(poster, "_update", fake_update)
+    monkeypatch.setattr(poster, "_post", fake_post)
+    monkeypatch.setattr(poster, "_post_file", fake_post_file)
+    return seen
+
+
+def test_the_card_is_completed_in_place(tmp_path, monkeypatch, caplog):
+    poster = inject_slack.SlackPoster(enabled=True)
+    seen = _fake_update_transport(poster, monkeypatch)
+    with caplog.at_level("INFO"):
+        ts = poster.post_injection(SENT_ROW, tmp_path / "inj661.png")
+
+    assert ts == "1757000000.661"          # the SAME message, not a new one
+    assert seen["posts"] == []
+    upd, = seen["updates"]
+    assert upd["ts"] == "1757000000.661"
+    # the awaiting tail is gone once there is an outcome
+    assert "awaiting recovery" not in upd["text"]
+    att, = upd["attachments"]
+    assert att["color"] == inject_slack.COLOR_RECOVERED
+    assert [b["type"] for b in att["blocks"]] == ["section", "image"]
+    assert att["blocks"][1]["slack_file"] == {"id": "F123"}
+    assert "completed in place (form=inline)" in caplog.text
+
+
+def test_a_failed_upload_completes_the_card_without_the_image(tmp_path,
+                                                              monkeypatch,
+                                                              caplog):
+    poster = inject_slack.SlackPoster(enabled=True)
+    seen = _fake_update_transport(poster, monkeypatch, upload=None)
+    with caplog.at_level("INFO"):
+        ts = poster.post_injection(SENT_ROW, tmp_path / "x.png")
+    assert ts == "1757000000.661"
+    att, = seen["updates"][0]["attachments"]
+    assert [b["type"] for b in att["blocks"]] == ["section"]
+    assert "form=bar" in caplog.text
+    assert seen["shares"] == []
+
+
+def test_rejected_blocks_complete_the_bar_and_thread_the_plot(tmp_path,
+                                                              monkeypatch,
+                                                              caplog):
+    """invalid_blocks: keep the coloured bar, hang the plot underneath."""
+    poster = inject_slack.SlackPoster(enabled=True)
+    seen = _fake_update_transport(poster, monkeypatch,
+                                  update_err="invalid_blocks")
+    with caplog.at_level("INFO"):
+        ts = poster.post_injection(SENT_ROW, tmp_path / "x.png")
+    assert ts == "1757000000.661"
+    assert len(seen["updates"]) == 2
+    first, second = seen["updates"]
+    assert [b["type"] for b in first["attachments"][0]["blocks"]] == [
+        "section", "image"]
+    assert [b["type"] for b in second["attachments"][0]["blocks"]] == ["section"]
+    # the plot arrives as a reply under the very same message
+    assert seen["shares"][0]["thread_ts"] == "1757000000.661"
+    assert seen["shares"][0]["comment"] == inject_slack.CAPTION_REPLY
+    assert "form=bar+thread" in caplog.text
+
+
+def test_an_unusable_ts_falls_back_to_a_new_message(tmp_path, monkeypatch,
+                                                    caplog):
+    """A message that cannot be edited at all still gets its card posted."""
+    poster = inject_slack.SlackPoster(enabled=True)
+    seen = _fake_update_transport(poster, monkeypatch,
+                                  update_err="message_not_found",
+                                  second_err="message_not_found")
+    with caplog.at_level("INFO"):
+        ts = poster.post_injection(SENT_ROW, tmp_path / "x.png")
+    assert ts == "tsnew"
+    assert seen["posts"], "no new message was posted"
+    assert "posting a new message instead" in caplog.text
+
+
+def test_without_a_stored_ts_it_posts_fresh(tmp_path, monkeypatch):
+    """Nothing to update - the fire-time post never landed."""
+    poster = inject_slack.SlackPoster(enabled=True)
+    seen = _fake_update_transport(poster, monkeypatch)
+    ts = poster.post_injection(dict(SENT_ROW, slack_ts=None),
+                               tmp_path / "x.png")
+    assert ts == "tsnew"
+    assert seen["updates"] == []
+    assert seen["posts"]
+
+
+def test_sent_then_update_dry_run_writes_both_payloads(tmp_path):
+    import json
+    poster = inject_slack.SlackPoster(enabled=True, dry_run_dir=tmp_path)
+    poster.post_sent(SENT_ROW)
+    poster.post_injection(SENT_ROW, "/events/inj661/inj661.png")
+
+    sent, = list(tmp_path.glob("*_inject_661_sent.txt"))
+    upd, = list(tmp_path.glob("*_inject_661_update.txt"))
+    sent_payload = json.loads(sent.read_text())
+    assert sent_payload["text"].endswith("_awaiting recovery..._")
+
+    body = upd.read_text()
+    upd_payload = json.loads(body.split("\n\n[uploaded")[0])
+    assert upd_payload["ts"] == "1757000000.661"
+    assert "awaiting recovery" not in upd_payload["text"]
+    att, = upd_payload["attachments"]
+    assert [b["type"] for b in att["blocks"]] == ["section", "image"]
+    assert "/events/inj661/inj661.png" in body

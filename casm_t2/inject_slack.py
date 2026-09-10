@@ -48,6 +48,9 @@ NBSP = " "
 COLOR_RECOVERED = "#2E7D32"
 COLOR_MISSED = "#C62828"
 COLOR_NEUTRAL = "#9E9E9E"
+
+#: Caption when the plot has to hang under the card instead of inside it.
+CAPTION_REPLY = "replay: injected pulse added to the stream dump"
 _INK = "#262626"
 
 #: Marker identity per DM bin, in bin order. Identity rides on colour AND
@@ -260,6 +263,37 @@ def outcome_text(row, web_base: str = DEFAULT_WEB_BASE) -> str:
         bits.append(f"width {hella_kernel.kernel_fwhm_ms(int(ibox)):.1f}"
                     f"{NBSP}ms (ibox {int(ibox)})")
     return " | ".join(bits)
+
+
+def injection_text(row, web_base: str = DEFAULT_WEB_BASE,
+                   icfg: dict | None = None) -> str:
+    """The whole shot in two lines: what went in, and what came back.
+
+    This is the caption of the single message per injection. It carries no
+    "awaiting recovery" line, because by the time it posts there is nothing
+    left to await.
+    """
+    sent = sent_text(row, icfg).split("\n")[0]
+    return sent + "\n" + outcome_text(row, web_base)
+
+
+def injection_attachments(row, file_id: str | None = None,
+                          web_base: str = DEFAULT_WEB_BASE) -> list[dict]:
+    """The coloured attachment of a shot's single message, DSA style.
+
+    One bar, coloured by outcome, holding the result line and - when the
+    replay plot was uploaded - the plot itself inline. `file_id` is a file
+    the bot owns and has NOT shared to a channel; referencing it from a
+    block is what puts the image inside the bar rather than beside it.
+    """
+    line = outcome_text(row, web_base)
+    blocks = [{"type": "section",
+               "text": {"type": "mrkdwn", "text": line}}]
+    if file_id:
+        blocks.append({"type": "image",
+                       "slack_file": {"id": file_id},
+                       "alt_text": "injection replay"})
+    return [{"color": outcome_color(row), "blocks": blocks, "fallback": line}]
 
 
 def outcome_color(row) -> str:
@@ -540,6 +574,29 @@ def load_channel() -> str | None:
     return _read_first_word(CHANNEL_OVERRIDE_PATH) or _read_first_word(CHANNEL_PATH)
 
 
+#: How a shot reaches the channel.
+#:
+#: `sent_then_update` (the default) posts the sent line the moment the pulse
+#: goes in, so the channel shows a shot is in flight, and then COMPLETES that
+#: same message ~100 s later: the coloured bar carrying the outcome line and
+#: the replay plot inline. One message per shot, and it says something useful
+#: from the first second.
+#:
+#: `single` posts nothing at fire time and ONE message per
+#: injection once everything is known: the replay plot, captioned with the
+#: sent line and the outcome line. One shot, one message, and the picture is
+#: there the first time anyone looks at it.
+#:
+#: `sent_then_edit` is the older two-step shape: a "sent" message the moment
+#: the pulse goes in, edited in place with a coloured outcome bar ~100 s
+#: later, and the replay threaded under it. It shows a shot is in flight
+#: before the result exists, which is worth having while the bot is new.
+MODE_SENT_THEN_UPDATE = "sent_then_update"
+MODE_SINGLE = "single"
+MODE_SENT_THEN_EDIT = "sent_then_edit"
+MODES = (MODE_SENT_THEN_UPDATE, MODE_SINGLE, MODE_SENT_THEN_EDIT)
+
+
 class SlackPoster:
     """Thin Slack transport for the injection bot. Never raises.
 
@@ -551,7 +608,8 @@ class SlackPoster:
     def __init__(self, enabled: bool = False, dry_run_dir=None,
                  channel: str | None = None, streak_every: int = 5,
                  icfg: dict | None = None,
-                 web_base: str = DEFAULT_WEB_BASE):
+                 web_base: str = DEFAULT_WEB_BASE,
+                 mode: str = MODE_SENT_THEN_UPDATE):
         self.enabled = bool(enabled)
         self.dry_run_dir = Path(dry_run_dir) if dry_run_dir else None
         self.dry_run = self.dry_run_dir is not None
@@ -562,6 +620,11 @@ class SlackPoster:
         self.icfg = icfg
         # base URL of the t3 web app, for the link in the recovered line
         self.web_base = web_base or DEFAULT_WEB_BASE
+        if mode not in MODES:
+            logger.warning("slack mode %r is not one of %s; using %s",
+                           mode, MODES, MODE_SENT_THEN_UPDATE)
+            mode = MODE_SENT_THEN_UPDATE
+        self.mode = mode
         self._seq = 0
 
     # ----- dry run ---------------------------------------------------------
@@ -585,11 +648,20 @@ class SlackPoster:
             return None, None
         return token, channel
 
-    def _post(self, text: str, attachments=None, thread_ts=None) -> str | None:
-        """chat.postMessage; returns the message ts, or None on any failure."""
+    def _post(self, text: str, attachments=None, thread_ts=None,
+              want_error: bool = False):
+        """chat.postMessage; returns the message ts, or None on any failure.
+
+        With `want_error` it returns (ts, error) instead, so a caller can
+        tell a rejected block payload from a dead network and fall back to
+        something the workspace will accept.
+        """
+        def out(ts, err):
+            return (ts, err) if want_error else ts
+
         token, channel = self._auth()
         if token is None:
-            return None
+            return out(None, "unconfigured")
         payload = {"channel": channel, "text": text}
         if attachments:
             payload["attachments"] = attachments
@@ -605,16 +677,21 @@ class SlackPoster:
             if not doc.get("ok"):
                 logger.warning("slack chat.postMessage failed: %s",
                                doc.get("error"))
-                return None
-            return doc.get("ts")
+                return out(None, str(doc.get("error")))
+            return out(doc.get("ts"), None)
         except Exception as exc:  # noqa: BLE001 - alerting is best-effort
             logger.warning("slack post failed: %s", exc)
-            return None
+            return out(None, str(exc))
 
-    def _update(self, ts: str, text: str, attachments=None) -> str | None:
+    def _update(self, ts: str, text: str, attachments=None,
+                want_error: bool = False):
+        """chat.update; returns the ts, or (ts, error) with `want_error`."""
+        def out(got, err):
+            return (got, err) if want_error else got
+
         token, channel = self._auth()
         if token is None:
-            return None
+            return out(None, "unconfigured")
         payload = {"channel": channel, "ts": ts, "text": text}
         if attachments:
             payload["attachments"] = attachments
@@ -627,22 +704,57 @@ class SlackPoster:
             doc = r.json()
             if not doc.get("ok"):
                 logger.warning("slack chat.update failed: %s", doc.get("error"))
-                return None
-            return doc.get("ts")
+                return out(None, str(doc.get("error")))
+            return out(doc.get("ts"), None)
         except Exception as exc:  # noqa: BLE001
             logger.warning("slack update failed: %s", exc)
-            return None
+            return out(None, str(exc))
 
-    def _post_file(self, png: Path, title: str, thread_ts=None,
-                   comment: str | None = None) -> bool:
-        """External-upload flow, same three steps as casm_t3.alerts."""
-        token, channel = self._auth()
+    def _share_ts(self, file_id: str, channel: str, auth: dict,
+                  timeout_s: float = 10.0) -> str | None:
+        """Message ts of the uploaded file's share into `channel`.
+
+        Slack materialises the upload -> message share asynchronously, so
+        poll files.info briefly. Needs the files:read scope; returns None on
+        timeout or without it, which only costs later editability - the post
+        itself already succeeded.
+        """
+        import time as _time
+        import requests
+        deadline = _time.monotonic() + timeout_s
+        while _time.monotonic() < deadline:
+            try:
+                d = requests.get(f"{_SLACK_API}/files.info", headers=auth,
+                                 params={"file": file_id},
+                                 timeout=_TIMEOUT_S).json()
+            except Exception:  # noqa: BLE001
+                return None
+            if d.get("ok"):
+                shares = (d.get("file") or {}).get("shares") or {}
+                for vis in ("public", "private"):
+                    entries = (shares.get(vis) or {}).get(channel)
+                    if entries and entries[0].get("ts"):
+                        return entries[0]["ts"]
+            elif d.get("error") == "missing_scope":
+                return None
+            _time.sleep(1.0)
+        return None
+
+    def _upload_unshared(self, png: Path, title: str) -> str | None:
+        """Upload a file the bot owns, shared to no channel; returns its id.
+
+        The two-step external upload, completed WITHOUT `channel_id`. The
+        file then exists but appears nowhere, which is what lets a block
+        reference render it inside an attachment instead of as its own
+        message with the picture hanging beneath.
+        """
+        token, _channel = self._auth()
         if token is None:
-            return False
+            return None
         png = Path(png)
         if not png.is_file():
-            logger.warning("slack post: no such figure %s", png)
-            return False
+            logger.warning("slack upload: no such file %s", png)
+            return None
         try:
             import requests
             auth = {"Authorization": f"Bearer {token}"}
@@ -656,7 +768,56 @@ class SlackPoster:
             if not d1.get("ok"):
                 logger.warning("slack getUploadURLExternal failed: %s",
                                d1.get("error"))
-                return False
+                return None
+            with png.open("rb") as fh:
+                r2 = requests.post(d1["upload_url"], files={"file": fh},
+                                   timeout=_TIMEOUT_S)
+            r2.raise_for_status()
+            r3 = requests.post(
+                f"{_SLACK_API}/files.completeUploadExternal", headers=auth,
+                json={"files": [{"id": d1["file_id"], "title": title}]},
+                timeout=_TIMEOUT_S)
+            r3.raise_for_status()
+            d3 = r3.json()
+            if not d3.get("ok"):
+                logger.warning("slack completeUploadExternal failed: %s",
+                               d3.get("error"))
+                return None
+            return d1["file_id"]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("slack unshared upload failed: %s", exc)
+            return None
+
+    def _post_file(self, png: Path, title: str, thread_ts=None,
+                   comment: str | None = None, want_ts: bool = False):
+        """External-upload flow, same three steps as casm_t3.alerts.
+
+        Returns True/False normally; with `want_ts` it returns the share's
+        message ts (or None), which single mode stores as the shot's
+        `slack_ts`.
+        """
+        fail = None if want_ts else False
+        token, channel = self._auth()
+        if token is None:
+            return fail
+        png = Path(png)
+        if not png.is_file():
+            logger.warning("slack post: no such figure %s", png)
+            return fail
+        try:
+            import requests
+            auth = {"Authorization": f"Bearer {token}"}
+            r1 = requests.get(f"{_SLACK_API}/files.getUploadURLExternal",
+                              headers=auth,
+                              params={"filename": png.name,
+                                      "length": png.stat().st_size},
+                              timeout=_TIMEOUT_S)
+            r1.raise_for_status()
+            d1 = r1.json()
+            if not d1.get("ok"):
+                logger.warning("slack getUploadURLExternal failed: %s",
+                               d1.get("error"))
+                return fail
             with png.open("rb") as fh:
                 r2 = requests.post(d1["upload_url"], files={"file": fh},
                                    timeout=_TIMEOUT_S)
@@ -674,26 +835,38 @@ class SlackPoster:
             if not d3.get("ok"):
                 logger.warning("slack completeUploadExternal failed: %s",
                                d3.get("error"))
-                return False
+                return fail
+            if want_ts:
+                return self._share_ts(d1["file_id"], channel, auth)
             return True
         except Exception as exc:  # noqa: BLE001
             logger.warning("slack file upload failed: %s", exc)
-            return False
+            return fail
 
     # ----- public ----------------------------------------------------------
 
     def post_sent(self, row) -> str | None:
-        """Post the "injection sent" message; returns its ts for the ledger."""
-        if not self.enabled:
+        """Post the "injection sent" message; returns its ts for the ledger.
+
+        Nothing at all in `single` mode, which posts one finished message
+        later. In the other two this is the message the channel sees at fire
+        time, and it is the one that later gets completed or edited.
+        """
+        if not self.enabled or self.mode == MODE_SINGLE:
             return None
         text = sent_text(row, self.icfg)
         if self.dry_run:
-            return self._dry_write(f"sent_{_g(row, 'id', 'x')}", text)
+            import json
+            body = json.dumps({"text": text}, indent=2)
+            return self._dry_write(f"inject_{_g(row, 'id', 'x')}_sent", body)
         return self._post(text)
 
     def post_outcome(self, row) -> str | None:
-        """Resolve the shot: edit the sent message in place, else post fresh."""
-        if not self.enabled:
+        """Resolve the shot: edit the sent message in place, else post fresh.
+
+        Not used in `single` mode - `post_injection` carries the outcome.
+        """
+        if not self.enabled or self.mode == MODE_SINGLE:
             return None
         line = outcome_text(row, self.web_base)
         color = outcome_color(row)
@@ -710,6 +883,96 @@ class SlackPoster:
             logger.warning("slack edit of injection %s failed; posting fresh",
                            _g(row, "id"))
         return self._post(f"`{_g(row, 'id')}`: {line}", attachments=[attachment])
+
+    def post_injection(self, row, png=None) -> str | None:
+        """Complete (or post) the shot's message; returns its ts.
+
+        In `sent_then_update` the fire-time message is UPDATED in place: the
+        sent line loses its "awaiting recovery" tail and gains a bar coloured
+        by outcome, carrying the result line and the replay plot inline. In
+        `single` the same card is posted fresh, because nothing went up
+        earlier.
+
+        Both share the plot trick: upload the file WITHOUT a channel, so the
+        bot owns something that appears nowhere, then reference it from an
+        image block by id. Sharing it to the channel instead would give the
+        picture its own message.
+
+        Every step down the fallback chain is logged with the form used, so
+        a channel that has quietly degraded says so in the journal rather
+        than just looking dull.
+        """
+        if not self.enabled:
+            return None
+        sent = sent_text(row, self.icfg).split("\n")[0]
+        caption = injection_text(row, self.web_base, self.icfg)
+        inj_id = _g(row, "id", "x")
+        ts = _g(row, "slack_ts")
+        updating = self.mode == MODE_SENT_THEN_UPDATE and bool(ts)
+
+        if self.dry_run:
+            import json
+            file_id = f"F_DRYRUN_{inj_id}" if png is not None else None
+            payload = {"text": sent,
+                       "attachments": injection_attachments(
+                           row, file_id, self.web_base)}
+            if updating:
+                payload = {"ts": ts, **payload}
+            body = json.dumps(payload, indent=2)
+            if png is not None:
+                body += f"\n\n[uploaded, unshared] {png}"
+            name = f"inject_{inj_id}_update" if updating else f"inject_{inj_id}"
+            return self._dry_write(name, body)
+
+        file_id = self._upload_unshared(png, f"inj{inj_id}") if png else None
+        attachments = injection_attachments(row, file_id, self.web_base)
+
+        if updating:
+            got, err = self._update(ts, sent, attachments=attachments,
+                                    want_error=True)
+            if got:
+                logger.info("injection %s completed in place (form=%s)",
+                            inj_id, "inline" if file_id else "bar")
+                return got
+            if file_id is not None:
+                # Most likely the app may not reference slack_file images.
+                # Complete the card without the picture, then hang the plot
+                # under it so it is still one thread, one shot.
+                logger.warning("injection %s: update with blocks refused (%s);"
+                               " completing without the image", inj_id, err)
+                plain = injection_attachments(row, None, self.web_base)
+                got, err2 = self._update(ts, sent, attachments=plain,
+                                         want_error=True)
+                if got:
+                    self._post_file(Path(png), f"inj{inj_id}", thread_ts=ts,
+                                    comment=CAPTION_REPLY)
+                    logger.info("injection %s completed (form=bar+thread)",
+                                inj_id)
+                    return got
+                err = err2
+            logger.warning("injection %s: update failed (%s); posting a new "
+                           "message instead", inj_id, err)
+
+        # `single` mode, or an update that could not be made at all.
+        got, err = self._post(sent, attachments=attachments, want_error=True)
+        if got:
+            logger.info("injection %s posted (form=%s)", inj_id,
+                        "inline" if file_id else "bar")
+            return got
+        if file_id is not None:
+            logger.warning("injection %s: block post refused (%s); falling "
+                           "back to the shared-upload caption form",
+                           inj_id, err)
+            shared = self._post_file(Path(png), f"inj{inj_id}",
+                                     comment=caption, want_ts=True)
+            if shared:
+                logger.info("injection %s posted (form=caption)", inj_id)
+                return shared
+        logger.warning("injection %s: falling back to plain text", inj_id)
+        got = self._post(caption)
+        if got:
+            logger.info("injection %s posted (form=text)", inj_id)
+        return got
 
     def post_replay(self, row, png, caption: str) -> bool:
         """Thread the replay plot under this shot's own message.
@@ -747,9 +1010,12 @@ class SlackPoster:
         if not self.enabled:
             return None
         text = summary_text(rows, day, self.icfg)
-        figures = render_summary_figures(rows, fig_dir, self.icfg)
-        if not figures:
-            text += "\n(summary figures failed to render - see the log)"
+        want_figures = bool(((self.icfg or {}).get("slack") or {})
+                            .get("summary_figures", False))
+        figures = (render_summary_figures(rows, fig_dir, self.icfg)
+                   if want_figures else [])
+        if want_figures and not figures:
+            text += "\n(summary figure failed to render - see the log)"
         if self.dry_run:
             return self._dry_write(f"summary_{day}", text)
         ts = self._post(text)
@@ -801,7 +1067,8 @@ def poster_from_cfg(icfg: dict) -> SlackPoster:
                        channel=scfg.get("channel"),
                        streak_every=int(scfg.get("streak_every", 5)),
                        icfg=icfg,
-                       web_base=scfg.get("web_base") or DEFAULT_WEB_BASE)
+                       web_base=scfg.get("web_base") or DEFAULT_WEB_BASE,
+                       mode=scfg.get("mode", MODE_SENT_THEN_UPDATE))
 
 
 def utc_day(when: datetime | None = None) -> str:

@@ -592,20 +592,35 @@ def do_replay(conn, cfg: dict, poster, inj_id: int, dump_dir) -> Path | None:
     """
     icfg = cfg.get("injection", {}) or {}
     rcfg = inject_replay.replay_cfg(icfg)
-    if dump_dir is None or rcfg.get("post") == "never":
-        return None
     row = ledger_row(conn, inj_id)
     outcome = (row or {}).get("outcome")
-    if not inject_replay.post_due(rcfg, outcome,
-                                  inject_replay.last_replay_day(conn)):
-        logger.info("injection %d: replay not due (post=%s, outcome=%s)",
-                    inj_id, rcfg.get("post"), outcome)
-        inject_replay.cleanup_dump(dump_dir, rcfg)
+    completes = poster.mode in (inject_slack.MODE_SINGLE,
+                                inject_slack.MODE_SENT_THEN_UPDATE)
+    due = (dump_dir is not None and rcfg.get("post") != "never"
+           and inject_replay.post_due(rcfg, outcome,
+                                      inject_replay.last_replay_day(conn)))
+    if not due:
+        if dump_dir is not None:
+            logger.info("injection %d: replay not due (post=%s, outcome=%s)",
+                        inj_id, rcfg.get("post"), outcome)
+            inject_replay.cleanup_dump(dump_dir, rcfg)
+        if completes:
+            # These modes owe the shot a finished card either way: without a
+            # plot it is the outcome bar alone, which is the part that
+            # matters.
+            ts = poster.post_injection(row, None)
+            if ts:
+                # Never clear a ts we already have: the fire-time message
+                # still exists even when completing it failed.
+                with conn:
+                    conn.execute("UPDATE injections SET slack_ts=? WHERE id=?",
+                                 (ts, inj_id))
         return None
 
     event_utc = None
     if outcome in inject_outcome.MISSES:
-        # Nothing was found, so the tool is told where to put the pulse.
+        # Nothing was found, so the tool is told where to put the pulse: the
+        # image is always the pulse version, miss or not.
         event_utc = inject_replay.expected_event_utc(
             conn, datetime.fromisoformat(row["inject_utc"]))
     png = inject_replay.run_replay(inj_id, dump_dir, rcfg,
@@ -613,10 +628,26 @@ def do_replay(conn, cfg: dict, poster, inj_id: int, dump_dir) -> Path | None:
                                    event_utc=event_utc)
     posted = False
     if png is not None:
+        with conn:
+            conn.execute("UPDATE injections SET replay_png=? WHERE id=?",
+                         (str(png), inj_id))
+        row = ledger_row(conn, inj_id)
+    if completes:
+        # The shot's card: completed in place in sent_then_update, posted
+        # fresh in single.
+        ts = poster.post_injection(row, png)
+        posted = ts is not None
+        with conn:
+            if ts:
+                conn.execute("UPDATE injections SET slack_ts=? WHERE id=?",
+                             (ts, inj_id))
+            conn.execute("UPDATE injections SET replay_posted=? WHERE id=?",
+                         (int(posted), inj_id))
+    elif png is not None:
         posted = bool(poster.post_replay(row, png, inject_replay.CAPTION))
         with conn:
-            conn.execute("UPDATE injections SET replay_png=?, replay_posted=?"
-                         " WHERE id=?", (str(png), int(posted), inj_id))
+            conn.execute("UPDATE injections SET replay_posted=? WHERE id=?",
+                         (int(posted), inj_id))
     inject_replay.cleanup_dump(dump_dir, rcfg)
     return png
 

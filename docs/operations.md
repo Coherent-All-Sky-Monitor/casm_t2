@@ -146,14 +146,14 @@ merge - which is exactly what you want when a shot comes back at half the
 expected S/N, or not at all.
 
 The replay closes that: dump the injected stream around the shot, add the
-pulse to the dump where it should have arrived, render it, and thread the PNG
-under the shot's own Slack message. On a miss it shows what hella should have
-found and did not.
+pulse to the dump where it should have arrived, and render it. In the default
+`single` Slack mode that plot IS the shot's message. On a miss it shows what
+hella should have found and did not.
 
     injection:
       reconcile_wait_s: 90
       replay:
-        post: daily             # daily | on_miss | always | never
+        post: always            # always | daily | on_miss | never
         dump_pre_s: 24
         dump_post_s: 10
         dump_timeout_s: 60
@@ -161,10 +161,12 @@ found and did not.
         events_root: /mnt/nvme3/T3/EVENTS
         command: t3-replay-injection
 
-`post` decides when the PNG is posted: `always` every shot, `on_miss` only
-misses, `daily` every miss plus the first shot of each UTC day, `never` nothing
-(and then no dump is requested at all). The dump is taken on every shot
-whenever posting is possible, because it cannot be taken retrospectively.
+`post` decides when the plot is rendered and posted: `always` (the shipped
+setting) every shot, `on_miss` only misses, `daily` every miss plus the first
+shot of each UTC day, `never` nothing (and then no dump is requested at all).
+The dump is taken on every shot whenever posting is possible, because it
+cannot be taken retrospectively. In `single` mode a shot with no plot still
+gets its message, as text.
 
 The window is `[inject_utc - dump_pre_s, inject_utc - dump_post_s]` - both
 offsets go backwards, because the pulse lands before the FIFO write: the
@@ -176,10 +178,12 @@ Timeline per shot, from the FIFO write:
 
 | time | what |
 | --- | --- |
-| 0 s | ledger row, FIFO write, Slack "injection sent" |
+| 0 s | ledger row, FIFO write, the sent line posts |
 | ~20 s | the intensity dump completes |
-| ~100 s | reconcile; the outcome edits the Slack message |
-| ~110 s | the replay PNG lands as a thread reply under it |
+| ~90 s | reconcile: the outcome is known |
+| ~100-110 s | the replay renders and the card is completed in place |
+
+In `single` mode nothing posts at 0 s and the whole card appears at the end.
 
 Archive layout, one directory per shot under `events_root`:
 
@@ -193,11 +197,51 @@ and its ledger row alone, and the shot is still reconciled normally.
 
 ### Injection messages in Slack
 
-The daemon can post one Slack message per injection: a "sent" line when
-the pulse hits the FIFO, edited in place ~3 minutes later with a green or
-red bar carrying the outcome. A run of consecutive misses (default 5, and
-each multiple after that) posts one attention message; the streak is read
-straight off the ledger, so restarts cannot double-count it.
+The daemon posts one Slack message per injection, and completes it in place.
+
+In the default `sent_then_update` mode the sent line goes up the moment the
+pulse hits the FIFO, so the channel shows a shot in flight:
+
+    injection 667 sent: beam 220, DM 300, FWHM 11.8 ms, injected S/N 25
+    _awaiting recovery..._
+
+About 100-110 s later that same message is updated: the awaiting tail goes,
+and a bar coloured by outcome (green recovered, red missed, grey not fired)
+appears under it carrying the result line and the replay plot inline.
+
+    injection 667 sent: beam 220, DM 300, FWHM 11.8 ms, injected S/N 25
+    | recovered -> <.../event/260910qklnfh|260910qklnfh> | SNR 24.6 (ratio 0.99) | DM 299.8 (delta -0.2) | beam 220 | width 11.5 ms (ibox 4)
+    | [replay plot]
+
+The message `text` stays the plain sent line, so notifications and the channel
+list read sensibly. The plot gets inside the bar by being uploaded WITHOUT a
+channel - `files.completeUploadExternal` with no `channel_id`, so the bot owns
+a file that appears nowhere - and then referenced from an image block by id.
+Sharing it to a channel instead would give the picture its own message.
+
+Four forms, in descending order of how much they show; the one used is named
+in the log, so a channel that has quietly degraded says so in the journal
+rather than just looking dull:
+
+| form | what the card ends up as | when |
+| --- | --- | --- |
+| inline | bar, result line, image | the intended shape |
+| bar | bar and result line, no image | the upload failed |
+| bar+thread | bar and result line, plot as a reply | the workspace refused the blocks |
+| new message | the card posted fresh | the original could not be edited |
+
+`bar+thread` matters because `slack_file` image blocks need the app to be
+permitted to reference its own files; without that the update comes back
+`invalid_blocks`, and the plot still arrives under the same message.
+
+Two other modes are selectable. `single` posts nothing at fire time and one
+finished card once the outcome and the plot both exist - quieter, but the
+channel says nothing for the first 100 s. `sent_then_edit` is the original
+two-step shape, with the plot threaded rather than inline.
+
+A run of consecutive misses (default 5, and each multiple after that) posts
+one attention message; the streak is read straight off the ledger, so
+restarts cannot double-count it.
 
 **This ships disabled** — `injection.slack.enabled: false` in t2d.yaml.
 With it false the daemon posts nothing and behaves exactly as before.
