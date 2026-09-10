@@ -20,9 +20,14 @@ the main RFI discriminator, since a real pulse is compact on the sky and
 RFI is not. Beams enter as degrees on a tangent plane about the zenith,
 taken from the weights live at that moment, because the beam *index* is
 not sky-ordered: consecutive indices are a median 16 deg apart while true
-sky neighbours are 3.1 deg. The two sky axes carry the beam's own FWHM,
-18.1 deg East-West and 3.9 deg North-South — one source lights up a row of
-beams, not a circle of them. Clusters then run a filter chain: injection
+sky neighbours are 3.1 deg. The two sky axes carry the beam's own FWHM —
+one source lights up a row of beams, not a circle of them, because the beam
+is far wider East-West than North-South. That ellipse follows the deployed
+weights: it is computed from the antennas actually beamformed and stored on
+the weights-registry product (by `t3-weights-watch`), and t2d takes it from
+there per weights id, logging which product it came from. The
+`cluster.beam_fwhm_x_deg` / `beam_fwhm_y_deg` in `config/t2d.yaml` are only
+the fallback, used when the live product carries no ellipse. Clusters then run a filter chain: injection
 match (stored, never dumped), beam veto, wide-beam RFI cut (too many
 beams, or too wide on the sky), known-source DM-range match, and S/N
 tiers (A >= 30, B >= 15, C >= 12; blind triggers need A/B plus DM >= 20).

@@ -369,3 +369,38 @@ def test_synthetic_grid_is_not_sky_ordered():
     seps = [table.separation_deg(b, b + 1) for b in range(table.n - 1)]
     seps.sort()
     assert seps[len(seps) // 2] > 10.0    # median consecutive-index separation
+
+
+def test_daemon_fwhm_from_registry_product(daemon, pointings, monkeypatch, caplog):
+    """The sky link scales follow the deployed weights when the product has them."""
+    import logging
+    d = daemon()
+    p = dict(pointings, beam_fwhm_x_deg=19.326, beam_fwhm_y_deg=3.921)
+    monkeypatch.setattr(d.registry, "pointings_for", lambda utc: p)
+    with caplog.at_level(logging.INFO):
+        table = d._sky_table(("2026-09-09-21:12:15", 5))
+    params = d._params_for(table)
+    assert (params.beam_fwhm_x_deg, params.beam_fwhm_y_deg) == (19.326, 3.921)
+    # every other axis is still the configured one
+    assert params.samp_scale == d.params.samp_scale
+    assert sum("from the registry product" in r.message for r in caplog.records) == 1
+    # logged once per product, not once per gulp
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        d._sky_table(("2026-09-09-21:12:15", 6))
+    assert not [r for r in caplog.records if "registry product" in r.message]
+
+
+def test_daemon_fwhm_falls_back_to_config(daemon, pointings, monkeypatch, caplog):
+    """A product with no ellipse (or a zero one) leaves the configured values in force."""
+    import logging
+    d = daemon(cluster={"beam_fwhm_x_deg": 18.1, "beam_fwhm_y_deg": 3.9})
+    monkeypatch.setattr(d.registry, "pointings_for", lambda utc: pointings)
+    with caplog.at_level(logging.INFO):
+        table = d._sky_table(("2026-09-09-21:12:15", 5))
+    params = d._params_for(table)
+    assert (params.beam_fwhm_x_deg, params.beam_fwhm_y_deg) == (18.1, 3.9)
+    assert params is d.params
+    assert sum("no beam ellipse" in r.message for r in caplog.records) == 1
+    # no pointing table at all: config too
+    assert d._params_for(None) is d.params

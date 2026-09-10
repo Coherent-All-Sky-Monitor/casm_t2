@@ -23,8 +23,11 @@ see casm_t2 MEMORY.md).
 The sky link on each axis is the beam's own FWHM on that axis
 (2026-09-09), so two trials are linked when they fall within one beam width
 of each other. The beam is treated as a standard ellipse aligned with
-alt/az, from ``bf_weights_generator.compute_beam_fwhm``: 18.1 deg E-W by
-3.9 deg N-S, pointing independent. It is very much wider E-W than N-S, so
+alt/az, from ``bf_weights_generator.compute_beam_fwhm``, and it follows the
+deployed weights: t2d takes the pair off the weights-registry product that
+was live for the gulp (about 19.3 deg E-W by 3.9 deg N-S for the 17-antenna
+products of September 2026) and falls back to the configured values below
+only for a product that carries no ellipse. Pointing independent. It is very much wider E-W than N-S, so
 one source lights up a row of beams rather than a circle of them, and an
 isotropic link either splits that row or merges unrelated sky.
 
@@ -90,7 +93,9 @@ class ClusterParams:
     width_scale: float = 2.0     # steps of the width column (already log2 samples)
     # Beam FWHM per axis, degrees. This IS the sky link scale: two trials
     # within one beam width of each other on both axes are one event.
-    # Standard alt/az-aligned ellipse from compute_beam_fwhm.
+    # Standard alt/az-aligned ellipse from compute_beam_fwhm. t2d overrides
+    # these per weights product from the registry; the defaults here are the
+    # fallback for a product with no ellipse.
     beam_fwhm_x_deg: float = 18.1   # E-W
     beam_fwhm_y_deg: float = 3.9    # N-S
     beam_scale: float = 4.0      # FALLBACK ONLY: beam-index axis, no pointings

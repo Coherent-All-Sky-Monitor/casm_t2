@@ -243,6 +243,10 @@ class T2Daemon:
         # the table only changes when weights are uploaded (days apart), so a
         # gulp costs one registry lookup and a dict hit.
         self._sky_tables: dict[str, cluster.SkyTable] = {}
+        # Cluster params per weights product: the sky link scales are the beam
+        # ellipse of the weights that were live, taken from the registry product
+        # when it carries one and from config otherwise (2026-09-09).
+        self._sky_params: dict[str, cluster.ClusterParams] = {}
 
         tiers = cfg.get("tiers", {})
         self.tier_a = tiers.get("A", 30.0)
@@ -588,9 +592,10 @@ class T2Daemon:
         # One pointing-table lookup per gulp, cached by weights id: DBSCAN
         # clusters on sky position, not beam index.
         sky = self._sky_table(key)
+        params = self._params_for(sky)
         t0 = time.monotonic()
         clusters = await asyncio.to_thread(cluster.cluster_candidates, cands,
-                                           self.params, sky)
+                                           params, sky)
         dt = time.monotonic() - t0
         try:
             await self._process(key, clusters, n_jobs, n_cands, dt * 1e3,
@@ -970,9 +975,31 @@ class T2Daemon:
             if table is None:
                 return None
             self._sky_tables[wid] = table
+            self._sky_params[wid] = self._params_for_pointings(wid, pointings)
             logger.info("beam pointing table loaded for weights %s (%d beams)",
                         wid or "<unnamed>", table.n)
         return table
+
+    def _params_for_pointings(self, wid: str, pointings: dict) -> cluster.ClusterParams:
+        """Cluster params for one weights product: the registry's beam ellipse
+        when the product carries one, the configured fallback otherwise.
+
+        Logged once per product, which is once per weights upload."""
+        fx, fy = pointings.get("beam_fwhm_x_deg"), pointings.get("beam_fwhm_y_deg")
+        if fx and fy and fx > 0 and fy > 0:
+            logger.info("sky link scales for weights %s from the registry product: "
+                        "%.2f deg E-W x %.2f deg N-S", wid or "<unnamed>", fx, fy)
+            return dataclasses.replace(self.params, beam_fwhm_x_deg=float(fx), beam_fwhm_y_deg=float(fy))
+        logger.info("weights %s carries no beam ellipse; sky link scales from config: "
+                    "%.2f deg E-W x %.2f deg N-S", wid or "<unnamed>",
+                    self.params.beam_fwhm_x_deg, self.params.beam_fwhm_y_deg)
+        return self.params
+
+    def _params_for(self, sky: cluster.SkyTable | None) -> cluster.ClusterParams:
+        """Cluster params to use for a gulp given its pointing table."""
+        if sky is None:
+            return self.params
+        return self._sky_params.get(sky.weights_id or "", self.params)
 
     def _pointings(self, event_utc: datetime | None) -> dict | None:
         if event_utc is None:

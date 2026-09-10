@@ -86,8 +86,15 @@ cluster:
   #
   # The beam FWHM per axis IS the link scale: two trials within one beam width
   # of each other are one event. The beam is assumed to be a standard ellipse
-  # aligned with alt/az. Standard ellipse from compute_beam_fwhm; change when
-  # the weights change the beam.
+  # aligned with alt/az, from compute_beam_fwhm.
+  #
+  # FALLBACK ONLY since 2026-09-09. The ellipse belongs to the weights, not to
+  # this file: t3-weights-watch computes it from each product's own enabled
+  # antennas and stores it on the registry product, and t2d uses the live
+  # product's values whenever it has them (it logs which source is in use, once
+  # per weights id). These two are used only for a product with no ellipse (one
+  # registered before 2026-09-09 that no --backfill-fwhm has reached, or one
+  # whose h5 is gone).
   beam_fwhm_x_deg: 18.1   # E-W
   beam_fwhm_y_deg: 3.9    # N-S
   # FALLBACK ONLY: the old beam-index axis, used when the weights registry

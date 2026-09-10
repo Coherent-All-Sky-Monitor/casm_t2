@@ -97,9 +97,19 @@ class Registry:
 
     def record_product(self, *, h5_path: str, stream_md5: dict[int, str],
                        alt_deg: list[float], az_deg: list[float],
+                       beam_fwhm_x_deg: float | None = None,
+                       beam_fwhm_y_deg: float | None = None,
                        meta: dict | None = None) -> str:
         """Register a weights product. Idempotent: re-registering the same payloads
-        returns the existing id and only refreshes the payload index."""
+        returns the existing id and only refreshes the payload index.
+
+        ``beam_fwhm_x_deg`` / ``beam_fwhm_y_deg`` are the synthesised beam's E-W
+        and N-S FWHM in degrees for THIS product's enabled antennas
+        (``bf_weights_generator.config.compute_beam_fwhm``); both optional, both
+        None when the geometry was not available. A product registered without
+        them can be filled in later by :meth:`set_product_fwhm` (t3-weights-watch
+        --backfill-fwhm), which is also what re-registering with them does.
+        """
         if len(alt_deg) != NBEAM or len(az_deg) != NBEAM:
             raise ValueError(f"pointing table must have {NBEAM} beams")
         self._ensure()
@@ -112,10 +122,14 @@ class Registry:
                 "stream_payload_md5": {str(k): v for k, v in sorted(stream_md5.items())},
                 "alt_deg": [round(float(a), 4) for a in alt_deg],
                 "az_deg": [round(float(a), 4) for a in az_deg],
+                "beam_fwhm_x_deg": _round_fwhm(beam_fwhm_x_deg),
+                "beam_fwhm_y_deg": _round_fwhm(beam_fwhm_y_deg),
                 "recorded_utc": _now_iso(),
                 "meta": meta or {},
             }
             self._atomic_write(path, json.dumps(rec))
+        elif beam_fwhm_x_deg is not None and beam_fwhm_y_deg is not None:
+            self.set_product_fwhm(pid, beam_fwhm_x_deg, beam_fwhm_y_deg)
         index = self._load_index()
         changed = False
         for md5 in stream_md5.values():
@@ -126,6 +140,34 @@ class Registry:
             self._atomic_write(self.index_path, json.dumps(index, indent=0, sort_keys=True))
         self._product_cache.pop(pid, None)
         return pid
+
+    def set_product_fwhm(self, product_id: str, beam_fwhm_x_deg: float | None,
+                         beam_fwhm_y_deg: float | None, *, overwrite: bool = False) -> bool:
+        """Store the beam ellipse on an existing product record.
+
+        Returns True when the record was rewritten. Products registered before
+        the ellipse existed (2026-09-09) carry no FWHM keys at all; this is how
+        they get one without re-uploading anything. Existing values are kept
+        unless ``overwrite``."""
+        path = self.products_dir / f"{product_id}.json"
+        try:
+            rec = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return False
+        if not overwrite and rec.get("beam_fwhm_x_deg") is not None:
+            return False
+        rec["beam_fwhm_x_deg"] = _round_fwhm(beam_fwhm_x_deg)
+        rec["beam_fwhm_y_deg"] = _round_fwhm(beam_fwhm_y_deg)
+        self._atomic_write(path, json.dumps(rec))
+        self._product_cache.pop(product_id, None)
+        return True
+
+    def product_ids(self) -> list[str]:
+        """Every registered product id, sorted (the backfill walks these)."""
+        try:
+            return sorted(p.stem for p in self.products_dir.glob("*.json"))
+        except OSError:
+            return []
 
     def record_live_event(self, *, utc: datetime | str, stream: int, payload_md5: str | None,
                           source: str, node: str | None = None,
@@ -222,11 +264,16 @@ class Registry:
         return self.product(pids.pop()), "ok"
 
     def pointings_for(self, utc: datetime) -> dict | None:
-        """{'weights_id', 'alt_deg'[512], 'az_deg'[512]} live at utc, for self-contained cards."""
+        """{'weights_id', 'alt_deg'[512], 'az_deg'[512], 'beam_fwhm_x_deg', 'beam_fwhm_y_deg'}
+        live at utc, for self-contained cards. The two FWHMs are the beam ellipse of
+        this very product (E-W, N-S, degrees) and are None for products registered
+        before 2026-09-09 that no backfill has reached."""
         prod, status = self.product_at(utc)
         if prod is None:
             return None
-        return {"weights_id": prod["product_id"], "alt_deg": prod["alt_deg"], "az_deg": prod["az_deg"]}
+        return {"weights_id": prod["product_id"], "alt_deg": prod["alt_deg"], "az_deg": prod["az_deg"],
+                "beam_fwhm_x_deg": prod.get("beam_fwhm_x_deg"),
+                "beam_fwhm_y_deg": prod.get("beam_fwhm_y_deg")}
 
     def sky_for(self, utc: datetime, beam: int, radec: bool = True, sun: bool = False) -> dict | None:
         """alt/az (and RA/Dec, sun) of a beam at an event time, from the weights live then.
@@ -320,6 +367,10 @@ def hms_dms(ra_deg: float, dec_deg: float) -> tuple[str, str]:
     c = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg)
     return (c.ra.to_string(unit=u.hourangle, sep="hms", precision=1, pad=True),
             c.dec.to_string(unit=u.deg, sep="dms", precision=0, alwayssign=True, pad=True))
+
+
+def _round_fwhm(v: float | None) -> float | None:
+    return None if v is None else round(float(v), 3)
 
 
 def _now_iso() -> str:
