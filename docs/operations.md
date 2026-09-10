@@ -168,35 +168,39 @@ Before enabling it, render the messages offline — no token, no network:
 
 That writes, per shot, the sent text, the outcome text and a PNG card of
 each (the colour bar is the attachment colour Slack would show), plus the
-daily summary text and three figures: recovered vs injected S/N with the
-1:1 line, a dashed least-squares fit through the origin labelled with its
-slope, and misses hollow at zero; outcome counts; and DM error against
-the recovered kernel FWHM. With no `--ids` it takes a whole UTC day
-(`--day`).
+daily summary text and two figures: recovered vs injected S/N with the 1:1
+line and misses hollow at zero, and outcome counts. With no `--ids` it takes
+a whole UTC day (`--day`). `--web-base` sets the host the links point at.
 
-The messages are deliberately short:
+The messages:
 
     injection 660 sent: beam 150, DM 300, FWHM 4.7 ms, injected S/N 28
-    recovered: S/N 43.0, DM 299.8, width 3.1 ms (ibox 2)
+    recovered -> <.../injections/plot/inj_..._b150|inj_..._b150> | SNR 43.0 (ratio 1.54) | DM 299.8 (delta -0.2) | offset 0 arcsec | width 3.1 ms (ibox 2)
 
-A shot whose reported S/N came out above the cap for its width saturated
-hella's candidate buffer, so its reported value measures the buffer rather
-than the pipeline. Those points stay on the recovery figure with an "x"
-through them and are left out of the trend fit.
+The link goes to the shot's truth plot on the T3 web app; a shot whose
+cluster triggered a dump links to its event page instead, which carries the
+dump, the plot and the trigger audit. `injection.slack.web_base` sets the
+base URL, defaulting to `http://127.0.0.1:8050` like t3-collect's
+`--web-base`.
 
-The recovered width is the kernel FWHM for that trial, not `2**ibox`
-samples. The injected S/N is the generator's own matched-filter estimate of
-the pulse that was actually written (`est_snr`, its
-`INJECTED_SNR_ESTIMATE`), falling back to the value the solver aimed at
-(`inject_snr`) when the generator printed nothing. Slack never quotes a
-predicted reported S/N: that lives in `target_snr` in the ledger, where the
-cap logic uses it.
+`ratio` is recovered over injected S/N. `offset` is the great-circle
+separation between the injected beam's pointing and the recovered beam's,
+from the pointing table live at the injection time, so it answers "how far
+from where we put it did it come back"; the same beam is 0, and with no
+pointing table it reads `offset n/a`. The width is last so it is easy to
+drop, and is the kernel FWHM for that trial, not `2**ibox` samples.
 
-A shot that resolves badly says only which stage lost it:
+The injected S/N is the generator's own matched-filter estimate of the pulse
+that was actually written (`est_snr`, its `INJECTED_SNR_ESTIMATE`), falling
+back to the value the solver aimed at (`inject_snr`) when the generator
+printed nothing. Slack never quotes a predicted reported S/N: that lives in
+`target_snr` in the ledger, where the cap logic uses it.
 
-    NOT recovered: not detected by hella (T1)
-    NOT recovered: dropped by T2 clustering
-    NOT recovered: dropped by T2 filter criteria
+A shot that resolves badly names the stage and what the evidence there was:
+
+    NOT recovered: lost at T1: no cluster in the window [-40 s, +90 s] in beam 200 (+-2) at DM 500 (+-75)
+    NOT recovered: lost at T2 filters: cluster at S/N 15.8 below tier B (18)
+    NOT recovered: lost at T2 filters: cluster tagged dm_floor by the low-DM storm veto
     injection not fired: FIFO write failed
 
 The last is injector plumbing, not a pipeline miss: it gets a grey bar

@@ -385,3 +385,28 @@ def default_registry() -> Registry:
     if _default is None:
         _default = Registry()
     return _default
+
+def beam_separation_arcsec(pointings: dict | None, beam_a: int, beam_b: int) -> float | None:
+    """Great-circle separation between two beams' pointings, in arcseconds.
+
+    `pointings` is what `Registry.pointings_for` returns. Alt/az of the two
+    beams at the same instant, so the separation is the angle on the sky
+    between where the injection was put and where it came back. Returns 0.0
+    for the same beam and None when there is no usable pointing table.
+    """
+    import math
+    if not pointings:
+        return None
+    if beam_a == beam_b:
+        return 0.0
+    alt, az = pointings.get("alt_deg"), pointings.get("az_deg")
+    if alt is None or az is None:
+        return None
+    try:
+        a1, z1 = math.radians(alt[beam_a]), math.radians(az[beam_a])
+        a2, z2 = math.radians(alt[beam_b]), math.radians(az[beam_b])
+    except (IndexError, TypeError, ValueError):
+        return None
+    cos_sep = (math.sin(a1) * math.sin(a2)
+               + math.cos(a1) * math.cos(a2) * math.cos(z1 - z2))
+    return math.degrees(math.acos(max(-1.0, min(1.0, cos_sep)))) * 3600.0

@@ -31,13 +31,14 @@ ALL = (RECOVERED, MISSED_T1, MISSED_T2, MISSED_TRIGGER, FIRE_FAILED)
 #: Set by the daemon on a shot that never reached the stream.
 FIRE_FAILED_PREFIXES = ("fifo_write_failed", "file_generation_failed")
 
-#: Short, plain phrases. These are read at a skim in Slack, so they name the
-#: stage that lost the shot and nothing else - no mechanism, no tier names.
-#: The detail is already in the ledger (`fail_reason`, the gate columns).
+#: Fallback phrases, used only when reconcile() left no detail in
+#: `fail_reason`. The real message is the detail: it names the stage AND what
+#: the evidence at that stage actually was, DSA style. Anything counting over
+#: injections still counts over the closed enum above, never over the text.
 EXPLANATIONS = {
-    MISSED_T1: "not detected by hella (T1)",
-    MISSED_T2: "dropped by T2 clustering",
-    MISSED_TRIGGER: "dropped by T2 filter criteria",
+    MISSED_T1: "lost at T1: no cluster in the reconcile window",
+    MISSED_T2: "lost at T2 clustering: no cluster formed",
+    MISSED_TRIGGER: "lost at T2 filters: the cluster would not have triggered",
     FIRE_FAILED: "injection not fired",
 }
 
@@ -46,6 +47,31 @@ FIRE_FAILED_REASONS = {
     "fifo_write_failed": "FIFO write failed",
     "file_generation_failed": "file generation failed",
 }
+
+#: Detail strings reconcile() writes are already full sentences, so the
+#: poster prints them verbatim. These legacy values are not, and predate the
+#: detail; map them so old rows still read sensibly.
+LEGACY_REASONS = {
+    "t1_no_detection": EXPLANATIONS[MISSED_T1],
+}
+
+
+def detail_or_explain(fail_reason: str | None, outcome: str | None) -> str:
+    """What to print after "NOT recovered: ".
+
+    Prefers the detail reconcile() wrote, falls back to the enum phrase.
+    """
+    text = str(fail_reason or "").strip()
+    if not text:
+        return explain(outcome)
+    if text in LEGACY_REASONS:
+        return LEGACY_REASONS[text]
+    if text.startswith("lost at ") or text.startswith("injection not fired"):
+        return text
+    if text.startswith("trigger_filters("):
+        # pre-detail rows: the parenthesised gate dump is not a sentence
+        return EXPLANATIONS[MISSED_TRIGGER] + f" ({text})"
+    return explain(outcome)
 
 
 def short_fire_reason(fail_reason: str | None) -> str:

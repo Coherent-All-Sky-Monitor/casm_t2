@@ -256,6 +256,7 @@ working from and what the matched cluster looked like:
 | rec_beam | peak beam of the matched cluster |
 | rec_samp | peak sample of the matched cluster |
 | rec_lead_s | cluster event time minus inject_utc, seconds |
+| rec_offset_arcsec | sky separation of the injected and recovered beams |
 | slack_ts | ts of the Slack message for this shot, when posting is on |
 | outcome | closed enum, below |
 
@@ -270,15 +271,34 @@ injections uses, so a new failure string cannot invent a category:
 
 | outcome | when | phrase in Slack |
 | --- | --- | --- |
-| recovered | all three gates passed | recovered |
-| missed_t1 | no cluster in the reconcile window at that beam and DM | not detected by hella (T1) |
-| missed_t2 | candidates arrived but nothing clustered | dropped by T2 clustering |
-| missed_trigger | clustered, but the trigger filters would have refused it | dropped by T2 filter criteria |
-| fire_failed | the shot never reached the stream (file or FIFO failure) | injection not fired: \<reason\> |
+| recovered | all three gates passed |
+| missed_t1 | no cluster in the reconcile window at that beam and DM |
+| missed_t2 | trials arrived but nothing clustered |
+| missed_trigger | clustered, but the trigger filters would have refused it |
+| fire_failed | the shot never reached the stream (file or FIFO failure) |
 
-The Slack phrases name the stage and stop there. Which filter refused a
-`missed_trigger`, and which gate a shot died at, stay in `fail_reason` and
-the gate columns, where an audit can read them.
+`reconcile()` writes a full sentence into `fail_reason` naming the stage and
+what the evidence there was, and the Slack line prints it verbatim:
+
+    lost at T1: no cluster in the window [-40 s, +90 s] in beam 200 (+-2) at DM 500 (+-75)
+    lost at T2 filters: cluster at S/N 15.8 below tier B (18)
+    lost at T2 filters: cluster tagged dm_floor by the low-DM storm veto
+    lost at T2 filters: cluster tagged occupancy:34 by the beam-occupancy veto
+    lost at T2 filters: cluster peaked in vetoed beam 200
+    lost at T2 filters: cluster at DM 12.4 below the floor (20)
+
+The T2-filters reason is a counterfactual replay of `_wants_trigger` against
+the stored cluster row, in the order t2d applies the checks. Every injection
+carries the `injection` tag by design, so that tag is skipped: reporting it
+would hide the real reason.
+
+Two honest limits. **`missed_t2` is currently unreachable**: only clusters
+are stored, raw T1 trials stay in hella's `.dat` files, so a missing cluster
+cannot be separated into "hella saw nothing" and "hella saw trials that did
+not cluster". Everything with no cluster is `missed_t1`, and its sentence
+says "no cluster", not "no candidate". The enum keeps `missed_t2` for when
+the trials are available. Second, the counterfactual reads the tags t2d
+stored at the time; a later change to the filters does not retro-fit them.
 
 `fire_failed` is injector plumbing, not a sensitivity result, and is
 excluded from miss counts and streaks.

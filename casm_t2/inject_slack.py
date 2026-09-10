@@ -146,12 +146,34 @@ def sent_text(row, icfg: dict | None = None) -> str:
             + "\n_awaiting recovery..._")
 
 
-def outcome_text(row) -> str:
+DEFAULT_WEB_BASE = "http://127.0.0.1:8050"
+
+
+def outcome_link(row, web_base: str = DEFAULT_WEB_BASE) -> str:
+    """Slack link to the page that shows this shot.
+
+    A cluster that triggered a dump has an event name and a full event page,
+    which carries the dump, the plot and the trigger audit; prefer it. A
+    shot that did not trigger has only its own truth plot, which the T3 web
+    app serves at /injections/plot/<file_id>.
+    """
+    base = (web_base or DEFAULT_WEB_BASE).rstrip("/")
+    name = _g(row, "rec_name")
+    if name:
+        return f"<{base}/event/{name}|{name}>"
+    file_id = _g(row, "file_id")
+    if file_id:
+        return f"<{base}/injections/plot/{file_id}|{file_id}>"
+    return f"`{_g(row, 'id', '?')}`"
+
+
+def outcome_text(row, web_base: str = DEFAULT_WEB_BASE) -> str:
     """One line describing how the shot resolved.
 
     The recovered width is the FWHM of hella's smoothing kernel for the
     matched trial, not 2**ibox samples: the kernel is about 0.67 of the
-    trial label wide, so the raw label overstates the pulse by half.
+    trial label wide, so the raw label overstates the pulse by half. It sits
+    last so it is easy to drop.
     """
     outcome = _g(row, "outcome")
     if outcome == oc.FIRE_FAILED:
@@ -159,20 +181,33 @@ def outcome_text(row) -> str:
         return "injection not fired: " + oc.short_fire_reason(
             _g(row, "fail_reason"))
     if outcome != oc.RECOVERED:
-        return "NOT recovered: " + oc.explain(outcome)
+        return "NOT recovered: " + oc.detail_or_explain(
+            _g(row, "fail_reason"), outcome)
 
     rec_snr = _f(row, "rec_snr")
     rec_dm = _f(row, "rec_dm")
+    dm = _f(row, "dm")
+    inj = injected_snr(row)
+    offset = _f(row, "rec_offset_arcsec")
     ibox = _g(row, "rec_width")
 
-    bits = [f"recovered: S/N {rec_snr:.1f}" if rec_snr is not None
-            else "recovered: S/N n/a"]
+    snr_bit = "SNR n/a"
+    if rec_snr is not None:
+        ratio = f" (ratio {rec_snr / inj:.2f})" if inj else ""
+        snr_bit = f"SNR {rec_snr:.1f}{ratio}"
+    dm_bit = "DM n/a"
     if rec_dm is not None:
-        bits.append(f"DM {rec_dm:.1f}")
+        delta = f" (delta {rec_dm - dm:+.1f})" if dm is not None else ""
+        dm_bit = f"DM {rec_dm:.1f}{delta}"
+    off_bit = ("offset n/a" if offset is None
+               else f"offset {offset:.0f}{NBSP}arcsec")
+
+    bits = [f"recovered -> {outcome_link(row, web_base)}", snr_bit, dm_bit,
+            off_bit]
     if ibox is not None:
         bits.append(f"width {hella_kernel.kernel_fwhm_ms(int(ibox)):.1f}"
                     f"{NBSP}ms (ibox {int(ibox)})")
-    return ", ".join(bits)
+    return " | ".join(bits)
 
 
 def outcome_color(row) -> str:
@@ -231,7 +266,7 @@ def summary_text(rows, day: str) -> str:
         and injected_snr(r))
     if ratios:
         med = ratios[len(ratios) // 2]
-        lines.append(f"reported/injected S/N: median {med:.2f} "
+        lines.append(f"recovered/injected S/N: median {med:.2f} "
                      f"(range {ratios[0]:.2f}-{ratios[-1]:.2f})")
     return "\n".join(lines)
 
@@ -239,36 +274,6 @@ def summary_text(rows, day: str) -> str:
 # ---------------------------------------------------------------------------
 # figures
 # ---------------------------------------------------------------------------
-
-def is_saturated(row, icfg: dict | None = None) -> bool:
-    """True when the reported S/N is above the cap for that injected width.
-
-    Such a shot filled hella's per-gulp candidate buffer, so its reported
-    S/N says more about the buffer than about the pipeline's sensitivity.
-    It stays on the plot, but it must not steer the trend fit.
-    """
-    rec = _f(row, "rec_snr")
-    fwhm = injected_fwhm_ms(row)
-    if rec is None or fwhm is None:
-        return False
-    return rec > inject_calib.reported_snr_cap(fwhm, icfg)
-
-
-def fit_slope(xs, ys) -> float | None:
-    """Least-squares slope through the origin, sum(xy)/sum(x^2).
-
-    Forced through the origin because a zero-amplitude injection is a
-    zero-S/N detection: an intercept would be fitting noise. The slope is
-    the day's reported/injected ratio, the same quantity `rec_per_true`
-    tabulates per width.
-    """
-    xs = [float(x) for x in xs]
-    ys = [float(y) for y in ys]
-    denom = sum(x * x for x in xs)
-    if not xs or denom <= 0:
-        return None
-    return sum(x * y for x, y in zip(xs, ys)) / denom
-
 
 def _pub_rc() -> dict:
     """Publication rcParams, applied through rc_context so nothing leaks."""
@@ -366,43 +371,21 @@ def render_summary_figures(rows, out_dir) -> list[Path]:  # noqa: C901
                         textcoords="offset points", fontsize=9.5,
                         color=COLOR_NEUTRAL, ha="left", va="top")
             plotted = 0
-            fit_x, fit_y = [], []
-            n_saturated = 0
             for r in rows:
                 t = injected_snr(r)
                 if t is None:
                     continue
                 plotted += 1
                 _lab, fill, marker, edge = dm_bucket(_f(r, "dm"))
-                s = _f(r, "rec_snr")
-                if s is not None and _g(r, "outcome") == oc.RECOVERED:
-                    ax.scatter([t], [s], s=70, marker=marker, facecolor=fill,
-                               edgecolor=edge, linewidth=0.9, alpha=0.9,
-                               zorder=3)
-                    if is_saturated(r):
-                        # Reported above the cap for its width means the shot
-                        # filled hella's candidate buffer, so its reported S/N
-                        # is not a measurement of the pipeline's response.
-                        # Still shown, struck through, but out of the fit.
-                        n_saturated += 1
-                        ax.scatter([t], [s], s=100, marker="x", color=_INK,
-                                   linewidth=1.4, zorder=4)
-                    else:
-                        fit_x.append(t)
-                        fit_y.append(s)
+                s_rec = _f(r, "rec_snr")
+                if s_rec is not None and _g(r, "outcome") == oc.RECOVERED:
+                    ax.scatter([t], [s_rec], s=70, marker=marker,
+                               facecolor=fill, edgecolor=edge, linewidth=0.9,
+                               alpha=0.9, zorder=3)
                 else:
                     ax.scatter([t], [0.0], s=70, marker=marker,
                                facecolor="none", edgecolor=edge,
                                linewidth=1.4, zorder=3)
-            slope = fit_slope(fit_x, fit_y)
-            if slope is not None:
-                ax.plot([0.0, hi], [0.0, slope * hi], color=_INK, lw=1.1,
-                        ls=(0, (2, 2)), zorder=2)
-                # label on the fit, at the right-hand edge, clipped into view
-                x_lab = min(hi * 0.93, hi if slope * hi <= hi else hi / slope * 0.93)
-                ax.annotate(f"fit: {slope:.2f}x", (x_lab, slope * x_lab),
-                            xytext=(8, -12), textcoords="offset points",
-                            fontsize=9.5, color=_INK, ha="left", va="top")
             if not plotted:
                 # Rows with neither est_snr nor inject_snr have no x
                 # coordinate. Say so rather than show a blank panel.
@@ -415,12 +398,8 @@ def render_summary_figures(rows, out_dir) -> list[Path]:  # noqa: C901
             ax.set_ylabel("recovered S/N")
             ax.set_title("Injection recovery", fontsize=11.5, color=_INK,
                          loc="left", pad=10)
-            handles = _dm_legend_handles(Line2D, True)
-            if n_saturated:
-                handles.append(Line2D(
-                    [], [], marker="x", color=_INK, ls="none", ms=9, mew=1.4,
-                    label="saturated hella (excluded from fit)"))
-            fig.legend(handles=handles, loc="outside center right", ncol=1,
+            fig.legend(handles=_dm_legend_handles(Line2D, True),
+                       loc="outside center right", ncol=1,
                        handletextpad=0.3, labelspacing=0.6, fontsize=9.5)
             _despine(ax)
             _save(fig, "snr_recovery.png")
@@ -456,31 +435,6 @@ def render_summary_figures(rows, out_dir) -> list[Path]:  # noqa: C901
                          pad=10)
             _save(fig, "outcomes.png")
 
-            # Figure 3: DM error against the recovered width, as the FWHM of
-            # hella's smoothing kernel for the matched trial. A wider kernel
-            # smears the pulse, so DM error growing with width is the expected
-            # shape; anything else is a search-grid problem.
-            fig = Figure(figsize=(6.6, 4.9))
-            ax = fig.add_subplot(111)
-            for r in rows:
-                rdm, dm, ibox = _f(r, "rec_dm"), _f(r, "dm"), _g(r, "rec_width")
-                if rdm is None or dm is None or ibox is None:
-                    continue
-                _lab, fill, marker, edge = dm_bucket(dm)
-                ax.scatter([hella_kernel.kernel_fwhm_ms(int(ibox))], [rdm - dm],
-                           s=70, marker=marker, facecolor=fill, edgecolor=edge,
-                           linewidth=0.9, alpha=0.9, zorder=3)
-            ax.axhline(0.0, color=COLOR_NEUTRAL, lw=0.8, alpha=0.7, zorder=1)
-            ax.set_xscale("log")
-            ax.set_xlabel("recovered width, kernel FWHM [ms]")
-            ax.set_ylabel("DM error (recovered $-$ injected) [pc cm$^{-3}$]")
-            ax.set_title("DM accuracy against recovered width", fontsize=11.5,
-                         color=_INK, loc="left", pad=10)
-            fig.legend(handles=_dm_legend_handles(Line2D, False),
-                       loc="outside center right", ncol=1,
-                       handletextpad=0.3, labelspacing=0.6, fontsize=9.5)
-            _despine(ax)
-            _save(fig, "dm_accuracy.png")
         except Exception as exc:  # noqa: BLE001
             logger.warning("summary figure render failed: %s", exc,
                            exc_info=True)
@@ -545,7 +499,8 @@ class SlackPoster:
 
     def __init__(self, enabled: bool = False, dry_run_dir=None,
                  channel: str | None = None, streak_every: int = 5,
-                 icfg: dict | None = None):
+                 icfg: dict | None = None,
+                 web_base: str = DEFAULT_WEB_BASE):
         self.enabled = bool(enabled)
         self.dry_run_dir = Path(dry_run_dir) if dry_run_dir else None
         self.dry_run = self.dry_run_dir is not None
@@ -554,6 +509,8 @@ class SlackPoster:
         # the `injection` config block, so the expected S/N in a sent message
         # uses the same rec_per_true table the solver used
         self.icfg = icfg
+        # base URL of the t3 web app, for the link in the recovered line
+        self.web_base = web_base or DEFAULT_WEB_BASE
         self._seq = 0
 
     # ----- dry run ---------------------------------------------------------
@@ -684,7 +641,7 @@ class SlackPoster:
         """Resolve the shot: edit the sent message in place, else post fresh."""
         if not self.enabled:
             return None
-        line = outcome_text(row)
+        line = outcome_text(row, self.web_base)
         color = outcome_color(row)
         if self.dry_run:
             return self._dry_write(f"outcome_{_g(row, 'id', 'x')}",
@@ -767,7 +724,8 @@ def poster_from_cfg(icfg: dict) -> SlackPoster:
                        dry_run_dir=scfg.get("dry_run_dir"),
                        channel=scfg.get("channel"),
                        streak_every=int(scfg.get("streak_every", 5)),
-                       icfg=icfg)
+                       icfg=icfg,
+                       web_base=scfg.get("web_base") or DEFAULT_WEB_BASE)
 
 
 def utc_day(when: datetime | None = None) -> str:

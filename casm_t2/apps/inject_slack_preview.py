@@ -18,22 +18,24 @@ import argparse
 from pathlib import Path
 
 from casm_t2 import db, inject_slack
+from casm_t2.apps.inject_daemon import LEDGER_SELECT
 
 
 def _rows(conn, ids: list[int] | None, day: str) -> list[dict]:
     if ids:
         marks = ",".join("?" for _ in ids)
         cur = conn.execute(
-            f"SELECT * FROM injections WHERE id IN ({marks}) ORDER BY id", ids)
+            LEDGER_SELECT + f" WHERE i.id IN ({marks}) ORDER BY i.id", ids)
     else:
         cur = conn.execute(
-            "SELECT * FROM injections WHERE inject_utc >= ? AND inject_utc < ?"
-            " ORDER BY id", (f"{day}T00:00", f"{day}T23:59:59.999"))
+            LEDGER_SELECT + " WHERE i.inject_utc >= ? AND i.inject_utc < ?"
+            " ORDER BY i.id", (f"{day}T00:00", f"{day}T23:59:59.999"))
     cols = [c[0] for c in cur.description]
     return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
-def preview(conn, ids: list[int] | None, day: str, out_dir: Path) -> list[Path]:
+def preview(conn, ids: list[int] | None, day: str, out_dir: Path,
+            web_base: str = inject_slack.DEFAULT_WEB_BASE) -> list[Path]:
     """Write every message and figure into out_dir; returns the paths."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -46,7 +48,8 @@ def preview(conn, ids: list[int] | None, day: str, out_dir: Path) -> list[Path]:
     # code path the daemon would take. Its own copies land in a subdirectory
     # to keep the reviewable files at the top level.
     poster = inject_slack.SlackPoster(enabled=True,
-                                      dry_run_dir=out_dir / "dry_run")
+                                      dry_run_dir=out_dir / "dry_run",
+                                      web_base=web_base)
 
     for row in rows:
         rid = row.get("id")
@@ -57,7 +60,7 @@ def preview(conn, ids: list[int] | None, day: str, out_dir: Path) -> list[Path]:
             sent, inject_slack.COLOR_NEUTRAL, out_dir / f"inj{rid}_sent.png"))
 
         poster.post_outcome(row)
-        line = inject_slack.outcome_text(row)
+        line = inject_slack.outcome_text(row, web_base)
         color = inject_slack.outcome_color(row)
         written.append(_write(out_dir / f"inj{rid}_outcome.txt",
                               f"[{color}] {line}"))
@@ -105,13 +108,15 @@ def main() -> None:
     p.add_argument("--out", required=True, help="output directory")
     p.add_argument("--ids", help="comma-separated injection ids")
     p.add_argument("--day", help="UTC day YYYY-MM-DD (default: today)")
+    p.add_argument("--web-base", default=inject_slack.DEFAULT_WEB_BASE,
+                   help="base URL of the t3 web app, for the recovered link")
     args = p.parse_args()
 
     ids = [int(x) for x in args.ids.split(",") if x.strip()] if args.ids else None
     day = args.day or inject_slack.utc_day()
     conn = db.connect(args.db)
     try:
-        paths = preview(conn, ids, day, Path(args.out))
+        paths = preview(conn, ids, day, Path(args.out), args.web_base)
     finally:
         conn.close()
     for path in paths:

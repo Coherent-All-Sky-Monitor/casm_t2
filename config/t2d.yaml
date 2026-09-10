@@ -259,6 +259,9 @@ injection:
     dry_run_dir: null
     channel: null
     streak_every: 5
+    # Base URL of the t3 web app, for the link in the recovered line. Same
+    # default as t3-collect's --web-base.
+    web_base: http://127.0.0.1:8050
 
 # Beam pointings for cluster rows and trigger cards come from the weights live
 # at the event time (casm_t2.weights_registry), maintained by deploy_bf_weights

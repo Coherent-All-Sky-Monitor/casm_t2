@@ -254,3 +254,75 @@ def test_config_uses_the_new_keys():
     assert icfg["reported_snr_cap"]["mid"] == 40.0
     for gone in ("sigma_ms_range", "target_rec_snr_range", "target_rec_snr_max"):
         assert gone not in icfg
+
+
+# --- beam offset ------------------------------------------------------------
+
+def test_same_beam_offset_is_exactly_zero():
+    from casm_t2 import weights_registry as wr
+    pointings = {"alt_deg": [80.0] * 8, "az_deg": [10.0] * 8}
+    assert wr.beam_separation_arcsec(pointings, 3, 3) == 0.0
+
+
+def test_offset_between_two_known_beams():
+    """A synthetic table: two beams 1 degree apart at the same azimuth."""
+    from casm_t2 import weights_registry as wr
+    alt = [0.0] * 8
+    az = [0.0] * 8
+    alt[0], alt[1] = 45.0, 46.0          # 1 deg apart in altitude
+    pointings = {"alt_deg": alt, "az_deg": az}
+    assert wr.beam_separation_arcsec(pointings, 0, 1) == pytest.approx(3600.0)
+
+    # and one degree of azimuth at the equator of the alt/az sphere
+    alt[2], az[2] = 0.0, 0.0
+    alt[3], az[3] = 0.0, 1.0
+    assert wr.beam_separation_arcsec(pointings, 2, 3) == pytest.approx(3600.0)
+
+
+def test_offset_is_none_without_a_pointing_table():
+    from casm_t2 import weights_registry as wr
+    assert wr.beam_separation_arcsec(None, 0, 1) is None
+    assert wr.beam_separation_arcsec({}, 0, 1) is None
+    assert wr.beam_separation_arcsec({"alt_deg": [1.0], "az_deg": [1.0]},
+                                     0, 400) is None
+
+
+# --- the counterfactual trigger refusal -------------------------------------
+
+FILT = {"dm_floor": 20.0, "max_nbeam": 32, "beam_veto": []}
+TIERS = {"A": 30.0, "B": 18.0, "C": 12.0}
+
+
+def _refuse(tier="B", tags="injection", snr=25.0, dm=300.0, n_beams=1, beam=90):
+    return d.trigger_refusal(tier, tags, snr, dm, n_beams, beam, FILT, TIERS)
+
+
+def test_a_clean_injection_would_have_triggered():
+    """The `injection` tag is on every shot by design and is not a reason."""
+    assert _refuse() is None
+
+
+@pytest.mark.parametrize("tags,expect", [
+    ("injection,veto", "cluster peaked in vetoed beam 90"),
+    ("injection,rfi_wide", "cluster tagged rfi_wide, spanning 1 beams (max 32)"),
+    ("injection,dm_floor",
+     "cluster tagged dm_floor by the low-DM storm veto"),
+    ("injection,occupancy:34",
+     "cluster tagged occupancy:34 by the beam-occupancy veto"),
+])
+def test_each_veto_tag_names_itself(tags, expect):
+    assert _refuse(tags=tags) == expect
+
+
+def test_below_tier_b_names_the_threshold():
+    assert _refuse(tier="C", snr=15.8) == "cluster at S/N 15.8 below tier B (18)"
+
+
+def test_below_the_dm_floor():
+    assert _refuse(dm=12.4) == "cluster at DM 12.4 below the floor (20)"
+
+
+def test_veto_order_matches_t2d():
+    """t2d drops on the tag before it ever looks at tier, so so do we."""
+    assert _refuse(tags="injection,dm_floor", tier="-", snr=3.0) == (
+        "cluster tagged dm_floor by the low-DM storm veto")

@@ -87,7 +87,8 @@ RECOVERED_ROW = {
     "id": 661, "inject_utc": "2026-09-09T22:17:55.642+00:00", "stream": 1,
     "beam": 90, "dm": 300.0, "amp": 8.0, "sigma_ms": 5.0, "est_snr": 19.662,
     "target_snr": 25.0, "inject_snr": 12.0, "sigma_n": 62.39,
-    "nchan_usable": 2600,
+    "nchan_usable": 2600, "file_id": "inj_20260909_221751_b090",
+    "rec_offset_arcsec": 15.0, "rec_name": None,
     "gate_t1": 1, "gate_t2": 1, "gate_trigger": 1, "rec_snr": 35.5246,
     "rec_dm": 299.818, "rec_width": 4, "rec_beam": 90, "rec_samp": 12345,
     "rec_lead_s": -19.32, "outcome": oc.RECOVERED, "fail_reason": None,
@@ -143,38 +144,84 @@ def test_injected_fwhm_is_2355_sigma():
     assert inject_slack.injected_fwhm_ms({"sigma_ms": None}) is None
 
 
-def test_outcome_text_recovered_uses_the_kernel_fwhm():
-    text = inject_slack.outcome_text(RECOVERED_ROW)
-    # ibox 4 is a 16-sample trial, but the kernel that matched is 11 samples
-    # wide: 11.5 ms, not 16.8 ms.
-    assert text == (f"recovered: S/N 35.5, DM 299.8, "
-                    f"width 11.5{NBSP}ms (ibox 4)")
+def test_outcome_text_recovered_is_the_dsa_shape():
+    text = inject_slack.outcome_text(RECOVERED_ROW, "http://host:8050")
+    # ratio 35.5246/19.662 = 1.81; ibox 4 kernel FWHM 11.5 ms, not 2^4=16.8
+    assert text == (
+        "recovered -> <http://host:8050/injections/plot/"
+        "inj_20260909_221751_b090|inj_20260909_221751_b090> | "
+        "SNR 35.5 (ratio 1.81) | DM 299.8 (delta -0.2) | "
+        f"offset 15{NBSP}arcsec | width 11.5{NBSP}ms (ibox 4)")
     assert inject_slack.outcome_color(RECOVERED_ROW) == inject_slack.COLOR_RECOVERED
 
 
-def test_outcome_text_carries_nothing_else():
+def test_outcome_link_prefers_the_event_page_when_the_cluster_triggered():
+    """A cluster with a candname has a dump and a full event page."""
+    row = dict(RECOVERED_ROW, rec_name="260909abcdef")
+    assert inject_slack.outcome_link(row, "http://host:8050") == (
+        "<http://host:8050/event/260909abcdef|260909abcdef>")
+    assert "/event/260909abcdef|" in inject_slack.outcome_text(
+        row, "http://host:8050")
+
+
+def test_outcome_link_defaults_to_the_local_web_base():
+    assert inject_slack.DEFAULT_WEB_BASE == "http://127.0.0.1:8050"
+    assert inject_slack.outcome_link(RECOVERED_ROW).startswith(
+        "<http://127.0.0.1:8050/injections/plot/")
+
+
+def test_offset_reads_n_a_without_a_pointing_table():
+    row = dict(RECOVERED_ROW, rec_offset_arcsec=None)
+    assert "offset n/a" in inject_slack.outcome_text(row)
+
+
+def test_same_beam_offset_is_zero():
+    row = dict(RECOVERED_ROW, rec_offset_arcsec=0.0)
+    assert f"offset 0{NBSP}arcsec" in inject_slack.outcome_text(row)
+
+
+def test_kernel_width_is_last_so_it_is_easy_to_drop():
     text = inject_slack.outcome_text(RECOVERED_ROW)
-    for word in ("lead", "ratio", "beam", "samp", "delta"):
-        assert word not in text
+    assert text.split(" | ")[-1] == f"width 11.5{NBSP}ms (ibox 4)"
 
 
-def test_outcome_text_missed():
-    text = inject_slack.outcome_text(MISSED_ROW)
-    assert text == "NOT recovered: not detected by hella (T1)"
-    assert inject_slack.outcome_color(MISSED_ROW) == inject_slack.COLOR_MISSED
+def test_outcome_text_missed_prints_the_detail_reconcile_wrote():
+    detail = ("lost at T1: no cluster in the window [-40 s, +90 s] "
+              "in beam 102 (+-2) at DM 579 (+-87)")
+    row = dict(MISSED_ROW, fail_reason=detail)
+    assert inject_slack.outcome_text(row) == "NOT recovered: " + detail
+    assert inject_slack.outcome_color(row) == inject_slack.COLOR_MISSED
 
 
-@pytest.mark.parametrize("outcome,expect", [
-    (oc.MISSED_T1, "NOT recovered: not detected by hella (T1)"),
-    (oc.MISSED_T2, "NOT recovered: dropped by T2 clustering"),
-    (oc.MISSED_TRIGGER, "NOT recovered: dropped by T2 filter criteria"),
+@pytest.mark.parametrize("detail", [
+    "lost at T1: no cluster in the window [-40 s, +90 s] in beam 200 (+-2) at DM 500 (+-75)",
+    "lost at T2 filters: cluster at S/N 15.8 below tier B (18)",
+    "lost at T2 filters: cluster tagged dm_floor by the low-DM storm veto",
+    "lost at T2 filters: cluster tagged occupancy:34 by the beam-occupancy veto",
+    "lost at T2 filters: cluster peaked in vetoed beam 200",
+    "lost at T2 filters: cluster at DM 12.4 below the floor (20)",
 ])
-def test_miss_lines_are_short_and_name_only_the_stage(outcome, expect):
-    text = inject_slack.outcome_text(dict(MISSED_ROW, outcome=outcome))
-    assert text == expect
-    # no mechanism, no tier names, no parentheticals beyond "(T1)"
-    for word in ("tier", "DM floor", "beam veto", "coincid", "window"):
-        assert word not in text
+def test_each_miss_reason_is_printed_verbatim(detail):
+    row = dict(MISSED_ROW, fail_reason=detail)
+    assert inject_slack.outcome_text(row) == "NOT recovered: " + detail
+    # the injection tag is by design and must never be the reported reason
+    assert "injection" not in detail
+
+
+def test_legacy_rows_still_read_sensibly():
+    """Rows written before reconcile() stored a detail."""
+    row = dict(MISSED_ROW, fail_reason="t1_no_detection")
+    assert inject_slack.outcome_text(row) == (
+        "NOT recovered: lost at T1: no cluster in the reconcile window")
+    row = dict(MISSED_ROW, outcome=oc.MISSED_TRIGGER,
+               fail_reason="trigger_filters(tier=C,nbeam=1)")
+    assert "trigger_filters(tier=C,nbeam=1)" in inject_slack.outcome_text(row)
+
+
+def test_missing_detail_falls_back_to_the_enum_phrase():
+    row = dict(MISSED_ROW, fail_reason=None)
+    assert inject_slack.outcome_text(row) == (
+        "NOT recovered: " + oc.EXPLANATIONS[oc.MISSED_T1])
 
 
 def test_fire_failed_is_not_phrased_as_a_miss():
@@ -185,9 +232,10 @@ def test_fire_failed_is_not_phrased_as_a_miss():
     assert inject_slack.outcome_color(row) == inject_slack.COLOR_NEUTRAL
 
 
-def test_streak_uses_the_same_short_phrase():
+def test_streak_uses_the_same_phrases():
     text = inject_slack.streak_text(5, [656], oc.MISSED_TRIGGER)
-    assert text.endswith("latest loss stage: dropped by T2 filter criteria")
+    assert text.endswith(
+        "latest loss stage: " + oc.EXPLANATIONS[oc.MISSED_TRIGGER])
 
 
 def test_streak_and_summary_text():
@@ -198,34 +246,15 @@ def test_streak_and_summary_text():
     text = inject_slack.summary_text([RECOVERED_ROW, MISSED_ROW], "2026-09-09")
     assert "2 injected, 1 recovered" in text
     assert "1 missed_t1" in text
-    assert "reported/injected S/N: median 1.81" in text   # 35.5246 / 19.662
+    assert "recovered/injected S/N: median 1.81" in text  # 35.5246 / 19.662
 
 
 # --- figures ----------------------------------------------------------------
 
-def test_saturated_rows_are_flagged():
-    """Reported above the width's cap: plotted, but out of the trend fit."""
-    # FWHM 11.8 ms, cap 40: id 664 reported 132
-    assert inject_slack.is_saturated(
-        dict(RECOVERED_ROW, rec_snr=132.372)) is True
-    assert inject_slack.is_saturated(RECOVERED_ROW) is False   # 35.5
-    # a wide shot saturates sooner: cap is 25.3 at FWHM 30 ms
-    wide = dict(RECOVERED_ROW, sigma_ms=30.0 / 2.355, rec_snr=30.0)
-    assert inject_slack.is_saturated(wide) is True
-    assert inject_slack.is_saturated({"rec_snr": None}) is False
-
-
-def test_fit_slope_through_the_origin():
-    assert inject_slack.fit_slope([1.0, 2.0], [2.0, 4.0]) == pytest.approx(2.0)
-    assert inject_slack.fit_slope([], []) is None
-    assert inject_slack.fit_slope([0.0], [5.0]) is None
-
-
 def test_summary_figures_written(tmp_path):
     paths = inject_slack.render_summary_figures(
         [RECOVERED_ROW, MISSED_ROW], tmp_path / "figs")
-    assert [p.name for p in paths] == ["snr_recovery.png", "outcomes.png",
-                                       "dm_accuracy.png"]
+    assert [p.name for p in paths] == ["snr_recovery.png", "outcomes.png"]
     assert all(p.is_file() and p.stat().st_size > 0 for p in paths)
 
 
@@ -268,7 +297,7 @@ def test_dry_run_writes_files_and_never_posts(tmp_path, no_network):
     assert [n.split("_", 1)[1] for n in names] == [
         "sent_661.txt", "outcome_661.txt", "streak_5.txt",
         "summary_2026-09-09.txt"]
-    assert "recovered: S/N 35.5" in (out / names[1]).read_text()
+    assert "SNR 35.5" in (out / names[1]).read_text()
     assert (out / "snr_recovery.png").is_file()
 
 

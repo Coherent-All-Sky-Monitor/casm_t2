@@ -40,7 +40,7 @@ from pathlib import Path
 import yaml
 
 from casm_t2 import (db, inject_calib, inject_outcome, inject_plot,
-                     inject_slack, logsetup)
+                     inject_slack, logsetup, weights_registry)
 
 logger = logging.getLogger("t2.inject")
 
@@ -106,13 +106,71 @@ reported_snr_cap = inject_calib.reported_snr_cap
 clamp_inject_snr = inject_calib.clamp_inject_snr
 
 
+LEDGER_SELECT = ("SELECT i.*, c.name AS rec_name FROM injections i"
+                 " LEFT JOIN clusters c ON c.id = i.matched_cluster")
+
+
 def ledger_row(conn, inj_id: int) -> dict | None:
-    """One injections row as a plain dict, for the Slack text builders."""
-    cur = conn.execute("SELECT * FROM injections WHERE id = ?", (inj_id,))
+    """One injections row as a plain dict, for the Slack text builders.
+
+    Joined to the matched cluster's event name: a cluster that triggered a
+    dump has one, and the Slack link should point at that event page rather
+    than at the injection's own truth plot.
+    """
+    cur = conn.execute(LEDGER_SELECT + " WHERE i.id = ?", (inj_id,))
     row = cur.fetchone()
     if row is None:
         return None
     return dict(zip([c[0] for c in cur.description], row))
+
+
+def trigger_refusal(tier, tags, snr, dm, n_beams, beam, filt, tiers) -> str | None:
+    """Why t2d would NOT have dumped this cluster, or None if it would have.
+
+    Mirrors T2Daemon._wants_trigger against the stored cluster row, in the
+    order t2d applies the checks. The `injection` tag is excluded on purpose:
+    every injection carries it by design, and reporting it as the reason
+    would hide the real one.
+    """
+    tagset = [t.strip() for t in str(tags or "").split(",") if t.strip()]
+    if "veto" in tagset:
+        return f"cluster peaked in vetoed beam {beam}"
+    if "rfi_wide" in tagset:
+        return (f"cluster tagged rfi_wide, spanning {n_beams} beams "
+                f"(max {filt.get('max_nbeam', 32)})")
+    if "dm_floor" in tagset:
+        return "cluster tagged dm_floor by the low-DM storm veto"
+    occ = next((t for t in tagset if t.startswith("occupancy:")), None)
+    if occ:
+        return f"cluster tagged {occ} by the beam-occupancy veto"
+    tier_b = tiers.get("B", 15.0)
+    if tier not in ("A", "B"):
+        return f"cluster at S/N {snr:.1f} below tier B ({tier_b:.0f})"
+    floor = filt.get("dm_floor", 20.0)
+    if dm < floor:
+        return f"cluster at DM {dm:.1f} below the floor ({floor:.0f})"
+    return None
+
+
+def beam_offset_arcsec(cfg: dict, utc, inj_beam: int, rec_beam: int):
+    """Sky separation between the injected and recovered beams, or None.
+
+    Uses the pointing table live at the injection time, so it answers "how
+    far from where we put it did it come back", not "how far apart are those
+    beams today".
+    """
+    if rec_beam is None or inj_beam is None:
+        return None
+    if int(rec_beam) == int(inj_beam):
+        return 0.0
+    try:
+        reg = weights_registry.Registry(cfg.get("weights_registry")) \
+            if cfg.get("weights_registry") else weights_registry.Registry()
+        return weights_registry.beam_separation_arcsec(
+            reg.pointings_for(utc), int(inj_beam), int(rec_beam))
+    except Exception as exc:  # noqa: BLE001 - a message must never break reconcile
+        logger.debug("beam offset unavailable: %s", exc)
+        return None
 
 
 def reconcile(conn, inj_id: int, cfg: dict) -> None:
@@ -145,20 +203,22 @@ def reconcile(conn, inj_id: int, cfg: dict) -> None:
     filt = cfg.get("filters", {})
     tiers = cfg.get("tiers", {})
     if cand is None:
-        # No cluster at all. T2 stores every injection-tagged cluster, so a
-        # missing row means T1 never reported trials worth clustering.
+        # No cluster at all. Only clusters are stored - raw T1 trials live in
+        # hella's .dat files - so this cannot separate "hella saw nothing"
+        # from "hella saw trials that did not cluster"; say what is known.
         gates = dict(gate_t1=0, gate_t2=0, gate_trigger=0,
-                     fail_reason="t1_no_detection")
+                     fail_reason=f"lost at T1: no cluster in the window "
+                                 f"[-40 s, +90 s] in beam {beam} (+-2) "
+                                 f"at DM {dm:.0f} (+-{dm_tol:.0f})")
         rec = (None, None, None)
-        detail = (None, None, None, None)
+        detail = (None, None, None, None, None)
     else:
         cid, snr, rdm, tier, tags, n_beams, cbeam, cwidth, csamp, cutc = cand
-        would = (tier in ("A", "B") and rdm >= filt.get("dm_floor", 20.0)
-                 and n_beams <= filt.get("max_nbeam", 32)
-                 and cbeam not in set(filt.get("beam_veto", [])))
-        gates = dict(gate_t1=1, gate_t2=1, gate_trigger=int(would),
-                     fail_reason=None if would else
-                     f"trigger_filters(tier={tier},nbeam={n_beams})")
+        refusal = trigger_refusal(tier, tags, snr, rdm, n_beams, cbeam,
+                                  filt, tiers)
+        gates = dict(gate_t1=1, gate_t2=1, gate_trigger=int(refusal is None),
+                     fail_reason=None if refusal is None
+                     else f"lost at T2 filters: {refusal}")
         rec = (cid, snr, rdm)
         # Negative lead is the normal case: the sidecar joins a gulp whose
         # samples are already seconds old, so the pulse arrives in the search
@@ -167,15 +227,16 @@ def reconcile(conn, inj_id: int, cfg: dict) -> None:
             lead = (datetime.fromisoformat(cutc) - t0).total_seconds()
         except (TypeError, ValueError):
             lead = None
-        detail = (cwidth, cbeam, csamp, lead)
+        offset = beam_offset_arcsec(cfg, t0, beam, cbeam)
+        detail = (cwidth, cbeam, csamp, lead, offset)
     outcome = inject_outcome.classify(gates["gate_t1"], gates["gate_t2"],
                                       gates["gate_trigger"], prior_fail)
     with conn:
         conn.execute(
             "UPDATE injections SET gate_t1=?, gate_t2=?, gate_trigger=?,"
             " fail_reason=?, matched_cluster=?, rec_snr=?, rec_dm=?,"
-            " rec_width=?, rec_beam=?, rec_samp=?, rec_lead_s=?, outcome=?"
-            " WHERE id=?",
+            " rec_width=?, rec_beam=?, rec_samp=?, rec_lead_s=?,"
+            " rec_offset_arcsec=?, outcome=? WHERE id=?",
             (gates["gate_t1"], gates["gate_t2"], gates["gate_trigger"],
              gates["fail_reason"], *rec, *detail, outcome, inj_id))
     logger.info("reconciled injection %d: t1=%s t2=%s trigger=%s (%s)",
