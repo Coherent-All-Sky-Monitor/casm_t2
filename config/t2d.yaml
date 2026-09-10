@@ -308,7 +308,7 @@ injection:
   # streak_every: post one attention message at each multiple of that many
   # consecutive missed shots. Preview it first: t2-inject-slack-preview.
   slack:
-    enabled: false
+    enabled: true
     # sent_then_update  the sent line posts the moment the pulse goes in, so
     #                   the channel shows a shot in flight; that same message
     #                   is COMPLETED ~100 s later with a bar coloured by
