@@ -48,15 +48,50 @@ def test_the_dump_window_is_before_inject_utc():
     """The pulse precedes the FIFO write: the sidecar joins an older gulp."""
     start, stop = ir.dump_window(NOW, ir.replay_cfg({}))
     assert start == NOW - timedelta(seconds=24)
-    assert stop == NOW - timedelta(seconds=10)
+    assert stop == NOW - timedelta(seconds=8)     # DM 0: no sweep, margin only
     assert stop < NOW
-    assert (stop - start).total_seconds() == 14
+    assert (stop - start).total_seconds() == 16
 
 
 def test_the_dump_window_follows_config():
-    cfg = ir.replay_cfg({"replay": {"dump_pre_s": 40, "dump_post_s": 5}})
+    cfg = ir.replay_cfg({"replay": {"dump_pre_s": 40, "dump_post_s": 5,
+                                    "dump_sweep_margin_s": 0}})
     start, stop = ir.dump_window(NOW, cfg)
     assert (stop - start).total_seconds() == 35
+
+
+def test_the_window_end_carries_the_dm_sweep():
+    """The whole dispersed pulse must be inside the dump, not just its head."""
+    cfg = ir.replay_cfg({})
+    later = NOW + timedelta(seconds=30)        # the request is not the limit
+    for dm, sweep in ((647.0, 6.148), (1000.0, 9.502)):
+        start, stop = ir.dump_window(NOW, cfg, dm, now=later)
+        assert start == NOW - timedelta(seconds=24)
+        want = NOW + timedelta(seconds=-10 + sweep + 2.0)
+        assert abs((stop - want).total_seconds()) < 0.01
+
+
+def test_the_window_end_is_clamped_to_the_request_time(caplog):
+    """The ring holds no future: a DM 1000 end sits 1.5 s past the write."""
+    with caplog.at_level("WARNING"):
+        start, stop = ir.dump_window(NOW, ir.replay_cfg({}), 1000.0, now=NOW)
+    assert stop == NOW
+    assert "clamping" in caplog.text
+
+
+def test_the_dump_timeout_scales_with_the_window():
+    """14 s took ~20 s to write, so the floor covers 24 s but not 40 s."""
+    cfg = ir.replay_cfg({})
+    assert ir.dump_timeout(cfg, 14.0) == 60.0
+    assert ir.dump_timeout(cfg, 24.0) == 60.0
+    assert ir.dump_timeout(cfg, 40.0) == 80.0
+
+
+def test_the_file_count_guard_follows_the_window():
+    """10.0 s per file, plus one because the window starts mid-file."""
+    assert ir.max_delete_files(14.0) == 3
+    assert ir.max_delete_files(24.0) == 4
+    assert ir.max_delete_files(0.0) == 1
 
 
 def test_a_dump_is_requested_unless_posting_is_off():
@@ -449,3 +484,52 @@ def test_a_rendered_miss_archives_only_the_card(tmp_path):
     assert "--card-json" in cmd and str(paths["json"]) in cmd
     assert "--fil" not in cmd
     assert str(paths["png"]) not in cmd        # no PNG kept beside the card
+
+
+# --- all the window's files reach the replay tool ----------------------------
+
+def test_a_24s_window_accepts_three_files_and_rejects_five(tmp_path, caplog):
+    """2-3 files is what a 24 s window is; five means the arithmetic is wrong."""
+    obs = "2026-09-10-02:27:18"
+    t_obs = datetime(2026, 9, 10, 2, 27, 18, tzinfo=UTC)
+    start = t_obs + timedelta(seconds=600)
+    stop = start + timedelta(seconds=24)
+    for i in range(3):
+        _dada_real(tmp_path, obs, 600.0 + i * 10.0, 10.0)
+    assert ir.cleanup_dump(tmp_path, ir.replay_cfg({}), start, stop) == 3
+
+    for i in range(5):
+        _dada_real(tmp_path, obs, 600.0 + i * 5.0, 6.0)
+    with caplog.at_level("ERROR"):
+        n = ir.cleanup_dump(tmp_path, ir.replay_cfg({}), start, stop)
+    assert n == 0 and len(list(tmp_path.glob("*.dada"))) == 5
+    assert "more than the" in caplog.text
+
+
+def test_every_file_of_the_window_reaches_the_replay_command(tmp_path):
+    obs = "2026-09-10-02:27:18"
+    t_obs = datetime(2026, 9, 10, 2, 27, 18, tzinfo=UTC)
+    dumps = tmp_path / "stream_0"
+    dumps.mkdir()
+    mine = [_dada_real(dumps, obs, 600.0 + i * 10.0, 10.0) for i in range(3)]
+    _dada_real(dumps, obs, 60.0, 10.0)             # someone else's dump
+    start = t_obs + timedelta(seconds=600)
+    stop = start + timedelta(seconds=24)
+
+    arg = ir.replay_dump_arg(dumps, start, stop)
+    assert arg.split(",") == [str(f) for f in mine]   # all of them, time order
+
+    cfg = ir.replay_cfg({"replay": {"events_root": str(tmp_path / "ev")}})
+    cmd = ir.build_command(671, arg, cfg)
+    assert cmd[cmd.index("--dump") + 1] == arg
+    cmd = ir.build_command(671, mine, cfg)            # a list works too
+    assert cmd[cmd.index("--dump") + 1].split(",") == [str(f) for f in mine]
+
+
+def test_without_a_window_the_directory_is_passed(tmp_path, caplog):
+    assert ir.replay_dump_arg(tmp_path, None, None) == str(tmp_path)
+    with caplog.at_level("WARNING"):
+        t0 = datetime(2026, 9, 10, 2, 27, 18, tzinfo=UTC)
+        assert ir.replay_dump_arg(tmp_path, t0, t0 + timedelta(seconds=24)) \
+            == str(tmp_path)
+    assert "passing the directory" in caplog.text

@@ -129,8 +129,9 @@ injection:
   replay:
     post: always              # always | daily | on_miss | never
     dump_pre_s: 24            # s before inject_utc, window start
-    dump_post_s: 10           # s before inject_utc, window end
-    dump_timeout_s: 60
+    dump_post_s: 10           # s before inject_utc, window end before the sweep
+    dump_sweep_margin_s: 2    # s added after the DM sweep, for the pulse width
+    dump_timeout_s: 60        # s floor; the wait scales as 2 x window_s
     keep_dump: false          # keep the .dada after plotting
     on_miss: none             # none: render nothing | expected: pulse where due
     keep_dump_on_miss: true

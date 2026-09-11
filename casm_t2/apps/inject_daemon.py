@@ -649,7 +649,9 @@ def do_replay(conn, cfg: dict, poster, inj_id: int, dump_dir) -> Path | None:
         # image is the pulse version either way.
         event_utc = inject_replay.expected_event_utc(
             conn, datetime.fromisoformat(row["inject_utc"]))
-    png = inject_replay.run_replay(inj_id, dump_dir, rcfg,
+    # Every file of the window goes to the tool: a sweep crosses file seams.
+    dump_arg = inject_replay.replay_dump_arg(dump_dir, d_start, d_stop)
+    png = inject_replay.run_replay(inj_id, dump_arg, rcfg,
                                    db_path=cfg.get("db", db.DEFAULT_PATH),
                                    event_utc=event_utc,
                                    label=(row or {}).get("file_id"),
@@ -850,17 +852,20 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
                     fwhm_ms, f"{est_snr:.1f}" if est_snr else "?")
 
         # Dump the injected stream around the shot for the replay plot. The
-        # window sits before inject_utc, where the pulse is. Requested now
-        # because it cannot be taken retrospectively; whether the plot is posted
-        # is decided once the outcome is known.
+        # window starts before inject_utc, where the pulse is, and ends after
+        # this DM's sweep across the band so the whole dispersed pulse is in
+        # the dump. Requested now because it cannot be taken retrospectively;
+        # whether the plot is posted is decided once the outcome is known.
         dump_dir = None
         if inject_replay.dump_due(rcfg):
-            d_start, d_stop = inject_replay.dump_window(now, rcfg)
+            d_start, d_stop = inject_replay.dump_window(now, rcfg, dm)
+            window_s = (d_stop - d_start).total_seconds()
             try:
                 loc = beams.stream_location(stream)
                 reply = await asyncio.to_thread(
                     dump_client.request_dump, loc.host, loc.control_port,
-                    d_start, d_stop, float(rcfg.get("dump_timeout_s", 60.0)))
+                    d_start, d_stop,
+                    inject_replay.dump_timeout(rcfg, window_s))
                 dump_dir = loc.dump_dir
                 with conn:
                     conn.execute(

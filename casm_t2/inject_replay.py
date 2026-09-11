@@ -21,6 +21,7 @@ row untouched.
 from __future__ import annotations
 
 import logging
+import math
 import shutil
 import statistics
 import sys
@@ -28,7 +29,7 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from casm_t2 import inject_outcome as oc
+from casm_t2 import inject_outcome as oc, timing
 
 logger = logging.getLogger("t2.inject.replay")
 
@@ -47,6 +48,8 @@ def replay_cfg(icfg: dict | None) -> dict:
     cfg.setdefault("dump_pre_s", 24.0)
     cfg.setdefault("dump_post_s", 10.0)
     cfg.setdefault("dump_timeout_s", 60.0)
+    # s of slack added after the DM sweep, for the pulse's own width.
+    cfg.setdefault("dump_sweep_margin_s", 2.0)
     cfg.setdefault("keep_dump", False)
     cfg.setdefault("events_root", "/mnt/nvme3/T3/EVENTS")
     cfg.setdefault("command", "t3-replay-injection")
@@ -67,16 +70,40 @@ def replay_cfg(icfg: dict | None) -> dict:
     return cfg
 
 
-def dump_window(inject_utc: datetime, rcfg: dict) -> tuple[datetime, datetime]:
-    """[inject_utc - dump_pre_s, inject_utc - dump_post_s].
+def dump_window(inject_utc: datetime, rcfg: dict, dm: float = 0.0,
+                now: datetime | None = None) -> tuple[datetime, datetime]:
+    """[inject_utc - dump_pre_s, inject_utc - dump_post_s + sweep + margin].
 
-    Both offsets go backwards from the FIFO write, because that is where the
+    The start goes backwards from the FIFO write, because that is where the
     pulse is: the sidecar joins a gulp whose samples are already 5-20 s old.
+    The end is pushed out by the DM sweep across the band (6.1 s at DM 647,
+    9.5 s at DM 1000) so the low-frequency end of the pulse is inside the dump;
+    a fixed end cut the sweep off mid-band. Clamped to `now`: the ring holds
+    no samples from the future.
     """
     pre = float(rcfg.get("dump_pre_s", 24.0))
     post = float(rcfg.get("dump_post_s", 10.0))
-    return (inject_utc - timedelta(seconds=pre),
-            inject_utc - timedelta(seconds=post))
+    margin = float(rcfg.get("dump_sweep_margin_s", 2.0))
+    sweep = timing.dispersion_sweep_s(float(dm or 0.0))
+    start = inject_utc - timedelta(seconds=pre)
+    stop = inject_utc - timedelta(seconds=post - sweep - margin)
+    now = now or datetime.now(timezone.utc)
+    if stop > now:
+        logger.warning("dump window end %s is in the future (DM %.1f, sweep "
+                       "%.1f s); clamping to %s, the sweep's tail is lost",
+                       stop, float(dm or 0.0), sweep, now)
+        stop = now
+    return start, stop
+
+
+def dump_timeout(rcfg: dict, window_s: float) -> float:
+    """Seconds to wait for the dump daemon's reply.
+
+    The daemon replies after writing, at roughly 1.4x real time (a 14 s window
+    took ~20 s), so a long window needs a longer wait than the configured
+    floor.
+    """
+    return max(float(rcfg.get("dump_timeout_s", 60.0)), 2.0 * float(window_s))
 
 
 def dump_due(rcfg: dict) -> bool:
@@ -176,14 +203,19 @@ def build_command(inj_id: int, dump_dir, rcfg: dict, db_path: str | None = None,
                   card_only: bool = False) -> list[str]:
     """The replay tool's argv.
 
+    `dump_dir` is a directory, a file, or a list of files (passed
+    comma-separated, the tool concatenating them in the order given).
+
     `event_utc` is passed only for a shot with no recovered cluster: the tool
     then adds the pulse at the time it should have arrived, so the reader
     sees what hella should have found.
     """
     paths = replay_paths(inj_id, rcfg, label)
+    dump = (",".join(str(d) for d in dump_dir)
+            if isinstance(dump_dir, (list, tuple)) else str(dump_dir))
     cmd = [*resolve_command(rcfg.get("command", "t3-replay-injection")),
            "--inject-id", str(inj_id),
-           "--dump", str(dump_dir),
+           "--dump", dump,
            "--card-json", str(paths["json"])]
     if card_only:
         # A rendered miss archives the numbers, not the pictures. --out is
@@ -231,9 +263,17 @@ def run_replay(inj_id: int, dump_dir, rcfg: dict, db_path: str | None = None,
 #: with this (same constant casm_t3's janitor uses).
 BYTES_PER_SECOND = 375e6
 
-#: A dump of the configured window is one or two files. More than this means
-#: the window arithmetic is wrong, so delete nothing.
-MAX_DELETE = 4
+#: The dump daemon writes at most 9536 samples (10.0 s) per file.
+DUMP_FILE_S = 10.0
+
+
+def max_delete_files(window_s: float) -> int:
+    """How many files a window of `window_s` may span before it looks wrong.
+
+    ceil(window/10) files, plus one because the window starts mid-file. More
+    than this means the window arithmetic is wrong, so delete nothing.
+    """
+    return math.ceil(max(0.0, float(window_s)) / DUMP_FILE_S) + 1
 
 
 def dump_file_span(path) -> tuple[datetime, datetime] | None:
@@ -276,8 +316,27 @@ def dump_files_in_window(dump_dir, start: datetime, stop: datetime,
             continue
         f0, f1 = span
         if f0 <= hi and f1 >= lo:
-            hits.append(path)
-    return hits
+            hits.append((f0, path))
+    # Time order: the replay tool concatenates the files in the order given.
+    return [path for _, path in sorted(hits, key=lambda t: t[0])]
+
+
+def replay_dump_arg(dump_dir, start: datetime | None,
+                    stop: datetime | None) -> str:
+    """What to pass as `--dump`: every file of the window, in time order.
+
+    A window wider than one file lands in 2-3 files and the sweep crosses the
+    seams, so all of them go. Falls back to the directory when no window is
+    recorded or nothing matched, the tool then selecting files itself.
+    """
+    if start is None or stop is None:
+        return str(dump_dir)
+    files = dump_files_in_window(dump_dir, start, stop)
+    if not files:
+        logger.warning("no dump files in %s overlap [%s .. %s]; passing the "
+                       "directory to the replay tool", dump_dir, start, stop)
+        return str(dump_dir)
+    return ",".join(str(f) for f in files)
 
 
 def keep_for_miss(rcfg: dict, outcome: str | None) -> bool:
@@ -292,7 +351,8 @@ def cleanup_dump(dump_dir, rcfg: dict, start=None, stop=None,
     Never removes the directory: `dump_dir` is
     `/mnt/nvme4/data/casm/cand_beam_dumps/stream_N`, shared with T2's triggered
     dumps. Only files whose window overlaps the recorded [start, stop] are
-    removed, at most MAX_DELETE of them, each logged by full path. Without a
+    removed, at most max_delete_files(window) of them, each logged by full
+    path. Without a
     recorded window nothing is deleted, this shot's files then being
     indistinguishable from anyone else's.
     """
@@ -320,10 +380,11 @@ def cleanup_dump(dump_dir, rcfg: dict, start=None, stop=None,
     if not hits:
         logger.info("no dump files in %s overlap [%s .. %s]", path, start, stop)
         return 0
-    if len(hits) > MAX_DELETE:
+    max_files = max_delete_files((stop - start).total_seconds())
+    if len(hits) > max_files:
         logger.error("dump cleanup in %s selected %d files for [%s .. %s], "
                      "more than the %d expected; deleting nothing",
-                     path, len(hits), start, stop, MAX_DELETE)
+                     path, len(hits), start, stop, max_files)
         return 0
     n = 0
     for f in hits:
