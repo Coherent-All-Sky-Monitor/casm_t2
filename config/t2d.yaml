@@ -127,7 +127,7 @@ injection:
   # under the shot's Slack message. Window is [inject_utc - dump_pre_s,
   # inject_utc - dump_post_s]: the pulse lands before inject_utc.
   replay:
-    post: always              # always | daily | on_miss | never
+    post: never               # always | daily | on_miss | never
     dump_pre_s: 24            # s before inject_utc, window start
     dump_post_s: 10           # s before inject_utc, window end before the sweep
     dump_sweep_margin_s: 2    # s added after the DM sweep, for the pulse width
