@@ -858,7 +858,11 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
         # whether the plot is posted is decided once the outcome is known.
         dump_dir = None
         if inject_replay.dump_due(rcfg):
-            d_start, d_stop = inject_replay.dump_window(now, rcfg, dm)
+            # Clamp against the clock at the request, not the FIFO write: the
+            # sidecar hand-off puts ~17 s between them, so a high-DM end past
+            # inject_utc is already in the ring.
+            d_start, d_stop = inject_replay.dump_window(
+                now, rcfg, dm, now=datetime.now(timezone.utc))
             window_s = (d_stop - d_start).total_seconds()
             try:
                 loc = beams.stream_location(stream)

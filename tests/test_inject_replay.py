@@ -72,10 +72,15 @@ def test_the_window_end_carries_the_dm_sweep():
 
 
 def test_the_window_end_is_clamped_to_the_request_time(caplog):
-    """The ring holds no future: a DM 1000 end sits 1.5 s past the write."""
+    """Safety net only: the request is ~17 s after the write, so a DM 1000 end
+    1.5 s past inject_utc is already in the ring and nothing is cut."""
+    later = NOW + timedelta(seconds=17)
+    _, stop = ir.dump_window(NOW, ir.replay_cfg({}), 1000.0, now=later)
+    assert stop > NOW                       # no clamp at the real request time
     with caplog.at_level("WARNING"):
-        start, stop = ir.dump_window(NOW, ir.replay_cfg({}), 1000.0, now=NOW)
-    assert stop == NOW
+        _, stop = ir.dump_window(NOW, ir.replay_cfg({}), 1000.0,
+                                 now=NOW - timedelta(seconds=5))
+    assert stop == NOW - timedelta(seconds=5)
     assert "clamping" in caplog.text
 
 
