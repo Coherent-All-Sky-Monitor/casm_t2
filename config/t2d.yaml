@@ -119,6 +119,8 @@ injection:
   std_wait_s: 120.0           # s to wait for a new value before giving up
   std_poll_s: 5.0             # s between reads
   nchan_usable: 2600          # 3072 minus the 472-channel 470-484 MHz mask
+  amp_floor: 4                # counts; u8 truncation costs >20% of the S/N below this
+  std_bandpass_factor: 1.4    # Redis std over per-channel std in band (1.33-1.47 measured)
   amp_range: [25.0, 45.0]     # stream counts
   reconcile_wait_s: 90        # s after the FIFO write before reconciling
   # Replay: dump the injected stream, render it with the pulse, thread the PNG

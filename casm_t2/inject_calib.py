@@ -1,7 +1,9 @@
 """Width and amplitude calibration for live injections.
 
-Pure functions, no I/O. Kept outside `apps.inject_daemon` so the solver and the
-Slack text share one copy of the numbers.
+Kept outside `apps.inject_daemon` so the solver and the Slack text share one
+copy of the numbers. No Redis and no database: the only I/O is the amplitude
+solver rendering a short pulse through the generator to a temporary file, which
+is how it stays bit-exact with what gets injected.
 """
 
 from __future__ import annotations
@@ -240,3 +242,158 @@ def rec_per_true(fwhm_ms: float, icfg: dict | None = None) -> float:
             f = (x - xs[i - 1]) / (xs[i] - xs[i - 1])
             return ys[i - 1] + f * (ys[i] - ys[i - 1])
     return ys[-1]
+
+
+# --- amplitude solve on the rendered (u8-truncated) pulse -------------------
+
+#: The generator the daemon shells out to. The solver imports it so the pulse
+#: it scores is rendered by the same code that is injected, truncation and all.
+GENERATOR_PATH = "/home/casm/software/dev/make_noise_fil_with_frb_snr.py"
+
+#: Sample time of the beamformer stream, s.
+TSAMP_S = 0.001048576
+
+#: Lowest amplitude in stream counts the solver may return. u8 truncation eats
+#: 23 percent of a 3-count pulse's matched-filter amplitude at 13 ms FWHM and
+#: the loss grows fast below that, so shots under 4 counts are not calibratable.
+DEFAULT_AMP_FLOOR = 4
+
+#: Largest amplitude the u8 stream can carry.
+AMP_MAX = 255
+
+#: Redis std over corrected std. Casm_bf_proc_stat_<beam>_0_stddev is one
+#: number over all 3072 channels about the beam mean, so bandpass structure
+#: inflates it over the per-channel std in the searched band: measured 1.33
+#: (beam 22), 1.41 (beam 6), 1.47 (beam 14).
+DEFAULT_STD_BANDPASS_FACTOR = 1.4
+
+
+def std_bandpass_factor(icfg: dict | None = None) -> float:
+    """Divisor taking the Redis std to a per-channel std in the searched band."""
+    factor = float((icfg or {}).get("std_bandpass_factor",
+                                    DEFAULT_STD_BANDPASS_FACTOR))
+    if factor <= 0:
+        raise SpecError(f"injection.std_bandpass_factor must be > 0, got {factor}")
+    return factor
+
+
+def corrected_std(raw_std: float, icfg: dict | None = None) -> tuple[float, float]:
+    """(per-channel std in the searched band, factor used)."""
+    factor = std_bandpass_factor(icfg)
+    return float(raw_std) / factor, factor
+
+
+def _generator():
+    """The generator module, imported from its script path."""
+    import sys
+    parent = str(__import__("pathlib").Path(GENERATOR_PATH).parent)
+    if parent not in sys.path:
+        sys.path.insert(0, parent)
+    import make_noise_fil_with_frb_snr as mn  # noqa: E402
+    return mn
+
+
+_RENDER_CACHE: dict = {}
+
+
+def rendered_pulse_counts(amp_counts: int, sigma_samp: float):
+    """One channel of the pulse as the generator renders it, u8 counts.
+
+    Calls gen_filterbank at DM 0 with no noise and reads channel 0 back, so the
+    `np.clip(...).astype(np.uint8)` truncation is the online one rather than a
+    copy of it. Every channel carries the same profile at DM 0.
+    """
+    import contextlib
+    import io
+    import tempfile
+    from pathlib import Path
+
+    import numpy as np
+
+    key = (int(amp_counts), round(float(sigma_samp), 6))
+    hit = _RENDER_CACHE.get(key)
+    if hit is not None:
+        return hit
+    mn = _generator()
+    # gen_filterbank centres the pulse at nsamp // 2 and paints +-4 sigma.
+    halfwin = int(math.ceil(4.0 * max(float(sigma_samp), 1.0)))
+    nsamp = 2 * (halfwin + 8)
+    sigma_ms_gen = float(sigma_samp) * 1000.0 * mn.tsamp_s
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "amp_solve.fil"
+        with contextlib.redirect_stdout(io.StringIO()):
+            mn.gen_filterbank(duration_samps=nsamp, DM=0.0,
+                              pulse_amp_counts=float(amp_counts),
+                              pulse_sigma_ms=sigma_ms_gen,
+                              output_fname_base=str(out), with_noise=False)
+        raw = out.read_bytes()
+    body = raw[len(raw) - nsamp * mn.nchans:]
+    prof = np.frombuffer(body, dtype=np.uint8).reshape(nsamp, mn.nchans)[:, 0]
+    prof = prof.astype(np.float64)
+    _RENDER_CACHE[key] = prof
+    return prof
+
+
+def truncated_snr(amp_counts: int, sigma_ms: float, std_per_channel: float,
+                  nchan_usable: int, tsamp_s: float = TSAMP_S) -> float:
+    """Matched-filter S/N of the rendered pulse over nchan_usable channels.
+
+    S/N = sqrt(nchan) * ||p||_2 / sigma_n for a profile p in counts repeated
+    over independent channels, which for an untruncated Gaussian is exactly the
+    analytic (A / sigma_n) sqrt(N) sqrt(sigma_t sqrt(pi)). Rendering p through
+    the generator is what puts the u8 truncation into the number.
+    """
+    sigma_samp = max(float(sigma_ms) / (1000.0 * float(tsamp_s)), 1.0)
+    prof = rendered_pulse_counts(int(amp_counts), sigma_samp)
+    return float(math.sqrt(int(nchan_usable)) * math.sqrt(float((prof ** 2).sum()))
+                 / float(std_per_channel))
+
+
+def fluence_retention(amp_counts: int, sigma_ms: float,
+                      tsamp_s: float = TSAMP_S) -> float:
+    """Counts surviving u8 truncation over the ideal Gaussian's counts.
+
+    Diagnostic only: the S/N loss goes as the ||p||_2 ratio, which is milder.
+    """
+    sigma_samp = max(float(sigma_ms) / (1000.0 * float(tsamp_s)), 1.0)
+    prof = rendered_pulse_counts(int(amp_counts), sigma_samp)
+    return float(prof.sum() / (int(amp_counts) * sigma_samp * math.sqrt(2.0 * math.pi)))
+
+
+def amp_for_injected_snr(target_snr: float, sigma_ms: float,
+                         std_per_channel: float, nchan_usable: int,
+                         tsamp_s: float = TSAMP_S,
+                         amp_floor: int = DEFAULT_AMP_FLOOR,
+                         log=logger) -> tuple[int, float]:
+    """Smallest integer amplitude reaching `target_snr`, and its predicted S/N.
+
+    The amplitude is quantised to u8 counts in the stream, so the solve is over
+    integers and scores the truncated pulse, not the Gaussian that was asked
+    for. Never returns below `amp_floor`, nor above AMP_MAX, where it warns that
+    the target is out of reach. `std_per_channel` is the per-channel std in the
+    searched band, the Redis value already divided by std_bandpass_factor.
+    Returns (amp_counts, predicted injected S/N).
+    """
+    floor_amp = max(1, int(amp_floor))
+
+    def snr(a: int) -> float:
+        return truncated_snr(a, sigma_ms, std_per_channel, nchan_usable, tsamp_s)
+
+    if snr(floor_amp) >= float(target_snr):
+        return floor_amp, snr(floor_amp)
+    if snr(AMP_MAX) < float(target_snr):
+        log.warning("injected S/N %.1f needs more than %d counts at FWHM "
+                    "%.1f ms and std %.2f; using %d (S/N %.1f)", target_snr,
+                    AMP_MAX, float(sigma_ms) * FWHM_PER_SIGMA, std_per_channel,
+                    AMP_MAX, snr(AMP_MAX))
+        return AMP_MAX, snr(AMP_MAX)
+    # S/N is non-decreasing in amplitude (floor() of a scaled profile is), so
+    # bisect for the crossing rather than render every count.
+    lo, hi = floor_amp, AMP_MAX
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if snr(mid) >= float(target_snr):
+            hi = mid
+        else:
+            lo = mid
+    return hi, snr(hi)

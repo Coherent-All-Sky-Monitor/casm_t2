@@ -10,6 +10,7 @@ import random
 import pytest
 
 from casm_t2 import hella_kernel as hk
+from casm_t2 import inject_calib as ic
 from casm_t2.apps import inject_daemon as d
 
 
@@ -135,11 +136,9 @@ def test_rec_per_true_accepts_a_single_point_table():
     assert d.rec_per_true(99.0, {"rec_per_true_table": [[10.0, 1.7]]}) == 1.7
 
 
-def test_amplitude_scales_so_the_target_is_width_independent(monkeypatch):
+def test_amplitude_scales_so_the_target_is_width_independent():
     """The whole point of the table: same target S/N, any width, and the
     solved amplitude tracks the measured ratio rather than a constant."""
-    monkeypatch.setattr(d, "amp_for_target_snr",
-                        lambda true_snr, sigma_ms, beam, nchan: (true_snr, 1.0))
     solved = {}
     for fwhm in (4.7, 11.8, 23.5):
         k = d.rec_per_true(fwhm, TABLE_CFG)
@@ -214,7 +213,7 @@ def test_the_sampled_range_never_clamps_at_any_width_or_dm():
 def test_the_solver_does_not_read_dm():
     """The amplitude is a function of S/N, width and the live std only."""
     import inspect
-    src = inspect.getsource(d.amp_for_target_snr)
+    src = inspect.getsource(d.amp_for_injected_snr)
     assert "dm" not in src.lower().replace("nchan", "")
 
 
@@ -955,3 +954,100 @@ def test_a_mix_of_old_and_new_counts_only_the_new(conn):
     _row(conn, 2, "2026-09-10T18:00:00.000+00:00", "inj_20260910_0003")
     when = datetime(2026, 9, 10, 19, 0, tzinfo=timezone.utc)
     assert d.next_file_id(conn, when) == "inj_20260910_0004"
+
+
+# --- the truncation-aware amplitude solve ----------------------------------
+
+# FWHM 13.4 ms, the missed shot 675: sigma 5.43 samples.
+SIG_675_MS = 13.4 / 2.355
+# Per-channel std in the searched band for that beam: Redis 34.2 over the 1.4
+# bandpass factor.
+STD_675 = 34.2 / 1.4
+
+
+@pytest.mark.parametrize("amp,retention", [
+    (2, 0.51), (3, 0.66), (4, 0.77), (5, 0.78), (10, 0.88), (34, 0.96),
+])
+def test_uint8_truncation_retention(amp, retention):
+    """Counts surviving the generator's u8 truncation, measured on the pulse
+    the generator itself renders (casm-wiki injection-amplitude-solver.md)."""
+    assert ic.fluence_retention(amp, SIG_675_MS) == pytest.approx(retention,
+                                                                  abs=0.02)
+
+
+def test_truncated_snr_matches_the_analytic_formula_when_nothing_is_lost():
+    """At 200 counts almost nothing is truncated, so the numeric S/N returns
+    to (A / sigma_n) sqrt(N) sqrt(sigma_t sqrt(pi))."""
+    sigma_t = SIG_675_MS / 1.048576
+    analytic = (200.0 / STD_675) * math.sqrt(2600) * math.sqrt(
+        sigma_t * math.sqrt(math.pi))
+    got = ic.truncated_snr(200, SIG_675_MS, STD_675, 2600)
+    assert got == pytest.approx(analytic, rel=0.01)
+
+
+def test_solver_never_goes_below_the_floor():
+    for target in (0.1, 1.0, 5.0, 12.0):
+        amp, snr = ic.amp_for_injected_snr(target, SIG_675_MS, STD_675, 2600)
+        assert amp >= 4
+        assert snr == pytest.approx(
+            ic.truncated_snr(amp, SIG_675_MS, STD_675, 2600))
+
+
+def test_solver_floor_is_configurable():
+    amp, _ = ic.amp_for_injected_snr(1.0, SIG_675_MS, STD_675, 2600,
+                                     amp_floor=8)
+    assert amp == 8
+
+
+def test_the_missed_shot_now_solves_to_four_counts():
+    """Shot 675 asked for 15.0 and got 3 counts, delivering 9.7 measured in
+    the searched band. The truncation-aware solve returns 4."""
+    amp, snr = ic.amp_for_injected_snr(15.0, SIG_675_MS, STD_675, 2600)
+    assert amp == 4
+    assert snr >= 15.0
+    assert snr == pytest.approx(21.9, abs=0.2)
+    # 3 counts falls short of the target, which is why 4 is the answer
+    assert ic.truncated_snr(3, SIG_675_MS, STD_675, 2600) < 15.0
+
+
+def test_solver_returns_the_smallest_amplitude_reaching_the_target():
+    for target in (15.0, 30.0, 60.0, 120.0):
+        amp, snr = ic.amp_for_injected_snr(target, SIG_675_MS, STD_675, 2600)
+        assert snr >= target
+        if amp > 4:
+            assert ic.truncated_snr(amp - 1, SIG_675_MS, STD_675, 2600) < target
+
+
+def test_solver_is_monotonic_in_the_target():
+    amps = [ic.amp_for_injected_snr(t, SIG_675_MS, STD_675, 2600)[0]
+            for t in (10.0, 15.0, 20.0, 30.0, 45.0, 80.0)]
+    assert amps == sorted(amps)
+    assert amps[0] < amps[-1]
+
+
+def test_solver_caps_at_the_u8_ceiling():
+    amp, snr = ic.amp_for_injected_snr(1e6, SIG_675_MS, STD_675, 2600)
+    assert amp == ic.AMP_MAX
+    assert snr < 1e6
+
+
+def test_bandpass_factor_corrects_the_redis_std():
+    std, factor = ic.corrected_std(34.2, {"std_bandpass_factor": 1.33})
+    assert factor == 1.33
+    assert std == pytest.approx(34.2 / 1.33)
+    assert ic.corrected_std(34.2, {})[1] == 1.4
+    assert ic.corrected_std(34.2, None)[0] == pytest.approx(34.2 / 1.4)
+
+
+def test_bandpass_factor_rejects_a_nonsense_value():
+    with pytest.raises(ic.SpecError):
+        ic.corrected_std(34.2, {"std_bandpass_factor": 0.0})
+
+
+def test_config_carries_the_floor_and_the_bandpass_factor():
+    import yaml
+    with open("config/t2d.yaml") as fh:
+        icfg = yaml.safe_load(fh)["injection"]
+    assert icfg["amp_floor"] == 4
+    assert 1.3 <= icfg["std_bandpass_factor"] <= 1.5
+    assert icfg["nchan_usable"] == 2600

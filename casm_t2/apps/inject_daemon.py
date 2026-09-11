@@ -87,23 +87,24 @@ def read_live_std(beam: int) -> float:
     return float(sigma_n)
 
 
-def amp_for_target_snr(target_snr: float, sigma_ms: float, beam: int,
-                       nchan_usable: int = 2880,
-                       std: float | None = None) -> tuple[float, float]:
-    """Pulse amplitude in stream counts for a target matched-filter S/N.
+def solve_amplitude(target_snr: float, sigma_ms: float, beam: int,
+                    nchan_usable: int = 2880, std: float | None = None,
+                    icfg: dict | None = None) -> tuple[int, float, float, float]:
+    """Integer amplitude in stream counts for a target injected S/N.
 
-    Analytical Gaussian matched filter over nchan independent channels
-    (make_noise_fil_with_frb_snr.matched_filter_snr, "analytical" branch):
-    S/N = (A / sigma_n) * sqrt(nchan) * sqrt(sigma_t * sqrt(pi)), sigma_t in
-    samples, sigma_n the live per-channel std of the beam from Redis. The pulse
-    renders as integer u8 counts, so the result is rounded and floored at 1.
-    Returns (amp_counts, sigma_n).
+    Takes the Redis std of the beam (read here when not supplied), divides out
+    the bandpass inflation and hands it to the truncation-aware integer solve.
+    Returns (amp_counts, predicted injected S/N, raw std, corrected std).
     """
-    import math
-    sigma_n = read_live_std(beam) if std is None else float(std)
-    sigma_t = max(sigma_ms / 1.048576, 1.0)
-    amp = target_snr * sigma_n / (math.sqrt(nchan_usable) * math.sqrt(sigma_t * math.sqrt(math.pi)))
-    return float(max(1, round(amp))), float(sigma_n)
+    icfg = icfg or {}
+    raw_std = read_live_std(beam) if std is None else float(std)
+    sigma_n, factor = inject_calib.corrected_std(raw_std, icfg)
+    amp, predicted = inject_calib.amp_for_injected_snr(
+        target_snr, sigma_ms, sigma_n, nchan_usable,
+        amp_floor=int(icfg.get("amp_floor", inject_calib.DEFAULT_AMP_FLOOR)))
+    logger.info("beam %d live std %.2f raw / %.2f corrected (bandpass factor "
+                "%.2f)", beam, raw_std, sigma_n, factor)
+    return amp, predicted, raw_std, sigma_n
 
 
 # The width/amplitude calibration lives in casm_t2.inject_calib so the Slack
@@ -117,6 +118,8 @@ sample_spec = inject_calib.sample_spec
 clamp_fwhm_ms = inject_calib.clamp_fwhm_ms
 clamp_dm = inject_calib.clamp_dm
 rec_per_true = inject_calib.rec_per_true
+amp_for_injected_snr = inject_calib.amp_for_injected_snr
+corrected_std = inject_calib.corrected_std
 reported_snr_cap = inject_calib.reported_snr_cap
 clamp_inject_snr = inject_calib.clamp_inject_snr
 
@@ -771,26 +774,44 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
                 i += 1
                 await asyncio.sleep(cadence_s)
                 continue
-            amp, sigma_n = amp_for_target_snr(
-                inject_snr, sigma_ms, beam, nchan_usable, std=std)
-            logger.info("injected S/N %.1f at FWHM %.1f ms (predicted reported "
-                        "%.1f at rec_per_true %.2f, cap %.1f%s), live std %.2f "
-                        "-> amp %.0f counts",
-                        inject_snr, fwhm_ms, target_rec,
+            amp, predicted, raw_std, sigma_n = solve_amplitude(
+                inject_snr, sigma_ms, beam, nchan_usable, std=std, icfg=icfg)
+            # The amplitude is an integer with a floor, so the pulse that is
+            # actually rendered is at or above what was asked for. Everything
+            # downstream quotes what will be injected, not the draw.
+            asked = inject_snr
+            inject_snr = predicted
+            target_rec = predicted * rec_per_true(fwhm_ms, icfg)
+            logger.info("injected S/N %.1f asked, %.1f delivered at FWHM %.1f "
+                        "ms (predicted reported %.1f at rec_per_true %.2f, cap "
+                        "%.1f%s), std %.2f raw / %.2f corrected -> amp %d counts",
+                        asked, inject_snr, fwhm_ms, target_rec,
                         rec_per_true(fwhm_ms, icfg),
                         reported_snr_cap(fwhm_ms, icfg),
-                        ", CLAMPED" if clamped else "", sigma_n, amp)
+                        ", CLAMPED" if clamped else "", raw_std, sigma_n, amp)
+            cap = reported_snr_cap(fwhm_ms, icfg)
+            if target_rec > cap:
+                # The amplitude floor, not the draw: it cannot be scaled down.
+                logger.warning("amp %d counts is the floor at FWHM %.1f ms and "
+                               "predicts a reported S/N of %.1f, over the %.1f "
+                               "cap", amp, fwhm_ms, target_rec, cap)
             if std_age:
                 logger.info("live std age %.0f s (max_std_age_s %.0f)",
                             std_age, float(icfg.get("max_std_age_s", 30.0)))
         else:
             amp = random.uniform(*icfg.get("amp_range", [25.0, 45.0]))
+            predicted = None
             inject_snr = target_rec = sigma_n = nchan_usable = None
         file_id = next_file_id(conn)
 
         try:
             dada, est_snr = await asyncio.to_thread(
                 make_injection_files, dm, amp, sigma_ms, local_beam, scratch, file_id)
+            if predicted is not None:
+                # The generator's own estimate is analytic over all 3072
+                # channels off the raw std; the solver's is the one that was
+                # solved for, so the ledger keeps that.
+                est_snr = predicted
         except subprocess.SubprocessError as exc:
             logger.error("injection file generation failed: %s", exc)
             if once:
@@ -921,8 +942,9 @@ def main() -> None:
                    help="deprecated spelling of --fwhm-ms, in Gaussian sigma "
                         "(FWHM = 2.355 sigma)")
     p.add_argument("--inject-snr", type=float,
-                   help="force the injected (true, analytic) S/N; the amplitude "
-                        "is solved from it and the live beam std")
+                   help="force the injected (true, matched-filter) S/N; the "
+                        "integer amplitude is solved from it, the live beam "
+                        "std and the u8 truncation of the rendered pulse")
     p.add_argument("--target-snr", type=float,
                    help="force the hella-REPORTED S/N instead; converted to an "
                         "injected S/N through the per-width rec_per_true table")
