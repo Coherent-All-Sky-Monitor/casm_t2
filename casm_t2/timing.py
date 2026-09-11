@@ -1,12 +1,9 @@
 """Time conversions between hella sample numbers and absolute UTC.
 
-The native CASM sample interval is 32.768 us x 32 = 1.048576 ms. Hella's
-own ``time_days`` output column has historically been computed with
-an assumed 1.0 ms sample time in some builds, so all absolute timing here
-is derived from the integer sample number and TSAMP_S only.
-
-The dump daemons (and PSRDADA headers generally) use UTC strings of the
-form ``2026-06-09-01:24:11`` with optional fractional seconds.
+All absolute timing is derived from the integer sample number and TSAMP_S.
+Hella's own ``time_days`` column assumes a 1.0 ms sample time in some builds
+and is not used. The dump daemons take PSRDADA UTC strings of the form
+``2026-06-09-01:24:11`` with optional fractional seconds.
 """
 
 from __future__ import annotations
@@ -15,7 +12,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-# 32.768 us x 32. Verified 2026-06-10 against wall clock over a 40 h run.
+# 32.768 us x 32, verified against wall clock over a 40 h run.
 TSAMP_S = 1.048576e-3
 
 # Band edges for the 3072-channel beam data, descending frequency order.

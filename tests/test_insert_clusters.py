@@ -1,8 +1,7 @@
 """insert_clusters must lose at most the offending row, never the gulp.
 
-Before 2026-07-31 an intra-batch name collision raised IntegrityError out
-of the single wrapping transaction, and every cluster in that gulp was
-discarded.
+An intra-batch name collision raising IntegrityError out of the wrapping
+transaction discards every cluster in that gulp.
 """
 
 from casm_t2 import db

@@ -1,4 +1,4 @@
-"""Storm lockout and storm_skip_gulp (2026-08-13).
+"""Storm lockout and storm_skip_gulp.
 
 Lockout: a blind trigger needs `storm_lockout_s` of blind-eligible quiet;
 every eligible blind event restarts the clock whether or not it dumped, so

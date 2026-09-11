@@ -1,9 +1,8 @@
-"""Logging that lands in both journald and a plain file.
+"""Logging to journald and a plain file.
 
-Daemons run under systemd user units with StandardOutput=journal, so the
-stream handler feeds journalctl; the file handler keeps the greppable
-tail -f files under /mnt/nvme5/casm_pipeline/logs/ that operations is used
-to. A missing/unwritable log file degrades to journald-only.
+The stream handler feeds journalctl under systemd; the file handler writes the
+greppable logs under /mnt/nvme5/casm_pipeline/logs/. An unwritable log file
+degrades to journald only.
 """
 
 from __future__ import annotations

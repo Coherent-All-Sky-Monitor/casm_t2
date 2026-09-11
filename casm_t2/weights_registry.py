@@ -1,17 +1,15 @@
-"""Registry of beamformer weights that have been live, and the beam pointings that go with them.
+"""Registry of beamformer weights that have been live, and their beam pointings.
 
-Why this exists (2026-09-02): T3 printed beam coordinates from a static table that
-was never refreshed after weights uploads, so every candidate coordinate posted from
-2026-08-19 to 2026-09-02 was wrong by a median 45 deg. Nothing in the fourier-space
-pipeline (medusa, bfcorr, redis, the rings) may be changed to fix this, so the truth
-is reconstructed from what our own tools do and what can be observed from outside:
+Beam coordinates must follow the deployed weights, not a static table. Nothing in
+the fourier-space pipeline (medusa, bfcorr, redis, the rings) may be changed, so
+the timeline is reconstructed from what our own tools do and can observe:
 
-* ``deploy_bf_weights`` (the only sanctioned upload path) records every product it
+* ``deploy_bf_weights``, the only sanctioned upload path, records every product it
   serialises (per-stream payload md5s and the 512-beam alt/az table) and a live
   event for every stream it pushes.
-* ``t3-weights-watch`` tails the medusa weights-daemon log; a transfer that no
-  upload accounts for is bfcorr reloading its defaults after a restart, and is
-  identified by hashing the defaults files bfcorr read.
+* ``t3-weights-watch`` tails the medusa weights-daemon log. A transfer that no
+  upload accounts for is bfcorr reloading its defaults after a restart, identified
+  by hashing the defaults files bfcorr read.
 * t2d resolves (beam, event UTC) -> pointings through the live-event timeline and
   stamps alt/az/RA/Dec into every cluster row and trigger card at insert time.
 
@@ -100,15 +98,14 @@ class Registry:
                        beam_fwhm_x_deg: float | None = None,
                        beam_fwhm_y_deg: float | None = None,
                        meta: dict | None = None) -> str:
-        """Register a weights product. Idempotent: re-registering the same payloads
-        returns the existing id and only refreshes the payload index.
+        """Register a weights product, returning its id.
 
-        ``beam_fwhm_x_deg`` / ``beam_fwhm_y_deg`` are the synthesised beam's E-W
-        and N-S FWHM in degrees for THIS product's enabled antennas
-        (``bf_weights_generator.config.compute_beam_fwhm``); both optional, both
-        None when the geometry was not available. A product registered without
-        them can be filled in later by :meth:`set_product_fwhm` (t3-weights-watch
-        --backfill-fwhm), which is also what re-registering with them does.
+        Idempotent: re-registering the same payloads returns the existing id and
+        refreshes the payload index. ``beam_fwhm_x_deg`` / ``beam_fwhm_y_deg`` are
+        the synthesised beam's E-W and N-S FWHM in degrees for this product's
+        enabled antennas (``bf_weights_generator.config.compute_beam_fwhm``), None
+        when the geometry was not available. They can be filled in later by
+        :meth:`set_product_fwhm` (t3-weights-watch --backfill-fwhm).
         """
         if len(alt_deg) != NBEAM or len(az_deg) != NBEAM:
             raise ValueError(f"pointing table must have {NBEAM} beams")
@@ -145,10 +142,9 @@ class Registry:
                          beam_fwhm_y_deg: float | None, *, overwrite: bool = False) -> bool:
         """Store the beam ellipse on an existing product record.
 
-        Returns True when the record was rewritten. Products registered before
-        the ellipse existed (2026-09-09) carry no FWHM keys at all; this is how
-        they get one without re-uploading anything. Existing values are kept
-        unless ``overwrite``."""
+        Returns True when the record was rewritten. Older products carry no FWHM
+        keys at all; this fills them in without re-uploading. Existing values are
+        kept unless ``overwrite``."""
         path = self.products_dir / f"{product_id}.json"
         try:
             rec = json.loads(path.read_text())
@@ -264,10 +260,10 @@ class Registry:
         return self.product(pids.pop()), "ok"
 
     def pointings_for(self, utc: datetime) -> dict | None:
-        """{'weights_id', 'alt_deg'[512], 'az_deg'[512], 'beam_fwhm_x_deg', 'beam_fwhm_y_deg'}
-        live at utc, for self-contained cards. The two FWHMs are the beam ellipse of
-        this very product (E-W, N-S, degrees) and are None for products registered
-        before 2026-09-09 that no backfill has reached."""
+        """{'weights_id', 'alt_deg'[512], 'az_deg'[512], 'beam_fwhm_x_deg',
+        'beam_fwhm_y_deg'} live at utc, for self-contained cards. The FWHMs are
+        this product's beam ellipse in degrees, None when it was never
+        recorded."""
         prod, status = self.product_at(utc)
         if prod is None:
             return None
@@ -389,10 +385,10 @@ def default_registry() -> Registry:
 def beam_separation_arcsec(pointings: dict | None, beam_a: int, beam_b: int) -> float | None:
     """Great-circle separation between two beams' pointings, in arcseconds.
 
-    `pointings` is what `Registry.pointings_for` returns. Alt/az of the two
-    beams at the same instant, so the separation is the angle on the sky
-    between where the injection was put and where it came back. Returns 0.0
-    for the same beam and None when there is no usable pointing table.
+    `pointings` is what `Registry.pointings_for` returns. Both beams are taken at
+    the same instant, so this is the on-sky angle between where an injection was
+    put and where it came back. 0.0 for the same beam, None without a usable
+    pointing table.
     """
     import math
     if not pointings:

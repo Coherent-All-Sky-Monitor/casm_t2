@@ -1,16 +1,11 @@
 """Automated replay of an injection: dump the stream, render it, post the plot.
 
-The truth plot the daemon already makes is rendered from the .fil that was
-pushed into the FIFO, so it shows the pulse as generated. It cannot show what
-the pulse looked like once it was merged into the live stream, because
-intensity dumps tap upstream of the injection merge - which is precisely the
-thing worth seeing when a shot is recovered at half the expected S/N, or not
-at all.
-
-The replay closes that gap: dump the injected stream around the shot, add the
-pulse to the dump at the time it should have arrived, and render it. On a
-recovered shot it shows what hella saw. On a miss it shows what hella should
-have found and did not, which is the more useful of the two.
+The daemon's truth plot is rendered from the .fil pushed into the FIFO, so it
+shows the pulse as generated. Intensity dumps tap upstream of the injection
+merge, so they cannot show the pulse in the live stream. The replay closes that
+gap: dump the injected stream around the shot, add the pulse at the time it
+should have arrived, render it. On a recovered shot that is what hella saw, on a
+miss what it should have found.
 
 Timeline per shot, from the FIFO write:
 
@@ -19,8 +14,8 @@ Timeline per shot, from the FIFO write:
     ~100 s  reconcile: the outcome edits the Slack message
     ~110 s  the replay PNG lands as a thread reply under it
 
-Everything here is fail-soft: a failure to dump, render or post leaves the
-injection and its ledger row untouched.
+Fail-soft: a failure to dump, render or post leaves the injection and its ledger
+row untouched.
 """
 
 from __future__ import annotations
@@ -55,14 +50,11 @@ def replay_cfg(icfg: dict | None) -> dict:
     cfg.setdefault("keep_dump", False)
     cfg.setdefault("events_root", "/mnt/nvme3/T3/EVENTS")
     cfg.setdefault("command", "t3-replay-injection")
-    # What to do about a shot the search did not find. `none` renders
-    # nothing: the card carries the red bar and the reason, which is the
-    # whole story, and an image of a pulse nobody detected mostly invites
-    # squinting at noise. `expected` renders it anyway, with the pulse where
-    # it should have been, for when a miss is worth staring at.
+    # A shot the search did not find. `none` renders nothing, the card carrying
+    # the red bar and the reason. `expected` renders it with the pulse where it
+    # should have been.
     cfg.setdefault("on_miss", "none")
-    # A miss is the case where the raw stream is worth keeping: the dump is
-    # the only copy of what hella actually saw.
+    # On a miss the dump is the only copy of what hella saw, so keep it.
     cfg.setdefault("keep_dump_on_miss", True)
     if cfg["on_miss"] not in ("none", "expected"):
         logger.warning("injection.replay.on_miss %r is not none|expected; "
@@ -88,22 +80,20 @@ def dump_window(inject_utc: datetime, rcfg: dict) -> tuple[datetime, datetime]:
 
 
 def dump_due(rcfg: dict) -> bool:
-    """Should a dump be requested for this shot at all?
+    """Whether a dump should be requested for this shot.
 
-    Requested whenever posting is possible: whether the PNG is *posted* is
-    decided later, once the outcome is known, but the dump has to exist by
-    then and cannot be taken retrospectively.
+    Requested whenever posting is possible. Whether the PNG is posted is decided
+    once the outcome is known, by which time the dump must already exist.
     """
     return rcfg.get("post") != "never"
 
 
 def post_due(rcfg: dict, outcome: str | None, last_post_day: str | None,
              now: datetime | None = None) -> bool:
-    """Should the replay PNG be posted for this shot?
+    """Whether the replay PNG should be posted for this shot.
 
-    `never` posts nothing. `always` posts every shot. `on_miss` posts only
-    misses. `daily` posts every miss plus the first shot of each UTC day, so
-    a quiet day still shows one worked example and a bad day shows all of it.
+    `never` posts nothing, `always` every shot, `on_miss` only misses, `daily`
+    every miss plus the first shot of each UTC day.
     """
     mode = rcfg.get("post", "daily")
     if mode == "never":
@@ -132,9 +122,8 @@ def expected_event_utc(conn, inject_utc: datetime,
                        default_lead_s: float = DEFAULT_LEAD_S) -> datetime:
     """When the pulse should have arrived, for a shot that was not recovered.
 
-    The median lead of the last ten recovered shots: the sidecar lag drifts
-    over weeks, so a measured recent median beats a constant. Falls back to
-    DEFAULT_LEAD_S when nothing has been recovered yet.
+    The median lead of the last ten recovered shots, the sidecar lag drifting
+    over weeks. Falls back to DEFAULT_LEAD_S when nothing has been recovered.
     """
     rows = conn.execute(
         "SELECT rec_lead_s FROM injections WHERE outcome = ?"
@@ -162,10 +151,9 @@ def replay_paths(inj_id, rcfg: dict, label: str | None = None) -> dict:
 def resolve_command(command: str) -> list[str]:
     """Split `replay.command` into argv, finding the tool if PATH lacks it.
 
-    The daemon runs under systemd with a PATH that does not include the venv,
-    so a bare `t3-replay-injection` is not found even though it sits next to
-    the interpreter running this code. Look there before giving up; an
-    absolute path or a `python -m ...` form is left alone.
+    Under systemd the PATH excludes the venv, so a bare `t3-replay-injection`
+    is looked for next to the running interpreter. An absolute path or a
+    `python -m ...` form is left alone.
     """
     parts = str(command).split()
     if not parts:
@@ -198,9 +186,8 @@ def build_command(inj_id: int, dump_dir, rcfg: dict, db_path: str | None = None,
            "--dump", str(dump_dir),
            "--card-json", str(paths["json"])]
     if card_only:
-        # A rendered miss archives the numbers, not the pictures: --out is
-        # required by the tool, so its PNG goes to a scratch path that is not
-        # kept alongside the card.
+        # A rendered miss archives the numbers, not the pictures. --out is
+        # required by the tool, so its PNG goes to a scratch path.
         cmd += ["--out", str(paths["dir"] / f"_scratch_{paths['png'].name}")]
     else:
         cmd += ["--out", str(paths["png"]), "--fil", str(paths["fil"])]
@@ -244,18 +231,17 @@ def run_replay(inj_id: int, dump_dir, rcfg: dict, db_path: str | None = None,
 #: with this (same constant casm_t3's janitor uses).
 BYTES_PER_SECOND = 375e6
 
-#: A dump of the configured window is one or two files. More than this from
-#: the window selection means the arithmetic is wrong, and the right response
-#: to that is to delete nothing.
+#: A dump of the configured window is one or two files. More than this means
+#: the window arithmetic is wrong, so delete nothing.
 MAX_DELETE = 4
 
 
 def dump_file_span(path) -> tuple[datetime, datetime] | None:
     """Sky-time interval a .dada file covers, from its name and size.
 
-    Files are named ``<UTC_START>_<byteoffset>.000000.dada``; the offset is
-    bytes since the observation started. Returns None when the name does not
-    parse, which must never be read as "no overlap".
+    Files are named ``<UTC_START>_<byteoffset>.000000.dada``, the offset being
+    bytes since the observation started. None when the name does not parse,
+    which must not be read as no overlap.
     """
     path = Path(path)
     try:
@@ -277,10 +263,9 @@ def dump_files_in_window(dump_dir, start: datetime, stop: datetime,
                          margin_s: float = 2.0) -> list[Path]:
     """The .dada files in `dump_dir` overlapping [start, stop].
 
-    `dump_dir` is a per-STREAM directory shared with T2's ordinary triggered
-    dumps, so this must pick out only the injection's own files. Selection is
-    by the window each file covers, from its name and size; a file whose name
-    does not parse is left alone rather than guessed at.
+    `dump_dir` is a per-stream directory shared with T2's triggered dumps, so
+    selection is by the window each file covers, from its name and size. A file
+    whose name does not parse is left alone.
     """
     lo = start - timedelta(seconds=margin_s)
     hi = stop + timedelta(seconds=margin_s)
@@ -302,18 +287,14 @@ def keep_for_miss(rcfg: dict, outcome: str | None) -> bool:
 
 def cleanup_dump(dump_dir, rcfg: dict, start=None, stop=None,
                  outcome: str | None = None, inj_label=None) -> int:
-    """Delete this injection's dump FILES. Returns how many went.
+    """Delete this injection's dump files. Returns how many went.
 
-    Never removes the directory. `dump_dir` is
-    `/mnt/nvme4/data/casm/cand_beam_dumps/stream_N`, which T2's ordinary
-    triggered dumps share: on 2026-09-10 an earlier version rmtree'd it after
-    shot 668 and took every other dump with it. Only files whose own window
-    overlaps the recorded [start, stop] are removed, at most MAX_DELETE of
-    them, and every deletion is logged by full path.
-
-    Without a recorded window nothing is deleted - there is no way to tell
-    this shot's files from anyone else's, and leaving disk to the janitor is
-    the cheap mistake.
+    Never removes the directory: `dump_dir` is
+    `/mnt/nvme4/data/casm/cand_beam_dumps/stream_N`, shared with T2's triggered
+    dumps. Only files whose window overlaps the recorded [start, stop] are
+    removed, at most MAX_DELETE of them, each logged by full path. Without a
+    recorded window nothing is deleted, this shot's files then being
+    indistinguishable from anyone else's.
     """
     if rcfg.get("keep_dump"):
         logger.info("keeping dump files in %s (keep_dump)", dump_dir)
@@ -356,6 +337,5 @@ def cleanup_dump(dump_dir, rcfg: dict, start=None, stop=None,
     return n
 
 
-#: Comment on a separately posted plot: just the shot id, since the
-#: message it accompanies already says what it is.
+#: Comment on a separately posted plot: the shot id alone.
 CAPTION = ""

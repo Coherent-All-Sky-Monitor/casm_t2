@@ -1,18 +1,15 @@
 """Replay recorded hella candidates through the T2 clustering, for tuning.
 
-Reads a UTC slice of the hella .dat output files, clusters it in
-gulp-sized chunks exactly as the live daemon would, and reports what the
-trigger logic would have seen: cluster rate, noise fraction, the beam-span
-and sky-extent distributions (the RFI discriminators), runtime per chunk
-versus real time, and the top clusters.
+Reads a UTC slice of the hella .dat files, clusters it in gulp-sized chunks as
+the live daemon would, and reports cluster rate, noise fraction, the beam-span
+and sky-extent distributions, runtime per chunk versus real time, and the top
+clusters.
 
-Clustering uses the sky axis when a pointing table is given with
-``--pointings`` (any JSON carrying a ``pointings`` block, such as a T3
-trigger card, or a weights-registry product file with alt_deg/az_deg).
-Without one it falls back to the beam-index axis, which the live daemon
-only does when the registry cannot name a product, so pass one if the
-replay is meant to match production. Purely offline — reads files, writes nothing but an
-optional CSV of clusters for HiPlot.
+``--pointings`` takes any JSON carrying a ``pointings`` block (a T3 trigger
+card, or a weights-registry product with alt_deg/az_deg) and enables the sky
+axis; without it the run falls back to the beam-index axis, which production
+uses only when the registry cannot name a product. Offline: writes nothing but
+the optional clusters CSV.
 
     t2-replay --from 2026-06-10T18:00 --to 2026-06-10T19:00 \\
               --eps 1.0 --min-samples 5 --csv /tmp/clusters.csv
@@ -98,8 +95,8 @@ def main() -> None:
           f"({(samp_max - samp_min) * timing.TSAMP_S:.0f} s)")
     print(f"params: {params}")
 
-    # Bin the slice into live-sized chunks, pooling all jobs (the live
-    # daemon sees all 512 beams in one coalesced window).
+    # Bin the slice into live-sized chunks, pooling all jobs: the live daemon
+    # sees all 512 beams in one coalesced window.
     chunks: dict[int, list] = defaultdict(list)
     n_read = 0
     t0 = time.monotonic()

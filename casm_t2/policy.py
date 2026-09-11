@@ -1,11 +1,8 @@
 """Trigger budgets and disk safety.
 
-Dumps are the only expensive, irreversible thing T2 does, and the disks are
-nearly full (user directive: "just do a few and stop"). Every dump kind gets
-a token-bucket policy — minimum spacing plus a hard daily cap — and every
-trigger must pass a free-space check on the target filesystem. Refusals are
-returned as reason strings so the caller can record them in the trigger
-audit; nothing here raises on a refused trigger.
+Each dump kind gets a minimum spacing plus a hard daily cap, and every trigger
+must pass a free-space check on the target filesystem. Refusals come back as
+reason strings for the trigger audit; nothing here raises.
 """
 
 from __future__ import annotations
@@ -41,10 +38,9 @@ class TriggerBudget:
 
 
 def disk_refusal(path: str, floor_gb: float) -> str | None:
-    """Refusal reason if the filesystem holding path is too full to dump into.
+    """Refusal reason if the filesystem holding path is too full, else None.
 
-    A missing path is itself a refusal (the dump daemon would write to a
-    directory we cannot see — fail safe rather than dump blind).
+    An unstattable path is itself a refusal.
     """
     try:
         st = os.statvfs(path)

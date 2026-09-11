@@ -1,15 +1,12 @@
-"""Gulp coalescing: wait for all eight jobs, not for a fixed hold (2026-09-09).
+"""Gulp coalescing: wait for all eight jobs, not for a fixed hold.
 
-The eight hella jobs finish seconds apart. A fixed sleep after the FIRST
-batch therefore split a gulp into fragments — gulp 1218 of obs
-2026-09-09-21:12:15 arrived 3+2+1+1+1 — and every per-gulp veto (occupancy
-footprint, the dm_floor coincidence spread, one-dump-per-gulp) only saw its
-own fragment. These tests pin the replacement: flush when all expected jobs
-have reported, or at coalesce_max_s, whichever comes first.
+The hella jobs finish seconds apart, so a fixed sleep after the first batch
+fragments a gulp and each per-gulp veto sees only its own fragment. These tests
+pin the rule: flush when all expected jobs have reported, or at coalesce_max_s,
+whichever comes first.
 
-Timings here are compressed (tenths of a second, not the live 12 s) but the
-shape is the live one: arrivals spread far wider than ``coalesce_s``, which
-under the old fixed hold is exactly what fragmented.
+Timings are compressed to tenths of a second, with arrivals spread far wider
+than ``coalesce_s``, which is the shape that fragments.
 """
 from __future__ import annotations
 

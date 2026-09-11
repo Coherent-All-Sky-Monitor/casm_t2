@@ -1,17 +1,13 @@
 """Parsing of the candidate stream emitted by casm-hella (T1).
 
-Each hella job sends one TCP payload per processed gulp: a first line with
-the gulp number, then one line per candidate. The deployed binary writes
-seven columns::
+Each hella job sends one TCP payload per gulp: a preamble line, then one line
+per candidate. The deployed binary writes seven columns::
 
     snr  samp  time_days  width  dm_idx  dm  beam
 
-Older builds wrote eight columns with the sample number duplicated
-(``snr samp samp time_days width dm_idx dm beam``); both layouts are
-accepted here. ``beam`` is globally indexed (0-511), i.e. it already
-includes the job's BEAM0 offset. ``time_days`` is derived from ``samp``
-inside hella and should not be trusted for absolute timing; use
-:mod:`casm_t2.timing` instead.
+Older builds wrote eight, with the sample number duplicated; both are accepted.
+``beam`` is global (0-511), already including the job's BEAM0 offset.
+``time_days`` is not reliable for absolute timing, use :mod:`casm_t2.timing`.
 """
 
 from __future__ import annotations

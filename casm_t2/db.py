@@ -1,12 +1,10 @@
 """SQLite event store for T2.
 
-One WAL-mode database on corr1 holds the clustered event stream and the
-trigger bookkeeping. Raw T1 trials stay in hella's .dat files; this only
-records clusters (the objects the trigger logic reasons about), so volume
-is a few hundred thousand rows per day at current RFI levels.
-
-Writers open with `connect()`, which applies WAL and a busy timeout so the
-daemon and ad-hoc readers (sqlite3 CLI, notebooks) coexist safely.
+One WAL-mode database on corr1 holding the clustered event stream and the
+trigger bookkeeping. Raw T1 trials stay in hella's .dat files, so volume here
+is a few hundred thousand rows per day at current RFI levels. Open with
+`connect()`, which applies WAL and a busy timeout so the daemon and ad-hoc
+readers coexist.
 """
 
 from __future__ import annotations
@@ -38,9 +36,8 @@ CREATE TABLE IF NOT EXISTS clusters (
     n_beams       INTEGER NOT NULL,
     beam_lo       INTEGER NOT NULL,
     beam_hi       INTEGER NOT NULL,
-    -- largest pairwise sky separation of the member beams, degrees. NULL for
-    -- rows written before 2026-09-09 and for clusters made without a pointing
-    -- table (beam-index fallback), where the extent was never measured.
+    -- largest pairwise sky separation of the member beams, degrees. NULL when
+    -- never measured: legacy rows, and clusters made on the beam-index fallback
     sky_extent_deg REAL,
     dm_lo         REAL NOT NULL,
     dm_hi         REAL NOT NULL,
@@ -48,8 +45,8 @@ CREATE TABLE IF NOT EXISTS clusters (
     samp_hi       INTEGER NOT NULL,
     tier          TEXT NOT NULL,     -- A/B/C or '-' below tier floor
     tags          TEXT NOT NULL,     -- comma-joined: rfi_wide, veto, would_trigger, ...
-    -- event name: YYMMDD + 6 random lowercase letters (12 chars). Legacy
-    -- 10-char names from before 2026-07-31 persist. Tiered events only.
+    -- event name: YYMMDD + 6 random lowercase letters. Legacy 10-char names
+    -- persist. Tiered events only.
     name          TEXT,
     created_utc   TEXT NOT NULL,
     -- sky position of the peak beam from the weights live at event_utc
@@ -78,12 +75,12 @@ CREATE TABLE IF NOT EXISTS gulp_stats (
     clustering_ms REAL NOT NULL,
     n_vetoed      INTEGER NOT NULL DEFAULT 0,  -- dropped by the width veto
     n_shed        INTEGER NOT NULL DEFAULT 0,  -- dropped by the storm cap
-    -- how long the coalescer held the key open before flushing, ms: short
-    -- when all eight jobs reported, at coalesce_max_s when one never did
+    -- how long the coalescer held the key open before flushing, ms: at
+    -- coalesce_max_s when a job never reported
     coalesce_wait_ms REAL NOT NULL DEFAULT 0,
-    -- 1 when the gulp was DROPPED because coalesce_max_s expired with fewer
-    -- than the expected jobs reported: never clustered, never triggered. The
-    -- row exists so the gap is visible in the duty cycle.
+    -- 1 when the gulp was dropped because coalesce_max_s expired short of the
+    -- expected jobs: never clustered, never triggered. The row keeps the gap
+    -- visible in the duty cycle.
     skipped        INTEGER NOT NULL DEFAULT 0,
     created_utc   TEXT NOT NULL
 );
@@ -126,7 +123,7 @@ CREATE TABLE IF NOT EXISTS injections (
     rec_dm        REAL,
     fail_reason   TEXT,              -- first failed gate, human-readable
     created_utc   TEXT NOT NULL,
-    -- solver inputs recorded at insert time (2026-09-09)
+    -- solver inputs recorded at insert time
     target_snr    REAL,              -- PREDICTED hella-reported S/N for the shot
     inject_snr    REAL,              -- injected (true, analytic) S/N the amp solved for
     sigma_n       REAL,              -- live per-channel std the solver used
@@ -228,21 +225,16 @@ def connect(path: str | Path = DEFAULT_PATH) -> sqlite3.Connection:
 
 def insert_clusters(conn: sqlite3.Connection,
                     rows: list[tuple]) -> list[int | None]:
-    """Insert clusters; each row is
-    (cluster, obs_utc_start, gulp, event_utc, tier, tags, name[, sky])
-    where the optional ``sky`` is the dict from ``weights_registry.sky_for``
-    (weights_id/alt_deg/az_deg/ra_deg/dec_deg) or None.
+    """Insert clusters, returning the assigned ids in input order.
 
-    Returns the assigned ids in input order, with **None** for any row that
-    could not be stored. Callers must tolerate the None holes.
+    Each row is (cluster, obs_utc_start, gulp, event_utc, tier, tags, name
+    [, sky]), the optional ``sky`` being the dict from
+    ``weights_registry.sky_for`` or None. An id is None for a row that could
+    not be stored, and callers must tolerate the holes.
 
-    One transaction wraps the gulp (throughput: a gulp is a few hundred rows
-    and fsync per row would not keep up), but every row also gets its own
-    SAVEPOINT. A constraint violation — in practice a duplicate event name —
-    then rolls back exactly that row and the rest of the gulp still lands.
-    Before 2026-07-31 the IntegrityError escaped the wrapping transaction and
-    discarded every cluster in the gulp, which is how a naming collision
-    turned into total data loss for that gulp.
+    One transaction wraps the gulp, fsync per row being too slow for a few
+    hundred rows, and each row gets its own SAVEPOINT so a constraint
+    violation (a duplicate event name) drops that row alone.
     """
     now = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
     ids: list[int | None] = []
@@ -297,17 +289,11 @@ def insert_gulp_stats(conn: sqlite3.Connection, obs_utc_start: str, gulp: int | 
                       coalesce_wait_ms: float = 0.0, skipped: int = 0) -> None:
     """One accounting row per coalesced gulp: the T1->T2 survival funnel.
 
-    ``n_cands`` is the raw count that arrived from the jobs. ``n_vetoed``
-    (width veto) and ``n_shed`` (storm cap) are removed before clustering,
-    so DBSCAN saw ``n_cands - n_vetoed - n_shed`` trials.
-
-    ``skipped`` marks a gulp that was dropped whole because
-    ``coalesce_max_s`` expired with fewer than the expected jobs reported.
-    Such a row carries the counts that did arrive but ``n_clusters`` 0: the
-    gulp was never clustered and could not have triggered. A job more than a
-    gulp late is stuck, not slow, and half a sky is not worth a dump
-    decision — but the row must exist, or the gap silently inflates the
-    duty cycle.
+    ``n_cands`` is the raw count from the jobs. ``n_vetoed`` (width veto) and
+    ``n_shed`` (storm cap) are removed before clustering, so DBSCAN saw
+    ``n_cands - n_vetoed - n_shed``. ``skipped`` marks a gulp dropped whole on
+    coalesce_max_s: the counts that arrived are kept, ``n_clusters`` is 0, and
+    the row keeps the gap out of the duty cycle.
     """
     now = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
     with conn:

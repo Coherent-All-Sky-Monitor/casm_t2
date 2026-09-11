@@ -1,25 +1,20 @@
 """Slack messages for the injection bot: text builders, figures, transport.
 
-Split the way the DSA-110 inject bot splits it, and for the same reason: the
-message *text* is pure functions of a ledger row, so it can be rendered and
-reviewed offline (see `t2-inject-slack-preview`) without a token, a network,
-or a running daemon. Only `SlackPoster` touches the network.
+The message text is pure functions of a ledger row, so it renders offline with
+no token, network or daemon (see `t2-inject-slack-preview`). Only `SlackPoster`
+touches the network.
 
-One message per injection. The "sent" message posts as soon as the FIFO write
-succeeds and its `ts` goes into the ledger; when reconcile finishes ~3 min
-later the same message is EDITED in place, with a coloured attachment holding
-the outcome line, so the channel holds one line per shot and a skim shows
-green or red. A single miss says nothing more; a run of `streak_every`
-consecutive misses posts one attention message.
+One message per injection: the sent message posts as soon as the FIFO write
+succeeds and its `ts` goes into the ledger, and reconcile completes that same
+message ~3 min later with a coloured attachment holding the outcome line. A run
+of `streak_every` consecutive misses posts one attention message.
 
-Everything is fail-soft: a Slack failure logs a warning and returns None. The
-injector must never stop because Slack did.
+A Slack failure logs a warning and returns None; the injector never stops on it.
 
-Configuration lives in `injection.slack` in t2d.yaml and ships DISABLED. The
-token and channel are the same two dotfiles casm_t3.alerts uses
-(``~/.config/slack_api``, ``~/.config/slack_channel``), plus an optional
-``~/.config/slack_channel_injections`` that overrides the channel when it
-exists, so injection chatter can live away from the candidate alerts.
+Config lives in `injection.slack` in t2d.yaml. Token and channel are the
+dotfiles casm_t3.alerts uses (``~/.config/slack_api``,
+``~/.config/slack_channel``), plus an optional
+``~/.config/slack_channel_injections`` overriding the channel.
 """
 
 from __future__ import annotations
@@ -39,8 +34,8 @@ CHANNEL_OVERRIDE_PATH = Path.home() / ".config" / "slack_channel_injections"
 _SLACK_API = "https://slack.com/api"
 _TIMEOUT_S = 15.0
 
-#: FWHM = 2.355 sigma. The ledger keeps the Gaussian sigma for backward
-#: compatibility; every message and axis label is FWHM.
+#: FWHM = 2.355 sigma. The ledger stores the Gaussian sigma; every message and
+#: axis label is FWHM.
 FWHM_PER_SIGMA = 2.355
 
 NBSP = " "
@@ -52,12 +47,10 @@ COLOR_NEUTRAL = "#9E9E9E"
 #: Caption when the plot has to hang under the card instead of inside it.
 _INK = "#262626"
 
-#: Marker identity per DM bin, in bin order. Identity rides on colour AND
-#: marker shape, so the figures survive greyscale printing and colour-blind
-#: readers. Bin EDGES come from `injection.summary_dm_bins`; these are just
-#: the styles they are drawn with. There are six, which covers the default
-#: five edges (four bins plus the two open ends) without repeating; a longer
-#: bin list cycles, and two bins then share a style.
+#: Marker style per DM bin, in bin order. Colour and shape both carry the
+#: identity, for greyscale and colour-blind readers. Bin edges come from
+#: `injection.summary_dm_bins`. Six styles cover the default five edges; a
+#: longer bin list cycles and two bins share a style.
 DM_STYLES = [
     ("#4C6EF5", "o", "#364FC7"),
     ("#F59F00", "s", "#E67700"),
@@ -150,10 +143,8 @@ def display_id(row) -> str:
 def display_id_md(row) -> str:
     """`display_id`, backticked for Slack mrkdwn so it renders as inline code.
 
-    The single formatter for the id in Slack TEXT: every message body, bar,
-    caption, and fallback goes through this (not the plot title - that is a
-    matplotlib figure in casm_t3 - and not log lines or the ledger, which
-    stay bare so they still `grep` and compare on the plain id).
+    The one formatter for the id in Slack text: message bodies, bars, captions
+    and fallbacks. Log lines and the ledger keep the bare id so they still grep.
     """
     return f"`{display_id(row)}`"
 
@@ -165,12 +156,12 @@ def injected_fwhm_ms(row) -> float | None:
 
 
 def injected_snr(row) -> float | None:
-    """The S/N of the pulse that was actually written into the stream.
+    """The S/N of the pulse written into the stream.
 
-    `inject_snr` is the value the amplitude solver aimed at from the live
-    noise; it is what the card prints (Vishnu, 2026-09-10: the generator's
-    own `est_snr` reads a different noise sample and disagreed by up to 2x
-    on the live cards). `est_snr` stands in for rows without a solver value.
+    `inject_snr` is what the amplitude solver aimed at from the live noise, and
+    is what the card prints; the generator's own `est_snr` reads a different
+    noise sample and can disagree by 2x. `est_snr` stands in for rows with no
+    solver value.
     """
     inj = _f(row, "inject_snr")
     return inj if inj is not None else _f(row, "est_snr")
@@ -179,10 +170,9 @@ def injected_snr(row) -> float | None:
 def sent_text(row, icfg: dict | None = None) -> str:
     """The message posted the moment the injection hits the FIFO.
 
-    Deliberately short: id, where it went, and what was put there. Non-
-    breaking spaces join every number to its unit so Slack's wrapping can
-    never split "4.7 ms" across two lines. `icfg` is accepted and unused;
-    the line no longer depends on any calibration table.
+    Id, where it went, what was put there. Non-breaking spaces join each number
+    to its unit so Slack cannot wrap "4.7 ms" across lines. `icfg` is accepted
+    and unused.
     """
     fwhm = injected_fwhm_ms(row)
     snr = injected_snr(row)
@@ -192,8 +182,8 @@ def sent_text(row, icfg: dict | None = None) -> str:
         f"FWHM {fwhm:.1f}{NBSP}ms" if fwhm is not None else "FWHM n/a",
         f"injected S/N {snr:.0f}" if snr is not None else "injected S/N n/a",
     ]
-    # The standing state is subtraction ON, so it adds nothing to the line;
-    # only the unusual state is called out.
+    # Subtraction on is the standing state, so only the other one is called
+    # out.
     suffix = " (IB sub off)" if _g(row, "sub_incoh") == 0 else ""
     return (f"injection {display_id_md(row)} sent: " + ", ".join(bits) + suffix
             + "\n_awaiting recovery..._")
@@ -205,10 +195,9 @@ DEFAULT_WEB_BASE = "http://127.0.0.1:8050"
 def recovered_beam_text(row) -> str:
     """Which beam it came back in, and how far that is from where it went.
 
-    Landing in the injected beam is the ordinary case and needs no number,
-    so it reads as a bare "beam 150". A different beam carries the sky
-    separation of the two pointings, which is the quantity that matters -
-    neighbouring beam indices are not a fixed angle apart.
+    The injected beam reads as a bare "beam 150". A different beam carries the
+    sky separation of the two pointings, neighbouring indices not being a fixed
+    angle apart.
     """
     rec_beam = _g(row, "rec_beam")
     if rec_beam is None:
@@ -226,14 +215,12 @@ def recovered_beam_text(row) -> str:
 def outcome_text(row, web_base: str = DEFAULT_WEB_BASE) -> str:
     """One line describing how the shot resolved.
 
-    The recovered width is the FWHM of hella's smoothing kernel for the
-    matched trial, not 2**ibox samples: the kernel is about 0.67 of the
-    trial label wide, so the raw label overstates the pulse by half. It sits
-    last so it is easy to drop.
+    The recovered width is the FWHM of hella's smoothing kernel for the matched
+    trial, about 0.67 of the 2**ibox trial label.
     """
     outcome = _g(row, "outcome")
     if outcome == oc.FIRE_FAILED:
-        # Not a pipeline miss: the pulse never reached the stream.
+        # Not a pipeline miss, the pulse never reached the stream.
         return "injection not fired: " + oc.short_fire_reason(
             _g(row, "fail_reason"))
     if outcome != oc.RECOVERED:
@@ -265,9 +252,8 @@ def injection_text(row, web_base: str = DEFAULT_WEB_BASE,
                    icfg: dict | None = None) -> str:
     """The whole shot in two lines: what went in, and what came back.
 
-    This is the caption of the single message per injection. It carries no
-    "awaiting recovery" line, because by the time it posts there is nothing
-    left to await.
+    The caption of the single message per injection, posted once the outcome is
+    known, so it carries no "awaiting recovery" line.
     """
     sent = sent_text(row, icfg).split("\n")[0]
     return sent + "\n" + outcome_text(row, web_base)
@@ -276,10 +262,10 @@ def injection_text(row, web_base: str = DEFAULT_WEB_BASE,
 def injection_blocks(row, file_id=None, icfg=None) -> list[dict]:
     """Top-level blocks: the sent line, then the plot if there is one.
 
-    The image is a block on the MESSAGE, not nested in the attachment: Slack
-    refused blocks inside a coloured attachment on chat.update
-    (invalid_attachments, shot 669). `file_id` is a file the bot owns and has
-    not shared to any channel, referenced by id.
+    The image is a block on the message, not nested in the attachment: Slack
+    rejects blocks inside a coloured attachment on chat.update
+    (invalid_attachments). `file_id` is a file the bot owns and has shared to no
+    channel, referenced by id.
     """
     sent = sent_text(row, icfg).split("\n")[0]
     blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": sent}}]
@@ -361,8 +347,8 @@ def summary_text(rows, day: str, icfg: dict | None = None) -> str:
         return (f"recovered/injected S/N{label}: median {med:.2f} "
                 f"(range {vals[0]:.2f}-{vals[-1]:.2f})")
 
-    # The reported/true ratio differs between subtraction states, so a day
-    # that mixes them must not be averaged into one meaningless number.
+    # The reported/true ratio differs between subtraction states, so a day that
+    # mixes them is not averaged.
     states = {_g(r, "sub_incoh") for r in rows}
     if len({s for s in states if s is not None}) > 1:
         for state, label in ((1, " (IB sub on)"), (0, " (IB sub off)")):
@@ -437,13 +423,10 @@ def _dm_legend_handles(line2d, with_miss: bool,
 
 def render_summary_figures(rows, out_dir,
                            icfg: dict | None = None) -> list[Path]:  # noqa: C901
-    """The daily summary figure; returns the paths written.
+    """The daily summary figure, injected against recovered S/N.
 
-    One figure: injected against recovered S/N. The outcome counts are in
-    the summary text, where they read as well and cost no attention.
-
-    Never raises: a matplotlib problem logs a warning and returns whatever
-    rendered, so the summary text still posts.
+    Returns the paths written. Outcome counts stay in the summary text. Never
+    raises: a matplotlib failure logs a warning and returns what rendered.
     """
     try:
         import matplotlib
@@ -469,10 +452,9 @@ def render_summary_figures(rows, out_dir,
             out_dir.mkdir(parents=True, exist_ok=True)
 
             # Figure 1: recovered vs injected S/N. The 1:1 line is the
-            # reference; the dashed fit through the origin is what hella
-            # actually does, and its slope is the reported/injected ratio
-            # averaged over the day. A miss is the same DM marker, hollow,
-            # parked at recovered S/N = 0.
+            # reference; the dashed fit through the origin has slope equal to
+            # the day-averaged reported/injected ratio. A miss is the same DM
+            # marker, hollow, at recovered S/N = 0.
             fig = Figure(figsize=(6.3, 5.2))
             ax = fig.add_subplot(111)
             injected = [v for v in (injected_snr(r) for r in rows)
@@ -505,7 +487,7 @@ def render_summary_figures(rows, out_dir,
                                linewidth=1.4, zorder=3)
             if not plotted:
                 # Rows with neither est_snr nor inject_snr have no x
-                # coordinate. Say so rather than show a blank panel.
+                # coordinate, so say so rather than draw a blank panel.
                 ax.annotate("no shots with a recorded injected S/N",
                             (0.5, 0.5), xycoords="axes fraction", ha="center",
                             va="center", fontsize=11, color=COLOR_NEUTRAL)
@@ -529,8 +511,8 @@ def render_summary_figures(rows, out_dir,
 def render_card(text: str, color: str, out_png) -> Path:
     """A PNG of one message, with the attachment colour bar down the left.
 
-    This is only for offline review (imgcat in a terminal); Slack renders
-    the real thing from the text and the attachment colour.
+    For offline review only. Slack renders the real thing from the text and the
+    attachment colour.
     """
     import matplotlib
     matplotlib.use("Agg", force=True)
@@ -576,21 +558,15 @@ def load_channel() -> str | None:
 
 #: How a shot reaches the channel.
 #:
-#: `sent_then_update` (the default) posts the sent line the moment the pulse
-#: goes in, so the channel shows a shot is in flight, and then COMPLETES that
-#: same message ~100 s later: the coloured bar carrying the outcome line and
-#: the replay plot inline. One message per shot, and it says something useful
-#: from the first second.
+#: `sent_then_update` (default): post the sent line at fire time, then complete
+#: that same message ~100 s later with a coloured bar carrying the outcome line
+#: and the replay plot inline. One message per shot.
 #:
-#: `single` posts nothing at fire time and ONE message per
-#: injection once everything is known: the replay plot, captioned with the
-#: sent line and the outcome line. One shot, one message, and the picture is
-#: there the first time anyone looks at it.
+#: `single`: nothing at fire time, one message per injection once everything is
+#: known, the replay plot captioned with the sent and outcome lines.
 #:
-#: `sent_then_edit` is the older two-step shape: a "sent" message the moment
-#: the pulse goes in, edited in place with a coloured outcome bar ~100 s
-#: later, and the replay threaded under it. It shows a shot is in flight
-#: before the result exists, which is worth having while the bot is new.
+#: `sent_then_edit`: the older two-step shape. A sent message at fire time,
+#: edited in place with a coloured outcome bar, replay threaded under it.
 MODE_SENT_THEN_UPDATE = "sent_then_update"
 MODE_SINGLE = "single"
 MODE_SENT_THEN_EDIT = "sent_then_edit"
@@ -600,9 +576,9 @@ MODES = (MODE_SENT_THEN_UPDATE, MODE_SINGLE, MODE_SENT_THEN_EDIT)
 class SlackPoster:
     """Thin Slack transport for the injection bot. Never raises.
 
-    `enabled=False` (the default, and what t2d.yaml ships) makes every method
-    a no-op returning None. `dry_run_dir` set makes every method write the
-    would-be message to a .txt in that directory and touch no socket at all.
+    `enabled=False` makes every method a no-op returning None. `dry_run_dir`
+    makes every method write the would-be message to a .txt there and open no
+    socket.
     """
 
     def __init__(self, enabled: bool = False, dry_run_dir=None,
@@ -615,10 +591,10 @@ class SlackPoster:
         self.dry_run = self.dry_run_dir is not None
         self.channel = channel
         self.streak_every = int(streak_every)
-        # the `injection` config block, so the expected S/N in a sent message
-        # uses the same rec_per_true table the solver used
+        # The `injection` config block, so the expected S/N in a sent message
+        # uses the solver's rec_per_true table.
         self.icfg = icfg
-        # base URL of the t3 web app, for the link in the recovered line
+        # Base URL of the t3 web app, for the link in the recovered line.
         self.web_base = web_base or DEFAULT_WEB_BASE
         if mode not in MODES:
             logger.warning("slack mode %r is not one of %s; using %s",
@@ -652,9 +628,8 @@ class SlackPoster:
               want_error: bool = False):
         """chat.postMessage; returns the message ts, or None on any failure.
 
-        With `want_error` it returns (ts, error) instead, so a caller can
-        tell a rejected block payload from a dead network and fall back to
-        something the workspace will accept.
+        `want_error` returns (ts, error) instead, so a caller can tell a rejected
+        block payload from a dead network and fall back.
         """
         def out(ts, err):
             return (ts, err) if want_error else ts
@@ -718,10 +693,9 @@ class SlackPoster:
                   timeout_s: float = 10.0) -> str | None:
         """Message ts of the uploaded file's share into `channel`.
 
-        Slack materialises the upload -> message share asynchronously, so
-        poll files.info briefly. Needs the files:read scope; returns None on
-        timeout or without it, which only costs later editability - the post
-        itself already succeeded.
+        Slack materialises the upload to message share asynchronously, so poll
+        files.info briefly. Needs the files:read scope; None on timeout or
+        without it, which costs only later editability.
         """
         import time as _time
         import requests
@@ -747,10 +721,9 @@ class SlackPoster:
     def _upload_unshared(self, png: Path, title: str) -> str | None:
         """Upload a file the bot owns, shared to no channel; returns its id.
 
-        The two-step external upload, completed WITHOUT `channel_id`. The
-        file then exists but appears nowhere, which is what lets a block
-        reference render it inside an attachment instead of as its own
-        message with the picture hanging beneath.
+        The two-step external upload completed without `channel_id`. The file
+        exists but appears nowhere, so a block reference can render it inside an
+        attachment rather than as its own message.
         """
         token, _channel = self._auth()
         if token is None:
@@ -852,9 +825,8 @@ class SlackPoster:
     def post_sent(self, row) -> str | None:
         """Post the "injection sent" message; returns its ts for the ledger.
 
-        Nothing at all in `single` mode, which posts one finished message
-        later. In the other two this is the message the channel sees at fire
-        time, and it is the one that later gets completed or edited.
+        A no-op in `single` mode. In the other two this is the fire-time message,
+        later completed or edited.
         """
         if not self.enabled or self.mode == MODE_SINGLE:
             return None
@@ -868,7 +840,7 @@ class SlackPoster:
     def post_outcome(self, row) -> str | None:
         """Resolve the shot: edit the sent message in place, else post fresh.
 
-        Not used in `single` mode - `post_injection` carries the outcome.
+        Unused in `single` mode, where `post_injection` carries the outcome.
         """
         if not self.enabled or self.mode == MODE_SINGLE:
             return None
@@ -891,13 +863,11 @@ class SlackPoster:
     def post_injection(self, row, png=None) -> str | None:
         """Complete (or post) the shot's message; returns its ts.
 
-        The sent line is the message text and its first block; the plot, if
-        there is one, is a top-level image block beside it; one coloured
-        attachment carries the outcome. The image never goes in a thread and
-        never carries a caption - the card already says what it is.
+        The sent line is the message text and its first block, the plot a
+        top-level image block beside it, and one coloured attachment carries the
+        outcome. The image is never threaded and never captioned.
 
-        Forms, in descending order of how much lands in one message; the one
-        used is logged, so a channel that has quietly degraded says so:
+        Forms, most to least contained, with the one used logged:
 
           inline     one message: sent line, plot, coloured bar
           bar+image  the bar on the sent message, the plot as its own
@@ -938,9 +908,9 @@ class SlackPoster:
                             inj_id, "inline" if file_id else "bar")
                 return got
             if file_id is not None:
-                # The workspace will not take a slack_file image block. Put
-                # the outcome on the card anyway and give the plot its own
-                # TOP-LEVEL message; never a thread reply.
+                # The workspace will not take a slack_file image block: put the
+                # outcome on the card and give the plot its own top-level
+                # message, never a thread reply.
                 logger.warning("injection %s: update with blocks refused (%s);"
                                " posting the plot separately", inj_id, err)
                 plain = injection_blocks(row, None, self.icfg)
@@ -979,9 +949,8 @@ class SlackPoster:
     def post_replay(self, row, png, caption: str) -> bool:
         """Thread the replay plot under this shot's own message.
 
-        A reply, not a new message: the channel keeps one top-level line per
-        injection, and the plot sits with the shot it belongs to. Without a
-        stored ts there is nothing to reply to, so the plot is skipped rather
+        A reply, so the channel keeps one top-level line per injection. Without a
+        stored ts there is nothing to reply to and the plot is skipped rather
         than posted loose.
         """
         if not self.enabled:
@@ -1033,9 +1002,9 @@ class SlackPoster:
 def miss_streak(conn, before_id: int | None = None) -> tuple[int, list[int], str | None]:
     """Length of the current run of consecutive misses, newest first.
 
-    Read from the ledger rather than a state file: the DB already is the
-    state, so a daemon restart cannot double-count or reset a streak.
-    Returns (n, ids newest-first capped at 10, latest outcome).
+    Read from the ledger rather than a state file, so a restart cannot
+    double-count or reset a streak. Returns (n, ids newest-first capped at 10,
+    latest outcome).
     """
     sql = ("SELECT id, outcome FROM injections WHERE outcome IS NOT NULL"
            + (" AND id <= ?" if before_id else "")

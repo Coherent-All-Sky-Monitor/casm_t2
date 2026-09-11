@@ -1,18 +1,14 @@
-"""Regression for the sky/sky_row name collision in T2Daemon._process (2026-09-10).
+"""Regression for the sky/sky_row name collision in T2Daemon._process.
 
-Line 834 used to rebind the per-gulp SkyTable (from ``_sky_table``, used for
-injection matching) to the per-cluster pointing dict (from ``_sky``, appended
-to the stored row). From the second cluster in a gulp on, ``_classify`` then
-handed that dict to ``_inj_beams``, which crashed on ``sky.weights_id``
-whenever the cluster fell inside the 60 s injection window -- dropping the
-whole gulp through the ``except Exception`` in the caller. Six gulps were
-lost this way on 2026-09-10.
+Rebinding the per-gulp SkyTable to the per-cluster pointing dict made
+``_classify`` hand that dict to ``_inj_beams`` from the second cluster of a gulp
+on, which crashed on ``sky.weights_id`` whenever the cluster fell inside the
+injection window and dropped the whole gulp through the caller's
+``except Exception``.
 
-This test drives two real clusters through ``_process`` with a real
-``SkyTable`` (so ``_inj_beams`` takes the sky-neighbour branch, not the
-index-window fallback) and an injection-ledger entry that matches the
-second cluster. Before the fix, the second cluster raised AttributeError;
-after the fix both clusters classify without error.
+The test drives two real clusters through ``_process`` with a real ``SkyTable``,
+so ``_inj_beams`` takes the sky-neighbour branch, plus an injection-ledger entry
+matching the second cluster.
 """
 from __future__ import annotations
 

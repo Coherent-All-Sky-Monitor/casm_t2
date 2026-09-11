@@ -1,10 +1,9 @@
 """Sample-range reads of hella candidate .dat files.
 
-Hella appends one block of lines per processed gulp, so sample numbers are
-monotonic at gulp granularity (within a gulp the trial order is arbitrary).
-That makes a byte-offset bisect on the second column safe down to one gulp
-of slack, and lets a replay over a few hours seek straight to its slice of
-a multi-day, multi-GB file instead of scanning from the top.
+Hella appends one block of lines per gulp, so sample numbers are monotonic at
+gulp granularity (trial order within a gulp is arbitrary). A byte-offset bisect
+on the second column is therefore safe to one gulp of slack, letting a replay
+seek to its slice of a multi-GB file.
 """
 
 from __future__ import annotations
@@ -14,8 +13,8 @@ from typing import IO, Iterator
 
 from casm_t2 import wire
 
-# One hella gulp is 8.192 s ~ 7813 samples; use a generous bound for the
-# bisect slack and the end-of-range stop condition.
+# One hella gulp is 8.192 s ~ 7813 samples. Bound for the bisect slack and the
+# end-of-range stop condition.
 GULP_SLACK_SAMP = 16384
 
 

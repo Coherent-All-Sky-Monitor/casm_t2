@@ -1,6 +1,6 @@
 """Unit tests for the voltage dump CLI's window and stream arithmetic.
 
-Pure functions only — nothing here opens a socket or talks to a daemon.
+Pure functions only: nothing here opens a socket or talks to a daemon.
 Run with ``pytest`` from the repo root.
 """
 

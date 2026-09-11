@@ -1,11 +1,10 @@
 """DBSCAN clustering of T1 candidates.
 
-A single astrophysical pulse fires many T1 trials: neighbouring DM steps,
-several boxcar widths, a few adjacent sky beams, and a spread of arrival
-samples comparable to the boxcar width. Broadband RFI does the same but
-across *many* beams at once. Clustering collapses both into one object per
-physical event, so triggering logic reasons about events, not trials, and
-the sky extent of a cluster becomes the primary RFI discriminator.
+One astrophysical pulse fires many T1 trials: neighbouring DM steps, several
+boxcar widths, a few adjacent sky beams, and a spread of arrival samples.
+Broadband RFI does the same across many beams at once. Clustering collapses
+both into one object per physical event, and the sky extent of a cluster is the
+primary RFI discriminator.
 
 Distance is Euclidean over five scaled axes::
 
@@ -13,55 +12,21 @@ Distance is Euclidean over five scaled axes::
           + (d_log2(width) / width_scale)^2
           + (dx / beam_fwhm_x_deg)^2 + (dy / beam_fwhm_y_deg)^2 )  <=  eps
 
-where (x, y) is the beam's position on a tangent plane about the zenith,
-in degrees, x East-West and y North-South. Each scale keeps its meaning:
-an offset on one axis alone of exactly one scale is a distance of exactly
-1, so eps 1.0 still reads as "one scale on any single axis". The
-time/DM/width scales were tuned with t2-replay on live data (2026-06-10,
-see casm_t2 MEMORY.md).
+(x, y) is the beam's position on a tangent plane about the zenith, in degrees,
+x East-West and y North-South. An offset of exactly one scale on a single axis
+is a distance of exactly 1, so eps 1.0 reads as "one scale on any one axis".
 
-The sky link on each axis is the beam's own FWHM on that axis
-(2026-09-09), so two trials are linked when they fall within one beam width
-of each other. The beam is treated as a standard ellipse aligned with
-alt/az, from ``bf_weights_generator.compute_beam_fwhm``, and it follows the
-deployed weights: t2d takes the pair off the weights-registry product that
-was live for the gulp (about 19.3 deg E-W by 3.9 deg N-S for the 17-antenna
-products of September 2026) and falls back to the configured values below
-only for a product that carries no ellipse. Pointing independent. It is very much wider E-W than N-S, so
-one source lights up a row of beams rather than a circle of them, and an
-isotropic link either splits that row or merges unrelated sky.
+The sky link scale per axis is the beam's own FWHM, an alt/az-aligned ellipse
+from ``bf_weights_generator.compute_beam_fwhm``, taken off the weights-registry
+product live for the gulp and falling back to the configured values. The beam
+is much wider E-W than N-S, so a source lights a row of beams and an isotropic
+link would either split that row or merge unrelated sky.
 
-The metric was cityblock (L1) until 2026-09-09. Two things forced the
-change, both about the sky pair. The sky axes are two coordinates of ONE
-physical quantity — an angle on the sky — so under L1 the cost of a
-cross-beam link was `|dx| + |dy|`, which is up to sqrt(2) times the real
-separation and depends on how the beam pair happens to lie relative to the
-projection axes. Measured on the deployed grid, the median great-circle
-nearest-neighbour distance is 3.13 deg but the median L1 cost of reaching
-that same neighbour was 3.58 deg, so at a 4 deg scale only 61% of beams
-could reach their own nearest neighbour even for two otherwise identical
-trials. Under Euclidean the sky contribution is exactly the tangent-plane
-separation over the scale, which is what "one beam spacing" was always
-meant to mean.
-
-The other axes now also add in quadrature rather than linearly, which is
-more permissive for a trial that is offset a little on several axes at
-once — the usual shape of a real pulse's trial cloud — and unchanged for a
-trial offset on one axis alone.
-
-Why sky and not beam index (2026-09-09). The deployed 512-beam grid is not
-sky-ordered: consecutive beam indices are a median 16 deg apart while true
-sky neighbours are 3.1 deg, and only 11% of a beam's six sky-nearest
-neighbours lie within +-4 index. Clustering on ``beam / beam_scale`` was
-therefore clustering on nothing: a point source spanning two adjacent sky
-beams fragmented into two clusters, ``n_beams`` understated real
-footprints, and the ``rfi_wide`` cut (n_beams > 32) never fired on
-broadband RFI that was in fact lit up across the whole sky.
-
-The beam-index axis survives only as a fallback for when no pointing table
-is available (an unregistered weights product, a partial deploy); it is
-worse than useless as a similarity measure, so a run on the fallback logs
-a warning and should be treated as degraded.
+Clustering is on the sky, not on beam index: the deployed 512-beam grid is not
+sky-ordered (consecutive indices a median 16 deg apart, true sky neighbours
+3.1 deg, only 11% of a beam's six sky-nearest neighbours within +-4 index). The
+beam-index axis survives as a fallback for when no pointing table is available,
+and a run on it logs a warning and should be treated as degraded.
 """
 
 from __future__ import annotations
@@ -91,11 +56,9 @@ class ClusterParams:
     samp_scale: float = 64.0     # samples, ~67 ms at 1.048576 ms/sample
     dm_idx_scale: float = 32.0   # DM trial steps
     width_scale: float = 2.0     # steps of the width column (already log2 samples)
-    # Beam FWHM per axis, degrees. This IS the sky link scale: two trials
-    # within one beam width of each other on both axes are one event.
-    # Standard alt/az-aligned ellipse from compute_beam_fwhm. t2d overrides
-    # these per weights product from the registry; the defaults here are the
-    # fallback for a product with no ellipse.
+    # Beam FWHM per axis, degrees, which is the sky link scale. Alt/az-aligned
+    # ellipse from compute_beam_fwhm. t2d overrides these per weights product;
+    # the defaults apply to a product with no ellipse.
     beam_fwhm_x_deg: float = 18.1   # E-W
     beam_fwhm_y_deg: float = 3.9    # N-S
     beam_scale: float = 4.0      # FALLBACK ONLY: beam-index axis, no pointings
@@ -104,26 +67,20 @@ class ClusterParams:
 class SkyTable:
     """Per-beam sky positions for one weights product.
 
-    Holds the 512-beam alt/az table plus its tangent-plane projection about
-    the zenith, which is the pair of axes DBSCAN clusters on. Beams sit
-    above alt ~22 deg on the deployed grid, so a zenith-centred projection
-    is well behaved everywhere on it.
-
-    The projection is the sine (orthographic) one the task specifies::
+    The 512-beam alt/az table plus its orthographic tangent-plane projection
+    about the zenith, which is the axis pair DBSCAN clusters on::
 
         x = cos(alt) * sin(az) * 180/pi
         y = cos(alt) * cos(az) * 180/pi
 
-    It is exact at the zenith and compresses radial separations by
-    ``(zenith_angle) / sin(zenith_angle)`` away from it — about 8% at
-    alt 45 and 22% at alt 22, i.e. the sky axis is slightly *more*
-    permissive low down. That is the safe direction (it merges rather than
-    fragments) and is well inside the factor the 4 deg scale carries.
+    Exact at the zenith, compressing radial separations by
+    zenith_angle / sin(zenith_angle) away from it: about 8% at alt 45 and 22%
+    at alt 22, so the sky axis is slightly more permissive low down, which
+    merges rather than fragments.
 
-    ``separation_deg`` is a true great-circle separation, not a
-    tangent-plane distance, so ``Cluster.sky_extent_deg`` is a real angle.
-    Clustering itself uses the tangent-plane distance, which is the same
-    thing to well under a percent at the separations that matter.
+    ``separation_deg`` is a great-circle separation, so ``sky_extent_deg`` is a
+    real angle. Clustering uses the tangent-plane distance, equal to well under
+    a percent at the separations that matter.
     """
 
     __slots__ = ("weights_id", "alt_deg", "az_deg", "x", "y", "_unit", "n")
@@ -185,29 +142,22 @@ class SkyTable:
 
 
 #: neighbour_beams results, keyed by (weights_id, beam, fwhm_x, fwhm_y, scale).
-#: One weights product is live for hours and the same handful of injection
-#: beams is asked about repeatedly, so this is a few entries in practice.
+#: A weights product is live for hours and the same few beams are asked about
+#: repeatedly, so this stays small.
 _NEIGHBOUR_CACHE: dict[tuple, frozenset] = {}
 
 
 def neighbour_beams(sky: "SkyTable | None", beam: int, fwhm_x_deg: float,
                     fwhm_y_deg: float, scale: float = 1.0) -> set[int]:
-    """Beams within one beam ellipse of `beam` on the SKY, plus `beam` itself.
+    """Beams within one beam ellipse of `beam` on the sky, plus `beam` itself.
 
-    Beam *indices* are not sky-ordered: consecutive indices on the deployed
-    grid are a median 16 degrees apart, so "beam +-2" as an index window is
-    not a statement about the sky at all. It can miss the beam a pulse
-    actually landed in and admit beams most of a horizon away.
-
-    The test is the same ellipse the clustering uses::
+    The test is the ellipse clustering uses, on the tangent-plane axes::
 
         (dx / fwhm_x)^2 + (dy / fwhm_y)^2 <= scale^2
 
-    on the tangent-plane axes, with the FWHMs coming from the registry
-    product (config fallback). Returns ``{beam}`` when there is no pointing
-    table or the beam is off the table: callers that need an index window
-    must ask for one explicitly, so a missing table can never silently look
-    like a sky answer.
+    FWHMs come from the registry product, config fallback. Returns ``{beam}``
+    with no pointing table or a beam off the table, so a missing table never
+    passes for a sky answer. An index window must be asked for explicitly.
     """
     if sky is None or not sky.has(beam) or fwhm_x_deg <= 0 or fwhm_y_deg <= 0:
         return {int(beam)}
@@ -225,11 +175,7 @@ def neighbour_beams(sky: "SkyTable | None", beam: int, fwhm_x_deg: float,
 
 
 def unproject(x_deg: float, y_deg: float) -> tuple[float, float]:
-    """Inverse of the SkyTable projection: (x, y) degrees -> (alt, az) degrees.
-
-    Exists so the projection can be round-tripped in tests and by anyone
-    reading a tangent-plane figure back into pointing space.
-    """
+    """Inverse of the SkyTable projection: (x, y) degrees -> (alt, az) degrees."""
     r = math.hypot(x_deg, y_deg) / DEG        # = cos(alt)
     alt = math.degrees(math.acos(max(-1.0, min(1.0, r))))
     az = math.degrees(math.atan2(x_deg, y_deg)) % 360.0
@@ -284,19 +230,14 @@ def _dedup_grid(cands: list[Candidate], p: ClusterParams,
                 sky: SkyTable | None) -> tuple[list[Candidate], list[int]]:
     """Collapse trials onto a half-scale grid, keeping the best per cell.
 
-    Persistent RFI can emit 10k+ trials per gulp in one beam, which makes
-    DBSCAN's neighbour search the latency bottleneck. Cells of half the
-    cluster scale on each axis are finer than anything DBSCAN would
-    separate, so this only removes redundancy. Returns the cell
-    representatives (highest SNR) and each cell's raw trial count.
+    Persistent RFI emits 10k+ trials per gulp in one beam and DBSCAN's
+    neighbour search is then the latency bottleneck. Half-scale cells are finer
+    than anything DBSCAN would separate, so this only removes redundancy.
+    Returns the highest-SNR representative per cell and each cell's raw count.
 
-    The spatial part of the key uses the same axes DBSCAN sees — half-scale
-    cells of the tangent plane, one cell size per axis — plus the beam index
-    itself. Cells alone would merge distinct beams (a half-scale x cell is
-    far wider than the 3.1 deg beam spacing), and ``n_beams`` /
-    ``sky_extent_deg`` would then understate the real footprint. Keeping the
-    beam in the key makes the grid strictly finer than the sky axes, which
-    is the invariant that matters.
+    The spatial key is half-scale tangent-plane cells plus the beam index. Cells
+    alone would merge distinct beams (a half-scale x cell is far wider than the
+    3.1 deg beam spacing) and understate n_beams and sky_extent_deg.
     """
     half_x = max(p.beam_fwhm_x_deg / 2, 1e-6)
     half_y = max(p.beam_fwhm_y_deg / 2, 1e-6)
@@ -346,23 +287,18 @@ def cluster_candidates(cands: list[Candidate],
                        sky: SkyTable | None = None) -> list[Cluster]:
     """Cluster one coalesced window of candidates.
 
-    ``sky`` is the beam pointing table live at the time of these
-    candidates (see :class:`SkyTable`). With it, beams enter as two
-    tangent-plane degree axes scaled by ``beam_fwhm_x_deg`` and
-    ``beam_fwhm_y_deg`` — one beam width per axis — and every cluster
-    carries a real ``sky_extent_deg``. Without it, clustering falls back to
-    the beam-index axis and ``beam_scale``, which is a poor similarity
-    measure on the deployed non-sky-ordered grid — the fallback warns once
-    per process and leaves ``sky_extent_deg`` at 0.0, so nothing downstream
-    can be tagged on a number that was never measured.
+    ``sky`` is the beam pointing table live at the time of these candidates
+    (see :class:`SkyTable`). With it, beams enter as two tangent-plane degree
+    axes scaled by the beam FWHMs and every cluster carries a real
+    ``sky_extent_deg``. Without it, clustering falls back to the beam-index axis
+    and ``beam_scale``, warns once per process, and leaves ``sky_extent_deg``
+    at 0.0 so nothing downstream is tagged on an unmeasured number.
 
-    Trials are first collapsed onto a half-scale grid (see _dedup_grid),
-    then DBSCAN groups the cell representatives. Returns one Cluster per
-    DBSCAN cluster plus one singleton per noise point: a bright narrow
-    event that fired few trials must still be able to reach the trigger
-    logic, so density alone never discards anything — downstream filters
-    decide using n_members/n_beams/sky_extent_deg/SNR. Cluster.n_members
-    counts raw T1 trials, not deduplicated cells.
+    Trials are collapsed onto a half-scale grid first (_dedup_grid), then DBSCAN
+    groups the representatives. Returns one Cluster per DBSCAN cluster plus one
+    singleton per noise point, so a bright narrow event that fired few trials
+    still reaches the trigger logic; the downstream filters decide.
+    ``Cluster.n_members`` counts raw T1 trials, not deduplicated cells.
     """
     global _warned_no_pointings
     if sky is None and not _warned_no_pointings:

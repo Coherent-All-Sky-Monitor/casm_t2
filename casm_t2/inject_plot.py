@@ -1,10 +1,9 @@
 """Truth plot for an injection, rendered from the generated filterbank.
 
-Intensity dumps tap CAND_DUMP_BLOCK 0, upstream of where casm_beam_inj's
-data is merged into the search stream, so a dump can never contain an
-injected pulse. The gallery therefore shows the injection as generated:
-the .fil that was pushed into the FIFO, as a raw waterfall plus the
-profile dedispersed at the injected DM.
+Intensity dumps tap CAND_DUMP_BLOCK 0, upstream of the casm_beam_inj merge, so
+a dump never contains an injected pulse. The plot shows the .fil that was
+pushed into the FIFO: raw waterfall plus the profile dedispersed at the
+injected DM.
 """
 
 from __future__ import annotations

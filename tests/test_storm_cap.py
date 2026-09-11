@@ -1,9 +1,8 @@
 """Storm cap: a per-beam quota, then a bounded global truncation.
 
-Stage 1 (per-beam quota) keeps the shed fair across the sky but is not a
-bound — its allowance is quota x populated beams. Stage 2 makes the cap a
-real bound, and its per-beam floor is what stops a bright storm elsewhere
-from evicting a real single-beam FRB.
+Stage 1 (per-beam quota) keeps the shed fair across the sky but is not a bound,
+its allowance being quota x populated beams. Stage 2 makes the cap a bound, and
+its per-beam floor stops a bright storm elsewhere evicting a single-beam FRB.
 """
 
 import math
@@ -54,7 +53,7 @@ def test_keeps_the_top_n_by_snr_within_each_beam(make_cand):
 def test_a_quiet_beam_survives_a_storm_in_another_beam(make_cand):
     """The whole point: one faint candidate alone in its beam is kept.
 
-    A global top-N over this gulp would drop it — every one of the storm
+    A global top-N over this gulp would drop it: every one of the storm
     beam's candidates is brighter.
     """
     storm = [make_cand(snr=100.0 + i, beam=7) for i in range(500)]
@@ -136,7 +135,7 @@ def test_jul_31_storm_width_zero_across_every_beam(make_cand):
 
     assert len(keep) <= 20_000 + BEAM_FLOOR * 512   # ~22k, the real bound
     assert len(keep) + n_shed == 80_000
-    # every beam is still represented — the sky is not silently narrowed
+    # every beam is still represented, the sky is not silently narrowed
     assert len({c.beam for c in keep}) == 512
 
 

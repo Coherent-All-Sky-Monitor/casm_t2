@@ -20,8 +20,8 @@ SKY_ROWS, SKY_COLS, SKY_SPACING_DEG = 16, 32, 3.1
 def _synthetic_pointings(seed: int = 0) -> tuple[dict, dict]:
     """A 512-beam pointing table whose index order is NOT sky order.
 
-    Beams sit on a 16 x 32 grid of 3.1 deg spacing about the zenith — the
-    real grid's spacing — but the grid cell each beam index lands on is a
+    Beams sit on a 16 x 32 grid of 3.1 deg spacing about the zenith, the real
+    grid's spacing, but the grid cell each beam index lands on is a
     seeded shuffle, so index adjacency says nothing about sky adjacency.
     That is the property the deployed grid has (consecutive indices a median
     16 deg apart) and the one every sky-clustering test needs.

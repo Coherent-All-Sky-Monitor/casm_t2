@@ -1,14 +1,11 @@
 """Known-source matching for clustered events.
 
-A cluster matches a known source when its peak beam is inside one of the
-source's transit windows AND the cluster's DM envelope [dm_lo, dm_hi]
-overlaps the source DM window. Peak DM is deliberately not used: bright
-pulses merge with their own broadband/sidelobe response, dragging the
-cluster's peak-SNR trial toward the low-DM search floor while the envelope
-still covers the true DM (B0329 storms, 2026-06-10).
-
-Transit schedules come from t2-transit-schedule CSVs (beam, utc_start,
-utc_end), same format the Phase-0 watcher used.
+A cluster matches when its peak beam is inside one of the source's transit
+windows and its DM envelope [dm_lo, dm_hi] overlaps the source DM window. Peak
+DM is not used: a bright pulse merges with its own sidelobe response and drags
+the peak-SNR trial toward the low-DM search floor while the envelope still
+covers the true DM. Schedules are t2-transit-schedule CSVs (beam, utc_start,
+utc_end).
 """
 
 from __future__ import annotations

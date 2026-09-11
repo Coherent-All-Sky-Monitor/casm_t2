@@ -1,8 +1,7 @@
 """Width veto: drop whole boxcar-width indices at parse time.
 
-Width index 6 (the 67 ms boxcar) is 97-98.6% of stored rows on a quiet day
-— red-noise junk at DM >= 200 that pays full DBSCAN cost and triggers
-nothing.
+Width index 6 (the 67 ms boxcar) is 97-98.6% of stored rows on a quiet day,
+red-noise junk at DM >= 200 that pays full DBSCAN cost and triggers nothing.
 
 The filter sits in _handle rather than _flush_later so that the fast path,
 which fires dumps per batch before clustering, never sees vetoed trials
@@ -74,7 +73,7 @@ def test_no_candidates(make_cand):
 
 
 def test_order_and_identity_are_preserved(make_cand):
-    """Survivors come through untouched — no reordering, no copies of values."""
+    """Survivors come through untouched: no reordering, no copies of values."""
     cands = [make_cand(width=1, snr=s) for s in (30.0, 10.0, 20.0)]
     keep, _ = apply_width_veto(cands, {6})
     assert [c.snr for c in keep] == [30.0, 10.0, 20.0]

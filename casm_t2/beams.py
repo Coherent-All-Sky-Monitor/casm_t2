@@ -1,10 +1,9 @@
 """Mapping from global beam number to the machine and stream that own it.
 
-The 512 search beams are split into 8 streams of 64 beams. Streams are
-numbered globally across the two backend nodes: streams 0-3 live on
-casm-corr1, streams 4-7 on casm-corr2. Each stream has a casm_cand_dump
-daemon listening on control port 28000 + stream, and its dumps are written
-on the owning node under cand_beam_dumps/stream_<stream>/.
+The 512 search beams split into 8 streams of 64. Streams are numbered globally:
+0-3 on casm-corr1, 4-7 on casm-corr2. Each has a casm_cand_dump daemon on
+control port 28000 + stream, writing to cand_beam_dumps/stream_<stream>/ on the
+owning node.
 """
 
 from __future__ import annotations
@@ -23,10 +22,10 @@ STREAM_HOSTS = {
     4: "casm-corr2", 5: "casm-corr2", 6: "casm-corr2", 7: "casm-corr2",
 }
 
-# Voltage dumps live on the ANTENNA-side processing chain (medusa_antenna.cfg):
-# its own casm_cand_dump daemons on the raw voltage ring, 3 streams per node,
-# control port 27000 + stream. Every antenna sees every source, so a voltage
-# trigger fans out to ALL of these endpoints.
+# Voltage dumps run on the antenna-side chain (medusa_antenna.cfg): separate
+# casm_cand_dump daemons on the raw voltage ring, 3 streams per node, control
+# port 27000 + stream. Every antenna sees every source, so a voltage trigger
+# fans out to all endpoints.
 VOLTAGE_CONTROL_BASE_PORT = 27000
 VOLTAGE_DUMP_DIR = "/mnt/nvme4/data/casm/cand_dumps"
 VOLTAGE_MOUNT = "/mnt/nvme4"

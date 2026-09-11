@@ -1,10 +1,10 @@
-"""Clustering on sky position instead of beam index (2026-09-09).
+"""Clustering on sky position instead of beam index.
 
-The deployed 512-beam grid is not sky-ordered, so the old ``beam`` axis
-grouped trials that share nothing and separated trials from the same patch
-of sky. These tests pin the replacement: a tangent-plane (x, y) pair in
-degrees, a real ``sky_extent_deg`` on every cluster, and the beam-index
-fallback for when no pointing table exists.
+The deployed 512-beam grid is not sky-ordered, so a ``beam`` axis groups trials
+that share nothing and separates trials from the same patch of sky. These tests
+pin the replacement: a tangent-plane (x, y) pair in degrees, a real
+``sky_extent_deg`` on every cluster, and the beam-index fallback for when no
+pointing table exists.
 """
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ def trials(beams, samp=1000, dm_idxs=(100, 116), widths=(2, 3), snr=20.0):
     """Four trials per beam: two DM cells x two boxcar widths.
 
     Enough to make every trial a DBSCAN core point *only* when its beam has
-    a neighbour within one sky scale — which is exactly the merge/split
+    a neighbour within one sky scale, which is exactly the merge/split
     behaviour under test. Fewer trials per beam and nothing is ever core;
     more and single beams cluster on their own.
     """
@@ -215,7 +215,7 @@ def test_broadband_forty_beams_is_one_wide_cluster(sky, daemon):
 def test_sky_extent_catches_what_max_nbeam_misses(sky, daemon):
     """12 beams over 33 deg: under max_nbeam 32, over max_sky_extent_deg 25.
 
-    This is the class the old cut could not see — a burst lighting up a
+    This is the class the old cut could not see: a burst lighting up a
     dozen beams spread right across the sky counts as 12 beams and sailed
     through ``n_beams > 32``.
     """
@@ -237,7 +237,7 @@ def test_sky_extent_catches_what_max_nbeam_misses(sky, daemon):
 
 
 def test_compact_source_is_not_tagged(sky, daemon):
-    """Two sky-adjacent beams — a real source's footprint — stay clean."""
+    """Two sky-adjacent beams, a real source's footprint, stay together."""
     table, beam_at = sky
     a, b = _pick_sky_adjacent_far_in_index(table, beam_at)
     cls = cluster_candidates(trials([a, b], dm_idxs=(700, 716)), PARAMS, table)

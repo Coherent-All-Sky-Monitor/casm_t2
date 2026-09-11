@@ -1,8 +1,6 @@
-# t2-source-watch configuration for B0329+54 transit monitoring.
-#
-# DM window brackets B0329's DM of 26.76 pc/cm3 with room for the coarse
-# low-DM trial grid; SNR floor of 11 sits just above the hella threshold
-# where yesterday's transit showed pulses reaching SNR ~13.
+# t2-source-watch config for B0329+54 transit monitoring.
+# The DM window brackets B0329's 26.76 pc/cc with room for the coarse low-DM
+# trial grid; snr_min sits just above the hella threshold.
 
 source_name: B0329+54
 
@@ -18,8 +16,8 @@ beam_veto: []
 schedule_csv: /mnt/nvme5/casm_pipeline/schedules/b0329_schedule.csv
 schedule_pad_s: 120
 
-# Forward every raw payload to 127.0.0.1:<tee_base_port>+job for the
-# shadow t2d clustering daemon. Fire-and-forget; safe if t2d is down.
+# Forward every raw payload to 127.0.0.1:<tee_base_port>+job for t2d.
+# Fire-and-forget, safe if t2d is down.
 tee_base_port: 13345
 
 trigger:

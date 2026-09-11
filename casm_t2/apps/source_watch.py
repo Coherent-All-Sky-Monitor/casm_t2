@@ -1,16 +1,13 @@
 """Watch the live hella candidate stream for a known source and trigger dumps.
 
-This is the Phase-0 seed of the T2 daemon: it listens on the eight TCP ports
-that the hella jobs already publish to, filters candidates down to a known
-source (DM window + per-beam transit schedule + SNR floor), and for each
-accepted event immediately requests a beam intensity dump from the owning
-casm_cand_dump daemon. A small JSON "trigger card" is dropped in the owning
-node's T2 spool directory so the per-node plotter (casm_t3) can pick the
-event up once the dump lands.
+The Phase-0 predecessor of t2d, retired from live duty and kept for reference.
+Listens on the eight hella TCP ports, filters to a known source (DM window,
+per-beam transit schedule, SNR floor), and requests a beam intensity dump from
+the owning casm_cand_dump daemon for each accepted event. A JSON trigger card
+goes into the owning node's T2 spool directory for the per-node plotter.
 
-Latency matters: the dump ring buffers only reach ~20 s into the past and
-hella itself reports up to ~16 s after the pulse, so triggering happens
-inline in the ingest path, before any bookkeeping.
+Triggering happens inline in the ingest path, before any bookkeeping: the dump
+rings reach only ~20 s back and hella reports up to ~16 s after the pulse.
 """
 
 from __future__ import annotations
@@ -148,13 +145,13 @@ class SourceWatch:
         self.ctx_window_s = ctx.get("window_s", 4.0)
         self.ctx_delay_s = ctx.get("delay_s", 8.0)
         self.ctx_max_members = ctx.get("max_members", 3000)
-        # Rolling buffer of every candidate seen on any port, kept long
-        # enough to reconstruct the beam/DM neighbourhood of a trigger.
+        # Rolling buffer of every candidate seen on any port, long enough to
+        # reconstruct the beam/DM neighbourhood of a trigger.
         self.context: deque[tuple[float, int, float, float, int]] = deque(maxlen=400_000)
         self._card_tasks: set[asyncio.Task] = set()
         # Optional tee: forward each raw payload to 127.0.0.1:<base>+job so a
-        # shadow consumer (t2d) sees the stream without owning hella's ports.
-        # Strictly fire-and-forget; a dead consumer must never cost latency.
+        # shadow consumer sees the stream without owning hella's ports.
+        # Fire-and-forget, a dead consumer must not cost latency.
         self.tee_base = cfg.get("tee_base_port")
         self._tee_tasks: set[asyncio.Task] = set()
         self.log_path = Path(cfg["log_csv"])
@@ -220,8 +217,8 @@ class SourceWatch:
     # ------------------------------------------------------------ filtering
 
     async def _process(self, batch: wire.Batch) -> None:
-        # Prefer the observation identity carried on the wire by the
-        # deployed hella preamble; fall back to the output filenames.
+        # Prefer the observation identity on the wire from the hella preamble,
+        # falling back to the output filenames.
         if batch.utc_start is not None:
             utc_start = timing.parse_dada_utc(batch.utc_start)
         else:
@@ -248,7 +245,7 @@ class SourceWatch:
         if not hits:
             return
 
-        # One trigger per batch: the same pulse shows up in several DM/width
+        # One trigger per batch: the same pulse appears in several DM/width
         # trials and neighbouring beams, so take the highest-SNR hit.
         best, event_utc = max(hits, key=lambda h: h[0].snr)
         logger.info("hit: snr=%.1f dm=%.2f beam=%d width=%d event=%s (%d hits in batch)",
@@ -286,9 +283,9 @@ class SourceWatch:
         action = "triggered" if reply == "OK" else "trigger_refused"
         self._log(now, event_utc, c, action, reply)
         if reply == "OK":
-            # The dump is already requested; hold the trigger card back a few
-            # seconds so context candidates from the other jobs' gulps (which
-            # may lag this one) make it into the card before T3 reads it.
+            # The dump is already requested. Hold the card back a few seconds
+            # so context candidates from lagging jobs make it in before T3
+            # reads it.
             task = asyncio.create_task(self._delayed_card(c, event_utc, start, stop, loc))
             self._card_tasks.add(task)
             task.add_done_callback(self._card_tasks.discard)

@@ -1,8 +1,7 @@
-"""Event naming: shape, uniqueness, and — above all — boundedness.
+"""Event naming: shape, uniqueness, and boundedness.
 
-The unbounded retry loop this replaces spun forever on the asyncio event
-loop once the 4-letter name space filled, wedging ingest three times in
-production. The bound is the point of these tests.
+An unbounded retry loop spins forever on the asyncio event loop once the name
+space fills, wedging ingest. The bound is the point of these tests.
 """
 
 import re

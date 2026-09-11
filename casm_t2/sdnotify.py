@@ -1,14 +1,9 @@
 """Minimal sd_notify client for systemd ``Type=notify`` units.
 
-The protocol is one datagram of ``KEY=value`` text sent to the AF_UNIX
-socket named in ``$NOTIFY_SOCKET``. A leading ``@`` means the abstract
-namespace, which Python spells as a leading NUL byte. Stdlib only, no
-dependency on python-systemd.
-
-Every call is a silent no-op when ``$NOTIFY_SOCKET`` is unset, so the
-daemon behaves identically under tmux, in tests, and on a developer's
-laptop. Failures never raise: telling systemd we are alive must never be
-the thing that kills us.
+One datagram of ``KEY=value`` text to the AF_UNIX socket named in
+``$NOTIFY_SOCKET``; a leading ``@`` means the abstract namespace, spelled in
+Python as a leading NUL. Stdlib only. Every call is a no-op when the variable
+is unset, and failures are logged, never raised.
 """
 
 from __future__ import annotations

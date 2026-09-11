@@ -1,10 +1,8 @@
 """Daily injection recovery report.
 
-Aggregates the injections ledger over a window (default 24 h) into the
-per-gate funnel the commissioning review needs: how many injections were
-made, how many T1 detected, how many T2 clustered, how many would have
-triggered, and the named reason for every miss. Prints to stdout and writes
-a dated text report; the web UI renders the same numbers live from the DB.
+Aggregates the injections ledger over a window (default 24 h) into the per-gate
+funnel: injected, T1 detected, T2 clustered, trigger-eligible, plus the reason
+for each miss. Prints to stdout and writes a dated text report.
 """
 
 from __future__ import annotations

@@ -1,9 +1,7 @@
 """Width and amplitude calibration for live injections.
 
-Pure functions, no I/O. They live outside `apps.inject_daemon` because both
-the solver (which picks the amplitude before firing) and the Slack text
-(which quotes the S/N the shot is expected to be reported at) need the same
-numbers, and the daemon already imports the Slack module.
+Pure functions, no I/O. Kept outside `apps.inject_daemon` so the solver and the
+Slack text share one copy of the numbers.
 """
 
 from __future__ import annotations
@@ -23,16 +21,15 @@ FWHM_PER_SIGMA = 2.355
 #: That puts a hard floor of 2.355 * 1.048576 ms on any injected FWHM.
 MIN_RENDERABLE_FWHM_MS = FWHM_PER_SIGMA * 1.048576  # 2.469 ms
 
-#: Used when no config is at hand (the preview CLI reads a database, not a
-#: t2d.yaml). Keep in step with `injection.rec_per_true_table` in the config;
-#: measured 2026-09-09 with T1 subtraction off.
+#: Used when no config is at hand, the preview CLI reading a database rather
+#: than a t2d.yaml. Keep in step with `injection.rec_per_true_table`. Measured
+#: with T1 subtraction off.
 DEFAULT_REC_PER_TRUE_TABLE = [[4.7, 2.24], [11.8, 2.08], [23.5, 1.22]]
 
-#: Reported-S/N ceiling as a function of injected width, in the shape the
-#: config uses. Above the ceiling the injected pulse fills hella's 10000-peak
-#: per-gulp candidate buffer and the gulp stops being searched across the
-#: whole beam set. The footprint of a candidate grows with width, so a wide
-#: pulse saturates at a lower reported S/N than a narrow one.
+#: Reported-S/N ceiling against injected width, in the config's shape. Above it
+#: the pulse fills hella's 10000-peak per-gulp buffer and the gulp stops being
+#: searched across the whole beam set. A candidate's footprint grows with width,
+#: so a wide pulse saturates at a lower reported S/N.
 DEFAULT_REPORTED_SNR_CAP = {
     "narrow": 50.0,        # FWHM below narrow_max_ms
     "narrow_max_ms": 6.0,
@@ -46,14 +43,10 @@ DEFAULT_REPORTED_SNR_CAP = {
 def reported_snr_cap(fwhm_ms: float, icfg: dict | None = None) -> float:
     """Highest reported S/N this width may be injected at.
 
-    Extrapolated from 2026-09-09: reported 43 at FWHM 4.7 ms and 35.5 at
-    11.8 ms left the gulp intact; reported 78 at 11.8 ms filled the buffer
-    (31/64 beams searched) and 132 filled it harder (43/64). Flat below
-    15 ms, then falling as 1/sqrt(FWHM) because a wider candidate occupies
-    more of the buffer per detection: 25 at FWHM 30 ms.
-
-    A config carrying only the legacy flat `target_rec_snr_max` is honoured
-    as a width-independent cap.
+    Flat below mid_max_ms, then falling as 1/sqrt(FWHM), a wider candidate
+    occupying more of hella's per-gulp buffer per detection. A config carrying
+    only the legacy flat `target_rec_snr_max` is honoured as a width-independent
+    cap.
     """
     icfg = icfg or {}
     cfg = icfg.get("reported_snr_cap")
@@ -81,14 +74,12 @@ def sample_inject_snr(rng, lo: float, hi: float) -> float:
 
 def clamp_inject_snr(inject_snr: float, fwhm_ms: float,
                      icfg: dict | None = None) -> tuple[float, float, bool]:
-    """Hold the PREDICTED reported S/N under the width's cap.
+    """Hold the predicted reported S/N under the width's cap.
 
-    The sampled quantity is the injected (true) S/N, which is what the
-    amplitude solver needs. What saturates hella is the *reported* S/N, so
-    predict it with the rec_per_true table and, if it is over the ceiling,
-    scale the injected S/N down to sit exactly on it.
-
-    Returns (injected S/N, predicted reported S/N, whether it was clamped).
+    The sampled quantity is the injected (true) S/N, what the amplitude solver
+    needs, while the reported S/N is what saturates hella. Predict it with the
+    rec_per_true table and scale the injected S/N down onto the ceiling if it is
+    over. Returns (injected S/N, predicted reported S/N, whether it was clamped).
     """
     k = rec_per_true(fwhm_ms, icfg)
     cap = reported_snr_cap(fwhm_ms, icfg)
@@ -103,8 +94,8 @@ def clamp_inject_snr(inject_snr: float, fwhm_ms: float,
     return float(scaled), float(cap), True
 
 
-#: hella's DM grid. A shot outside it cannot be recovered at its own DM, so
-#: a draw is clamped here rather than silently wasted.
+#: hella's DM grid, pc/cc. A shot outside it cannot be recovered at its own DM,
+#: so a draw is clamped.
 DM_MIN, DM_MAX = 0.0, 1000.0
 
 
@@ -123,14 +114,10 @@ def draw(spec, rng) -> float:
         {dist: choice,     values: [3, 8, 20], weights: [1, 2, 1]}
         {dist: fixed,      value: 15}
 
-    `loguniform` is the right default for anything spanning a decade and
-    sampled against powers-of-two search trials; `choice` and `fixed`
-    express a calibration grid, where the point is to repeat the same few
-    settings rather than to cover a range.
-
-    Raises SpecError on anything malformed: a bad spec is a config mistake
-    that should stop the daemon at startup, not quietly produce injections
-    at the wrong brightness for a week.
+    `loguniform` suits anything spanning a decade against powers-of-two search
+    trials; `choice` and `fixed` express a calibration grid. Raises SpecError on
+    a malformed spec, which stops the daemon at startup rather than injecting at
+    the wrong brightness.
     """
     if not isinstance(spec, dict):
         raise SpecError(f"sample spec must be a mapping, got {spec!r}")
@@ -173,10 +160,8 @@ def sample_spec(icfg: dict, name: str, rng, legacy_key: str | None = None,
                 legacy_log=logger) -> float:
     """Draw one shot parameter from `injection.sample`, or an old range key.
 
-    The old `dm_range` / `fwhm_ms_range` / `inject_snr_range` lists still
-    work so a config from before the `sample:` block keeps running, but they
-    warn: two ways to say the same thing is how a config drifts out of step
-    with what is actually being injected.
+    The legacy `dm_range` / `fwhm_ms_range` / `inject_snr_range` lists still
+    work, with a warning.
     """
     spec = ((icfg or {}).get("sample") or {}).get(name)
     if spec is not None:
@@ -213,11 +198,10 @@ def clamp_dm(dm: float, log=logger) -> float:
 
 
 def sample_fwhm_ms(rng, lo_ms: float, hi_ms: float) -> float:
-    """Draw an injected FWHM log-uniformly, clamped to what the generator can render.
+    """Draw an injected FWHM log-uniformly, clamped to what the generator renders.
 
-    Log-uniform, not uniform: the trials are spaced in powers of two, so a
-    uniform draw over 2.5-30 ms would put two thirds of the shots on the two
-    widest trials and almost never exercise the narrow ones.
+    Log-uniform because the trials are spaced in powers of two: a uniform draw
+    over 2.5-30 ms puts two thirds of the shots on the two widest trials.
     """
     lo = max(float(lo_ms), MIN_RENDERABLE_FWHM_MS)
     hi = max(float(hi_ms), lo)
@@ -227,16 +211,13 @@ def sample_fwhm_ms(rng, lo_ms: float, hi_ms: float) -> float:
 def rec_per_true(fwhm_ms: float, icfg: dict | None = None) -> float:
     """hella-reported S/N divided by the analytical matched-filter S/N.
 
-    hella's matched trial is a smoothing kernel of FWHM about 0.67 * 2**ibox
-    samples over rows normalised to unit variance, not the unit-area boxcar
-    the analytical formula assumes, so the ratio is a function of width and
-    not a constant. `injection.rec_per_true_table` holds measured
-    [fwhm_ms, ratio] pairs and this interpolates linearly in log FWHM,
-    holding the end values flat outside the measured range.
-
-    Falls back to the scalar `injection.rec_per_true` when a config is given
-    with no table (what the deployed config did before), and to
-    DEFAULT_REC_PER_TRUE_TABLE when no config is given at all.
+    A function of width, not a constant: hella's matched trial is a smoothing
+    kernel of FWHM about 0.67 * 2**ibox samples over unit-variance rows, not the
+    unit-area boxcar the analytical formula assumes.
+    `injection.rec_per_true_table` holds measured [fwhm_ms, ratio] pairs,
+    interpolated linearly in log FWHM and held flat outside the measured range.
+    Falls back to the scalar `injection.rec_per_true`, then to
+    DEFAULT_REC_PER_TRUE_TABLE.
     """
     if icfg is None:
         table = DEFAULT_REC_PER_TRUE_TABLE

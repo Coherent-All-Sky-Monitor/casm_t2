@@ -3,7 +3,7 @@
 The discriminant is distinct beams within +-window_samp of a cluster peak,
 counted on RAW candidates (DBSCAN fragments broadband junk into single-beam
 clusters, so cluster n_beams cannot substitute). Real sources occupy 0-2
-beams, broadband zero-DM junk 40-64 (iteration-2 closure).
+beams, broadband zero-DM junk 40-64.
 """
 
 from casm_t2.apps.t2d import build_beam_footprint, occupancy_beams

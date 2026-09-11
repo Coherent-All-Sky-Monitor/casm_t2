@@ -23,4 +23,4 @@ Stop the tmux/nohup equivalents first (t2watch, t2d, t3plot, t3collect tmux
 sessions on corr1; setsid t3-dump-plotter on corr2). Status/logs:
 
     systemctl --user status t2d
-    journalctl --user -u t2d -f      # plus the append: log files as before
+    journalctl --user -u t2d -f      # the append-mode log files still exist

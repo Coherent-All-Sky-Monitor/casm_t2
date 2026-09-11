@@ -1,27 +1,24 @@
 """Online injection scheduler with a per-gate ledger.
 
 Injects synthetic FRBs into the live beamformer stream on a fixed cadence
-(via the existing casm_beam_inj FIFOs — no Fourier Space code involved) and
-records every injection in the T2 database BEFORE it happens, so t2d can
-exclude it from triggering and the daily report can attribute every miss to
-a pipeline gate.
+through the casm_beam_inj FIFOs, and records every injection in the T2 database
+before it happens so t2d can exclude it from triggering and every miss can be
+attributed to a gate.
 
-Recipe (productionized from meilin's mei_realtime_inj.ipynb):
+Per shot:
   1. make_noise_fil_with_frb_snr.py renders one 8192-sample, single-beam
-     filterbank with the pulse (no noise — it adds onto the live stream)
-     and estimates the injected S/N from the live beam noise statistics.
+     filterbank holding the pulse alone, no noise, since it adds onto the live
+     stream, and estimates the injected S/N from the live beam statistics.
   2. convert_fil_to_dada.py wraps it in a DADA header for the inject beam.
-  3. The .dada bytes are written to /tmp/beaminj.fifo.<stream>, where the
-     casm_beam_inj daemon merges them into the next gulps.
+  3. The .dada bytes go to /tmp/beaminj.fifo.<stream>, where casm_beam_inj
+     merges them into the next gulps.
 
-A few minutes after each injection the daemon reconciles it against the
-clusters table and fills the gate columns (gate_t1/gate_t2/gate_trigger)
-plus the recovered snr/dm, so /injections in the web UI and the daily
-report are near-real-time. Gates: did T1 report it -> did T2 cluster it ->
-would T2's trigger filters have passed it (injections are tagged and never
-actually dump).
+Reconciliation runs a few minutes later against the clusters table and fills
+gate_t1/gate_t2/gate_trigger plus the recovered snr/dm. Gates: did T1 report it,
+did T2 cluster it, would T2's trigger filters have passed it (injections are
+tagged and never dump).
 
-corr1 streams (0-3) only for now; corr2 needs a local runner.
+corr1 streams (0-3) only; corr2 needs a local runner.
 """
 
 from __future__ import annotations
@@ -52,8 +49,7 @@ PYTHON = "/home/casm/software/dev/casm_venvs/casm_offline_env/bin/python"
 
 _SNR_RE = re.compile(r"INJECTED_SNR_ESTIMATE\s+([-+0-9.eE]+)")
 
-#: samples per gulp; gulp index is exactly samp // GULP_SAMPS (checked
-#: against shot 660: cluster samp 3543044 -> gulp 432, as stored).
+#: Samples per gulp. The gulp index is exactly samp // GULP_SAMPS.
 GULP_SAMPS = 8192
 
 #: The display-name format, and nothing else: `inj_YYYYMMDD_NNNN`.
@@ -99,9 +95,9 @@ def amp_for_target_snr(target_snr: float, sigma_ms: float, beam: int,
     Analytical Gaussian matched filter over nchan independent channels
     (make_noise_fil_with_frb_snr.matched_filter_snr, "analytical" branch):
     S/N = (A / sigma_n) * sqrt(nchan) * sqrt(sigma_t * sqrt(pi)), sigma_t in
-    samples. sigma_n is the live per-channel std of this beam from Redis
-    (bf_proc_stat). The pulse is rendered as integer u8 counts, so the result
-    is rounded and floored at 1 count. Returns (amp_counts, sigma_n).
+    samples, sigma_n the live per-channel std of the beam from Redis. The pulse
+    renders as integer u8 counts, so the result is rounded and floored at 1.
+    Returns (amp_counts, sigma_n).
     """
     import math
     sigma_n = read_live_std(beam) if std is None else float(std)
@@ -111,8 +107,7 @@ def amp_for_target_snr(target_snr: float, sigma_ms: float, beam: int,
 
 
 # The width/amplitude calibration lives in casm_t2.inject_calib so the Slack
-# text can use the same numbers the solver used. Re-exported here because
-# this module is where they are applied.
+# text uses the same numbers as the solver. Re-exported here, where it applies.
 FWHM_PER_SIGMA = inject_calib.FWHM_PER_SIGMA
 MIN_RENDERABLE_FWHM_MS = inject_calib.MIN_RENDERABLE_FWHM_MS
 sample_fwhm_ms = inject_calib.sample_fwhm_ms
@@ -133,9 +128,8 @@ LEDGER_SELECT = ("SELECT i.*, c.name AS rec_name FROM injections i"
 def ledger_row(conn, inj_id: int) -> dict | None:
     """One injections row as a plain dict, for the Slack text builders.
 
-    Joined to the matched cluster's event name: a cluster that triggered a
-    dump has one, and the Slack link should point at that event page rather
-    than at the injection's own truth plot.
+    Joined to the matched cluster's event name, so the Slack link points at that
+    event page rather than the injection's own truth plot.
     """
     cur = conn.execute(LEDGER_SELECT + " WHERE i.id = ?", (inj_id,))
     row = cur.fetchone()
@@ -148,12 +142,10 @@ def ledger_row(conn, inj_id: int) -> dict | None:
 #: to streams 0-3, which are corr1-local, so reconcile can always read them.
 HELLA_CANDS_DIR = "/mnt/nvme4/data/casm/hella_cands"
 
-#: Reconcile window around inject_utc. The pulse lands in the data stream
-#: BEFORE inject_utc: the sidecar is added to the next assembled gulp, whose
-#: samples are already 5-18 s old (measured 2026-08-15 to 09-01, drifting
-#: later; casm-wiki injection-saturation.md). The old [-10, +90] window
-#: declared most late-August shots t1_no_detection although hella had found
-#: them. The same window is used for the cluster match and the T1 trial scan.
+#: Reconcile window around inject_utc, seconds. The pulse lands before
+#: inject_utc: the sidecar joins the next assembled gulp, whose samples are
+#: already 5-18 s old. Used for both the cluster match and the T1 trial scan.
+#: See casm-wiki injection-saturation.md.
 WINDOW_LO_S = -40.0
 WINDOW_HI_S = 90.0
 
@@ -207,21 +199,14 @@ def wait_for_fresh_std(beam: int, icfg: dict, reader=None, now=None,
                        sleep=None, log_path=BFCORR_LOG) -> tuple[float, float]:
     """The live std of `beam`, once it can be trusted. Returns (std, age_s).
 
-    What makes the std untrustworthy is a beamformer restart: the value in
-    Redis is whatever was last published, and after a restart it can sit
-    unchanged for minutes while the publisher comes back. Injection 666 was
-    fired 2.5 min after a restart on exactly that stale value and came out
-    a factor low.
+    A beamformer restart leaves the last published value in Redis, where it can
+    sit unchanged for minutes. Redis carries no timestamp for these keys, and
+    the `age_s` query_live_noise_std returns is the local cache age, always 0.0
+    on the force_refresh path. Freshness is decided two ways:
 
-    Redis carries no timestamp for these keys, and the `age_s` that
-    query_live_noise_std returns is the age of the LOCAL cache - it is
-    always 0.0 on the force_refresh path the daemon uses, so it cannot see
-    this. Freshness is therefore decided two ways:
-
-      * no restart within `max_std_age_s` -> the value is trusted at once,
-        which is the normal case and costs one Redis read;
-      * a recent restart -> poll every 5 s until the value CHANGES, which is
-        proof the publisher is running again, giving up after `std_wait_s`.
+      * no restart within `max_std_age_s`: trusted at once, one Redis read;
+      * a recent restart: poll every `std_poll_s` until the value changes, which
+        is proof the publisher is back, giving up after `std_wait_s`.
 
     Raises StaleStdError when the wait runs out.
     """
@@ -257,13 +242,12 @@ def wait_for_fresh_std(beam: int, icfg: dict, reader=None, now=None,
 
 
 def current_sub_incoh(log_path=BFCORR_LOG) -> int | None:
-    """Is incoherent-beam subtraction on right now? 1 / 0, or None if unknown.
+    """Incoherent-beam subtraction state now: 1, 0, or None when unknown.
 
-    Read from the most recent ``START casm_bfcorr`` line in the beamformer
-    log: the flag is a command-line argument, so the latest start is the
-    current state. Returns None when the log cannot be read or holds no
-    start line - never a guess, because the S/N calibration differs between
-    the two states and a wrong label is worse than no label.
+    Read from the most recent ``START casm_bfcorr`` line in the beamformer log,
+    the flag being a command-line argument. None when the log cannot be read or
+    holds no start line; the S/N calibration differs between the two states, so
+    a wrong label is worse than none.
     """
     starts = _bfcorr_starts(log_path)
     if not starts:
@@ -276,20 +260,19 @@ def current_sub_incoh(log_path=BFCORR_LOG) -> int | None:
 def last_bfcorr_start(log_path=BFCORR_LOG) -> datetime | None:
     """UTC of the most recent beamformer start, or None.
 
-    A restart is what leaves a stale per-beam std in Redis, so this is the
-    clock the staleness guard runs on.
+    A restart leaves a stale per-beam std in Redis, so this is the clock the
+    staleness guard runs on.
     """
     stamps = [t for t, _ in _bfcorr_starts(log_path) if t is not None]
     return max(stamps) if stamps else None
 
 
 def injection_neighbours(cfg: dict, utc: datetime, beam: int) -> tuple[set[int], bool]:
-    """Beams that count as "the injected beam" on the sky, and whether the
-    answer is a sky answer.
+    """Beams counting as the injected beam, and whether that is a sky answer.
 
-    Returns (beams, from_sky). `from_sky` False means there was no pointing
-    table and the caller must fall back to an index window - which is not a
-    statement about the sky, so it is logged.
+    Returns (beams, from_sky). from_sky False means no pointing table was
+    available and the caller falls back to an index window, which is not a sky
+    test and is logged.
     """
     try:
         reg = (weights_registry.Registry(cfg["weights_registry"])
@@ -312,19 +295,15 @@ def injection_neighbours(cfg: dict, utc: datetime, beam: int) -> tuple[set[int],
 def next_file_id(conn, when: datetime | None = None) -> str:
     """The shot's display name: ``inj_YYYYMMDD_NNNN``, NNNN per UTC day.
 
-    Counts from 0001 each UTC day, from the highest number already recorded
-    for that day, so a daemon restart continues the sequence rather than
-    reusing a name. The ledger's integer `id` stays the primary key; this is
-    the handle a person reads, in Slack, on the plot, and in the archive
-    directory name.
+    Counts from 0001 each UTC day, continuing from the highest number already
+    recorded, so a restart does not reuse a name. The ledger's integer `id`
+    stays the primary key; this is the handle a person reads.
     """
     when = when or datetime.now(timezone.utc)
     day = f"{when:%Y%m%d}"
     prefix = f"inj_{day}_"
-    # Strictly this format only. A LIKE prefix also matches the old
-    # `inj_YYYYMMDD_HHMMSS_bNNN` names, and on 2026-09-10 that parsed the
-    # 1754 out of `inj_20260910_175412_b053` and numbered the next shot
-    # `inj_20260910_1755`.
+    # Strictly this format. A LIKE prefix also matches the old
+    # `inj_YYYYMMDD_HHMMSS_bNNN` names, whose time field parses as a number.
     rows = conn.execute(
         "SELECT file_id FROM injections WHERE file_id LIKE ?",
         (prefix + "%",)).fetchall()
@@ -339,15 +318,11 @@ def next_file_id(conn, when: datetime | None = None) -> str:
 def obs_utc_start_at(conn, utc: datetime) -> str | None:
     """UTC_START of the observation live at `utc`, as a PSRDADA string.
 
-    Taken from the most recent cluster at or before that time: clusters carry
-    the obs they came from, and one is written every few seconds in any
-    normal sky, so this is the cheapest reliable answer. Returns None when
-    the database has no cluster that old (a fresh database, or a gap).
-
-    Caveat worth knowing: if an observation restarted and has not yet
-    produced a cluster, this still names the previous one. The caller
-    notices, because the candidate file it points at will not contain the
-    injection window.
+    Taken from the most recent cluster at or before that time; clusters carry
+    their obs and one is written every few seconds in a normal sky. None when
+    the database has no cluster that old. An observation that restarted and has
+    not yet produced a cluster still reads as the previous one, which the caller
+    sees as a candidate file missing the injection window.
     """
     row = conn.execute(
         "SELECT obs_utc_start FROM clusters WHERE event_utc <= ?"
@@ -374,16 +349,13 @@ def count_t1_trials(path, beams, dm: float, samp_lo: float, samp_hi: float,
                     veto_widths=(6,)) -> T1Match | None:
     """Raw T1 trials matching an injection: (count, best S/N).
 
-    Returns None when the file does not exist - that is "we cannot tell",
-    which the caller must not confuse with "hella saw nothing".
-
-    `beams` is the set of beams that count as the injected one - its sky
-    neighbours, from `neighbour_beams`, not an index window.
-
-    The file is hella's own output: a header line then
-    ``snr samp time_days width dm_idx dm beam``, beam global, samp absolute
-    from the observation's UTC_START. Streamed rather than read whole: a
-    long observation's file runs to hundreds of MB.
+    Returns None when the file does not exist, meaning the question could not be
+    asked, which is not the same as hella seeing nothing. `beams` is the set
+    counting as the injected beam, its sky neighbours from `neighbour_beams`.
+    The file is hella's own output, a header line then
+    ``snr samp time_days width dm_idx dm beam`` with beam global and samp
+    absolute from UTC_START. Streamed, a long observation running to hundreds
+    of MB.
     """
     path = Path(path)
     if not path.is_file():
@@ -426,9 +398,8 @@ def scan_t1_trials(conn, cfg: dict, t0: datetime, stream: int, beams,
     """Look for raw T1 trials behind a shot that produced no cluster.
 
     Returns (n_trials, best_snr, note, match). `n_trials` is None when the
-    question could not be asked - no observation known, or the file is not
-    there - and `note` says which, for the ledger. `match` is the full
-    T1Match when there was a file to read.
+    question could not be asked, no observation known or no file, and `note`
+    says which for the ledger. `match` is the full T1Match when a file was read.
     """
     obs = obs_utc_start_at(conn, t0)
     if obs is None:
@@ -456,14 +427,11 @@ def t2_miss_reason(conn, obs_utc_start: str | None, gulp: int | None,
                    match=None, log=logger) -> str:
     """Why a gulp with matching T1 trials produced no cluster.
 
-    T2 clusters every surviving trial - DBSCAN noise points become singleton
-    clusters (`cluster.cluster_candidates`) - and stores everything at
-    S/N >= 12. So "trials arrived but nothing clustered" cannot happen to an
-    intact gulp: something dropped the gulp or the trials before clustering.
-    `gulp_stats` records exactly which, one row per coalesced gulp.
-
-    The last branch is the interesting one: if it ever fires, an assumption
-    above is wrong and the log says so.
+    T2 clusters every surviving trial, DBSCAN noise points becoming singletons,
+    and stores everything at S/N >= 12, so trials arriving with nothing
+    clustered means the gulp or the trials were dropped before clustering.
+    `gulp_stats` records which, one row per coalesced gulp. The final branch
+    fires only if that assumption is wrong, and logs so.
     """
     where = f"gulp {gulp}" if gulp is not None else "the gulp"
     if obs_utc_start is None or gulp is None:
@@ -518,10 +486,9 @@ def beam_offset_arcsec(cfg: dict, utc, inj_beam: int, rec_beam: int):
 def reconcile(conn, inj_id: int, cfg: dict) -> None:
     """Decide whether the search saw this injection, and record the evidence.
 
-    Recovered means a matching cluster, at ANY S/N: the gates stay recorded
-    for information, but whether the cluster would also have earned a dump
-    is trigger policy, not detection. With no cluster, hella's raw candidate
-    file separates "no cluster formed" from "hella never saw it".
+    Recovered means a matching cluster at any S/N. The gates stay recorded, a
+    dump being trigger policy rather than detection. With no cluster, hella's
+    raw candidate file separates "no cluster formed" from "hella never saw it".
     """
     row = conn.execute(
         "SELECT inject_utc, stream, beam, dm, fail_reason FROM injections"
@@ -533,17 +500,16 @@ def reconcile(conn, inj_id: int, cfg: dict) -> None:
     lo = (t0 + timedelta(seconds=WINDOW_LO_S)).isoformat(timespec="milliseconds")
     hi = (t0 + timedelta(seconds=WINDOW_HI_S)).isoformat(timespec="milliseconds")
     dm_tol = dm_tolerance(dm)
-    # "The injected beam" means its neighbours ON THE SKY. Beam indices are
-    # not sky-ordered - consecutive indices are a median 16 deg apart - so an
-    # index window is not a statement about the sky at all.
+    # The injected beam means its neighbours on the sky. Beam indices are not
+    # sky-ordered, so an index window is not a sky test.
     beams, from_sky = injection_neighbours(cfg, t0, beam)
     if not from_sky:
         beams = set(range(beam - 2, beam + 3))
         logger.warning("injection %d: no pointing table at %s, falling back to "
                        "the beam-INDEX window %d+-2, which is not a sky match",
                        inj_id, inj_utc, beam)
-    # Prefer the fast-triggered cluster: that is the one with the dump,
-    # the plot, and the trigger audit attached.
+    # Prefer the fast-triggered cluster, which carries the dump, the plot and
+    # the trigger audit.
     marks = ",".join("?" for _ in beams)
     cand = conn.execute(
         "SELECT id, snr, dm, tier, tags, n_beams, beam, width, samp, event_utc"
@@ -557,9 +523,9 @@ def reconcile(conn, inj_id: int, cfg: dict) -> None:
     tiers = cfg.get("tiers", {})
     n_trials = None
     if cand is None:
-        # No cluster. Ask hella's own candidate file whether the trials were
-        # there, which is the only way to tell a clustering loss from a
-        # detection loss - T2 stores clusters, never raw trials.
+        # No cluster. Ask hella's candidate file whether the trials were there,
+        # the only way to tell a clustering loss from a detection loss, T2
+        # storing clusters and never raw trials.
         n_trials, best_snr, note, match = scan_t1_trials(conn, cfg, t0, stream,
                                                          beams, dm)
         if n_trials is None:
@@ -568,7 +534,7 @@ def reconcile(conn, inj_id: int, cfg: dict) -> None:
                       f"{dm:.0f} (+-{dm_tol:.0f}) ({note})")
         elif n_trials > 0:
             # Trials were there, so the loss is upstream of clustering.
-            # gulp_stats says which gulp-level drop did it.
+            # gulp_stats names the gulp-level drop.
             reason = t2_miss_reason(conn, obs_utc_start_at(conn, t0),
                                     match.gulp if match else None, match)
         else:
@@ -580,16 +546,15 @@ def reconcile(conn, inj_id: int, cfg: dict) -> None:
         detail = (None, None, None, None, None)
     else:
         cid, snr, rdm, tier, tags, n_beams, cbeam, cwidth, csamp, cutc = cand
-        # Recorded for information only; it no longer decides the outcome.
+        # Recorded for information; it does not decide the outcome.
         would = (tier in ("A", "B") and rdm >= filt.get("dm_floor", 20.0)
                  and n_beams <= filt.get("max_nbeam", 32)
                  and cbeam not in set(filt.get("beam_veto", [])))
         gates = dict(gate_t1=1, gate_t2=1, gate_trigger=int(would),
                      fail_reason=None)
         rec = (cid, snr, rdm)
-        # Negative lead is the normal case: the sidecar joins a gulp whose
-        # samples are already seconds old, so the pulse arrives in the search
-        # stream BEFORE the FIFO write that scheduled it.
+        # Negative lead is normal: the sidecar joins a gulp whose samples are
+        # already seconds old, so the pulse arrives before the FIFO write.
         try:
             lead = (datetime.fromisoformat(cutc) - t0).total_seconds()
         except (TypeError, ValueError):
@@ -624,16 +589,16 @@ def _parse_utc(value):
 def do_replay(conn, cfg: dict, poster, inj_id: int, dump_dir) -> Path | None:
     """Render the shot's replay plot and thread it under its Slack message.
 
-    Runs after reconcile, so the outcome is known and a miss can be rendered
-    at the time the pulse should have arrived. Returns the PNG path, or None
-    when nothing was due or anything failed.
+    Runs after reconcile, so the outcome is known and a miss can be rendered at
+    the time the pulse should have arrived. Returns the PNG path, or None when
+    nothing was due or anything failed.
     """
     icfg = cfg.get("injection", {}) or {}
     rcfg = inject_replay.replay_cfg(icfg)
     row = ledger_row(conn, inj_id)
     outcome = (row or {}).get("outcome")
-    # The dump directory is shared with T2's ordinary triggered dumps, so
-    # cleanup needs this shot's own window to know which files are its.
+    # The dump directory is shared with T2's triggered dumps, so cleanup needs
+    # this shot's own window to tell which files are its.
     d_start = _parse_utc((row or {}).get("dump_utc_start"))
     d_stop = _parse_utc((row or {}).get("dump_utc_stop"))
     completes = poster.mode in (inject_slack.MODE_SINGLE,
@@ -648,13 +613,12 @@ def do_replay(conn, cfg: dict, poster, inj_id: int, dump_dir) -> Path | None:
             inject_replay.cleanup_dump(dump_dir, rcfg, d_start, d_stop,
                                        outcome, (row or {}).get('file_id'))
         if completes:
-            # These modes owe the shot a finished card either way: without a
-            # plot it is the outcome bar alone, which is the part that
-            # matters.
+            # These modes owe the shot a finished card either way; without a
+            # plot that is the outcome bar alone.
             ts = poster.post_injection(row, None)
             if ts:
-                # Never clear a ts we already have: the fire-time message
-                # still exists even when completing it failed.
+                # Never clear a ts already held: the fire-time message exists
+                # even when completing it failed.
                 with conn:
                     conn.execute("UPDATE injections SET slack_ts=? WHERE id=?",
                                  (ts, inj_id))
@@ -662,9 +626,8 @@ def do_replay(conn, cfg: dict, poster, inj_id: int, dump_dir) -> Path | None:
 
     if (outcome in inject_outcome.MISSES
             and rcfg.get("on_miss", "none") == "none"):
-        # A miss gets the red bar and the reason, which is the whole story;
-        # an image of a pulse nobody detected mostly invites squinting at
-        # noise. The raw dump is kept instead (keep_dump_on_miss).
+        # A miss gets the red bar and the reason, no rendered pulse. The raw
+        # dump is kept instead (keep_dump_on_miss).
         logger.info("injection %d missed (%s): no replay rendered "
                     "(replay.on_miss=none)", inj_id, outcome)
         if completes:
@@ -679,8 +642,8 @@ def do_replay(conn, cfg: dict, poster, inj_id: int, dump_dir) -> Path | None:
 
     event_utc = None
     if outcome in inject_outcome.MISSES:
-        # Nothing was found, so the tool is told where to put the pulse: the
-        # image is always the pulse version, miss or not.
+        # Nothing was found, so the tool is told where to put the pulse; the
+        # image is the pulse version either way.
         event_utc = inject_replay.expected_event_utc(
             conn, datetime.fromisoformat(row["inject_utc"]))
     png = inject_replay.run_replay(inj_id, dump_dir, rcfg,
@@ -695,8 +658,8 @@ def do_replay(conn, cfg: dict, poster, inj_id: int, dump_dir) -> Path | None:
                          (str(png), inj_id))
         row = ledger_row(conn, inj_id)
     if completes:
-        # The shot's card: completed in place in sent_then_update, posted
-        # fresh in single.
+        # The shot's card: completed in place in sent_then_update, posted fresh
+        # in single.
         ts = poster.post_injection(row, png)
         posted = ts is not None
         with conn:
@@ -724,15 +687,14 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
     streams = icfg.get("streams", [0, 1, 2, 3])
     cadence_s = icfg.get("cadence_min", 30) * 60.0
     conn = db.connect(cfg.get("db", db.DEFAULT_PATH))
-    # Ships disabled: with injection.slack.enabled false every poster call is
-    # a no-op, so the deployed daemon behaves exactly as it did before.
+    # With injection.slack.enabled false every poster call is a no-op.
     poster = inject_slack.poster_from_cfg(icfg)
     rcfg = inject_replay.replay_cfg(icfg)
     i = 0
     first = True
     while True:
-        # Hold the cadence on startup too: otherwise every daemon restart
-        # fires a surprise injection (and a dump) immediately.
+        # Hold the cadence on startup too, so a restart does not fire an
+        # immediate injection and dump.
         if first and not once:
             first = False
             last = conn.execute("SELECT max(inject_utc) FROM injections").fetchone()[0]
@@ -752,8 +714,8 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
         # Shot parameters come from the `sample:` block; a CLI flag overrides.
         dm = clamp_dm(force.get("dm")
                       or sample_spec(icfg, "dm", random, "dm_range"))
-        # Widths are FWHM everywhere except the generator call and the
-        # sigma_ms ledger column, both of which want the Gaussian sigma.
+        # Widths are FWHM everywhere except the generator call and the sigma_ms
+        # ledger column, both of which want the Gaussian sigma.
         fwhm_ms = clamp_fwhm_ms(
             force.get("fwhm_ms")
             or sample_spec(icfg, "fwhm_ms", random, "fwhm_ms_range"))
@@ -763,28 +725,26 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
                  or (icfg.get("sample") or {}).get("inject_snr") is not None
                  or "inject_snr_range" in icfg or "target_rec_snr_range" in icfg)
         if solve:
-            # The sampled quantity is the INJECTED (true, analytic) S/N: that
-            # is what the amplitude solver needs and what the pulse actually
-            # is, independent of how hella chooses to report it. The fixed
-            # count range assumed the pre-Route-Z beam scale (u8 rail,
-            # casm-wiki injection-saturation.md); counts are now fp16 units
-            # of a stream whose std is ~36-46.
+            # The sampled quantity is the injected (true, analytic) S/N, which
+            # is what the amplitude solver needs, independent of how hella
+            # reports it. The fixed count range assumed the pre-Route-Z u8 beam
+            # scale; counts are now fp16 units of a stream with std ~36-46.
+            # See casm-wiki injection-saturation.md.
             if force.get("inject_snr") is not None:
                 inject_snr = float(force["inject_snr"])
             elif force.get("target_snr") is not None:
-                # manual shot given as a reported S/N: undo the table
+                # Manual shot given as a reported S/N: undo the table.
                 inject_snr = float(force["target_snr"]) / rec_per_true(fwhm_ms, icfg)
             elif "target_rec_snr_range" in icfg and not (
                     (icfg.get("sample") or {}).get("inject_snr")):
-                # legacy config expressed as a reported-S/N range
+                # Legacy config expressed as a reported-S/N range.
                 inject_snr = random.uniform(
                     *icfg["target_rec_snr_range"]) / rec_per_true(fwhm_ms, icfg)
             else:
                 inject_snr = sample_spec(icfg, "inject_snr", random,
                                          "inject_snr_range")
-            # Only the REPORTED S/N saturates hella, so predict it from the
-            # per-width table and scale the injection down if it is over the
-            # ceiling for this width.
+            # Only the reported S/N saturates hella: predict it from the
+            # per-width table and scale down if over this width's ceiling.
             inject_snr, target_rec, clamped = clamp_inject_snr(
                 inject_snr, fwhm_ms, icfg)
             nchan_usable = int(icfg.get("nchan_usable", 2880))
@@ -792,9 +752,8 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
                 std, std_age = await asyncio.to_thread(
                     wait_for_fresh_std, beam, icfg)
             except StaleStdError as exc:
-                # Do not fire on a std we cannot trust: the amplitude would
-                # be wrong by whatever the std has drifted, and the shot
-                # would pollute the calibration it is meant to measure.
+                # Do not fire on an untrusted std: the amplitude would be off
+                # by the drift and pollute the calibration.
                 logger.error("injection skipped: %s", exc)
                 now = datetime.now(timezone.utc)
                 with conn:
@@ -869,10 +828,10 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
                     "fwhm=%.1fms est_snr=%s", inj_id, beam, stream, dm, amp,
                     fwhm_ms, f"{est_snr:.1f}" if est_snr else "?")
 
-        # Dump the injected stream around the shot, for the replay plot. The
-        # window is BEFORE inject_utc: that is where the pulse is. Requested
-        # now because it cannot be taken retrospectively - whether the plot
-        # is posted is decided later, once the outcome is known.
+        # Dump the injected stream around the shot for the replay plot. The
+        # window sits before inject_utc, where the pulse is. Requested now
+        # because it cannot be taken retrospectively; whether the plot is posted
+        # is decided once the outcome is known.
         dump_dir = None
         if inject_replay.dump_due(rcfg):
             d_start, d_stop = inject_replay.dump_window(now, rcfg)
@@ -904,8 +863,8 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
         except Exception:
             logger.exception("slack sent-post for injection %d failed", inj_id)
 
-        # truth plot for the web gallery, rendered from the injected .fil
-        # (dumps tap upstream of the injection merge and cannot show it)
+        # Truth plot for the web gallery, rendered from the injected .fil:
+        # dumps tap upstream of the injection merge and cannot show it.
         try:
             png_dir = Path(icfg.get("plot_dir",
                                     "/mnt/nvme5/casm_pipeline/candidates/injections"))
@@ -917,8 +876,8 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
         except Exception:
             logger.exception("truth plot for injection %d failed", inj_id)
 
-        # T1 reports 20-30 s late and the sidecar joins a gulp already
-        # seconds old, so the default 90 s clears both.
+        # T1 reports 20-30 s late and the sidecar joins a gulp already seconds
+        # old, so the default 90 s clears both.
         await asyncio.sleep(float(icfg.get("reconcile_wait_s", 90)))
         try:
             reconcile(conn, inj_id, cfg)
@@ -936,7 +895,7 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
             except Exception:
                 logger.exception("replay of injection %d failed", inj_id)
 
-        # rolling scratch cleanup: keep the last ~20 injections of work files
+        # Rolling scratch cleanup: keep the last ~20 injections of work files.
         work = sorted(scratch.glob("inj_*"), key=lambda p: p.stat().st_mtime)
         for f in work[:-40]:
             f.unlink(missing_ok=True)

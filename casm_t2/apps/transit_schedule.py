@@ -1,9 +1,8 @@
 """Generate a per-beam transit schedule CSV for a known source.
 
-This wraps bf_weights_generator's plot_source_transit.py, which knows how to
-turn a deployed beamforming weights file into per-beam transit windows. We
-run it with --time-tz UTC and parse its stdout table into a CSV consumed by
-t2-source-watch:
+Wraps bf_weights_generator's plot_source_transit.py, which turns a deployed
+weights file into per-beam transit windows. Run with --time-tz UTC, its stdout
+table is parsed into the CSV t2-source-watch reads:
 
     beam,utc_start,utc_end
     3,2026-06-10T18:49:00+00:00,2026-06-10T19:29:00+00:00

@@ -7,13 +7,12 @@ The dump daemons accept a single ASCII message per connection::
     DUMP_UTC_STOP 2026-06-10-18:49:08.250
 
 followed by a shutdown of the write side, and reply with "OK" or an error
-string. The requested window must still be inside the daemon's ring buffer
-(roughly the last 20 seconds), so callers are expected to fire promptly.
+string. The requested window must still be inside the daemon's ring buffer,
+roughly the last 20 seconds.
 
-Two CLIs live here: ``t2-dump`` for a single beam intensity stream, and
+Two CLIs: ``t2-dump`` for a single beam intensity stream, and
 ``casm-voltage-dump`` for the antenna-side raw voltage daemons, whose ring
-reaches ~28 s back and whose dumps are large enough to need a disk check
-first.
+reaches ~28 s back and whose dumps need a disk check first.
 """
 
 from __future__ import annotations
@@ -51,14 +50,12 @@ VOLTAGE_LOOKBACK_S = 26.0
 PAST_LAG_S = 2.0
 FUTURE_LEAD_S = 5.0
 
-# Each node hosts three antenna streams, and casm_cand_dump_disk demands
-# room for all three before it writes anything — commanding fewer streams
-# does not lower the bar.
+# Each node hosts three antenna streams and casm_cand_dump_disk demands room
+# for all three before writing. Commanding fewer does not lower the bar.
 VOLTAGE_STREAMS_PER_NODE = 3
 
-# The casm_t3 janitor keeps each stream_N tree under 150 GB, deleting the
-# oldest files first, so a dump longer than ~72 s per stream starts eating
-# itself as soon as it lands.
+# The casm_t3 janitor keeps each stream_N tree under 150 GB, oldest first, so a
+# dump longer than ~72 s per stream starts eating itself.
 JANITOR_QUOTA_BYTES = 150_000_000_000
 
 # Headroom the live recorders sharing VOLTAGE_MOUNT need; same number as
@@ -114,9 +111,9 @@ async def request_voltage_dump_async(utc_start: datetime, utc_stop: datetime,
                                      timeout: float = DEFAULT_TIMEOUT_S) -> dict[str, str]:
     """Request a voltage dump of the window from every antenna-stream daemon.
 
-    All six endpoints (three per node) are commanded concurrently; the
-    result maps "host:port" to the daemon reply or the error string. A
-    partial dump is still useful, so per-endpoint failures do not raise.
+    All six endpoints (three per node) are commanded concurrently. Returns
+    "host:port" -> daemon reply or error string; per-endpoint failures do not
+    raise, a partial dump still being useful.
     """
     async def one(host: str, port: int) -> tuple[str, str]:
         try:
@@ -226,9 +223,9 @@ def ring_age_refusal(now: datetime, utc_start: datetime) -> str | None:
 def node_volumes(duration_s: float, streams: list[int]) -> dict[str, tuple[int, int, int]]:
     """Per node: (commanded streams, bytes written, bytes the disk guard wants).
 
-    The guard counts all three streams the node hosts even when only one was
-    commanded, and casm_cand_dump_disk drops the dump when the mount is under
-    it — it logs the refusal, but the client is told nothing.
+    The guard counts all three streams the node hosts even when one was
+    commanded. casm_cand_dump_disk drops the dump when the mount is under it and
+    logs the refusal, telling the client nothing.
     """
     per_stream = duration_s * VOLTAGE_BYTES_PER_SECOND
     counts = Counter(voltage_endpoint(stream)[0] for stream in streams)
@@ -241,11 +238,10 @@ def preflight_issues(duration_s: float, streams: list[int],
                      *, force: bool = False) -> tuple[list[str], list[str]]:
     """Complaints about a proposed voltage dump, as (refusals, warnings).
 
-    A refusal means the dump is a bad idea for a reason no daemon will tell
-    you about: it will either be eaten by the janitor or squeeze the live
-    recorders off the mount. ``force`` returns every refusal as a warning
-    instead, which is what ``--force`` does. Free space is passed in, and
-    None for a host means we could not read it.
+    A refusal means the dump would be eaten by the janitor or would squeeze the
+    live recorders off the mount, neither of which any daemon reports.
+    ``force`` downgrades every refusal to a warning. Free space is passed in,
+    None for an unreadable host.
     """
     refusals: list[str] = []
     warnings: list[str] = []
@@ -282,10 +278,10 @@ def preflight_issues(duration_s: float, streams: list[int],
 
 
 def free_bytes(host: str) -> int | None:
-    """Free bytes on a node's dump mount, or None if we could not find out.
+    """Free bytes on a node's dump mount, or None if unreadable.
 
-    The local node is read directly; the other one over ssh, which is only a
-    convenience — a failed or slow ssh must not stop a dump.
+    The local node is read directly, the other over ssh. A failed or slow ssh
+    must not stop a dump.
     """
     if host == socket.gethostname().split(".")[0]:
         try:
@@ -333,8 +329,8 @@ def stream_dir(stream: int) -> str:
 def stream_file_sizes(host: str, stream: int) -> dict[str, int] | None:
     """{filename: bytes} for a stream's dump directory, or None if unreadable.
 
-    The local node is read directly; the other one over ssh. A missing
-    directory reads as empty — the writer creates it with the first dump.
+    The local node is read directly, the other over ssh. A missing directory
+    reads as empty, the writer creating it with the first dump.
     """
     path = stream_dir(stream)
     if host == local_hostname():
@@ -366,9 +362,9 @@ def stream_dump_state(before: set[str], sizes: dict[str, int],
                       expected_bytes: int) -> tuple[str, list[str]]:
     """("waiting" | "growing" | "done", new files) for one stream.
 
-    New files are the ones absent from the pre-trigger listing; the dump is
-    done when they hold the commanded window's payload (each file carries a
-    4096-byte header on top).
+    New files are those absent from the pre-trigger listing. The dump is done
+    once they hold the commanded window's payload, each file carrying a
+    4096-byte header on top.
     """
     new = sorted(n for n in sizes if n not in before)
     if not new:
@@ -380,10 +376,10 @@ def stream_dump_state(before: set[str], sizes: dict[str, int],
 def reader_prefix(new_by_stream: dict[int, list[str]]) -> tuple[str | None, list[str]]:
     """VoltageReader timestamp prefix for a gathered dump, with any caveats.
 
-    The full UTC_START_OBSOFFSET prefix pins this dump even when another one
-    shares its UTC_START, but it only matches a dump's first file — so a
-    dump split over several files falls back to the bare UTC_START, with a
-    note. Streams that disagree on UTC_START return no prefix at all.
+    The full UTC_START_OBSOFFSET prefix pins this dump even when another shares
+    its UTC_START, but matches only a dump's first file, so a multi-file dump
+    falls back to the bare UTC_START with a note. Streams that disagree on
+    UTC_START return no prefix.
     """
     parsed = {}
     for stream, names in new_by_stream.items():
@@ -414,10 +410,9 @@ def gather_dump(streams: list[int], dest: str, before: dict[int, set[str]],
                 stop: datetime, duration_s: float) -> tuple[int, str | None, list[str]]:
     """Wait for the dump files, pull the remote streams into dest.
 
-    Returns (streams that never finished, reader prefix or None, gathered
-    file paths). Blocks from just after the trigger until the window has
-    passed and every stream's new files hold the expected bytes (or a
-    timeout of the dump length plus a minute past the window's end).
+    Returns (streams that never finished, reader prefix or None, gathered file
+    paths). Blocks until the window has passed and every stream's new files hold
+    the expected bytes, timing out a dump length plus a minute past the window.
     """
     local = local_hostname()
     expected = expected_stream_bytes(duration_s)
@@ -466,7 +461,7 @@ def gather_dump(streams: list[int], dest: str, before: dict[int, set[str]],
         os.makedirs(dest_dir, exist_ok=True)
         gathered += [os.path.join(dest_dir, n) for n in names]
         if host == local:
-            # Already on this node's disk: a symlink beats a second copy
+            # Already on this node's disk, so symlink instead of copying.
             print(f"gather   stream {stream}: {len(names)} symlink(s) to local files")
             linked.append(stream)
             for n in names:
@@ -510,26 +505,24 @@ def dump_voltages(gather_dir: str, past_duration: float | None = None,
                   timeout: float = DEFAULT_TIMEOUT_S,
                   force: bool = False,
                   dry_run: bool = False) -> tuple[str, str | None]:
-    """Dump voltages and gather them into gather_dir; the Python form of
-    ``casm-voltage-dump ... --gather D -y``.
+    """Dump voltages and gather them into gather_dir.
 
-    One of three window forms: past_duration (the LAST N seconds, ending 2 s
-    before now — the ring buffer only reaches ~26 s back), next_duration
-    (the NEXT N seconds, starting 5 s from now — how long dumps are taken),
-    or an explicit start/stop pair of PSRDADA UTC strings
-    ("2026-07-30-22:25:22.958"). Triggers the dump, waits for the files on
-    both nodes, pulls the remote streams into gather_dir (local ones are
-    symlinked), prints each gathered file's absolute path, and returns
-    (gather_dir, prefix) ready for casm_io's VoltageReader:
+    The Python form of ``casm-voltage-dump ... --gather D -y``. One of three
+    window forms: past_duration (the last N seconds, ending 2 s before now, the
+    ring reaching ~26 s back), next_duration (the next N seconds, starting 5 s
+    from now, used for long dumps), or an explicit start/stop pair of PSRDADA
+    UTC strings. Triggers the dump, waits for the files on both nodes, pulls the
+    remote streams into gather_dir (local ones are symlinked), prints each
+    gathered path, and returns (gather_dir, prefix) for casm_io's VoltageReader:
 
         data_dir, prefix = dump_voltages("~/myrun", past_duration=2)
         reader = VoltageReader(data_dir, prefix)
 
-    streams selects a subset (list of indices or "1,2"); default all six.
-    dry_run=True prints the plan and the per-node disk state, sends
-    nothing, and returns (gather_dir, None). Raises RuntimeError on
-    preflight refusals (janitor quota, disk floor — force=True downgrades
-    them to warnings) and when no stream delivered.
+    ``streams`` selects a subset (list of indices or "1,2"), default all six.
+    ``dry_run`` prints the plan and the per-node disk state, sends nothing, and
+    returns (gather_dir, None). Raises RuntimeError on preflight refusals
+    (janitor quota, disk floor; ``force`` downgrades them to warnings) and when
+    no stream delivered.
     """
     if isinstance(streams, str):
         streams = parse_streams(streams)
@@ -602,11 +595,11 @@ def voltage_main() -> None:
         casm-voltage-dump --last 2 --gather ~/myrun # wait for the files and pull
                                                     # all six streams into ~/myrun
 
-    These daemons are part of the Fourier Space stack and know nothing about
-    T2, so this works whether or not t2d is running. Unlike
-    :func:`request_voltage_dump_async`, which fans out to every endpoint at
-    once, this sends to the selected streams one at a time on purpose: an
-    operator wants each reply attributed as it arrives.
+    These daemons are part of the Fourier Space stack and know nothing about T2,
+    so this works whether or not t2d is running. It sends to the selected
+    streams one at a time, rather than the fan-out of
+    :func:`request_voltage_dump_async`, so each reply is attributed as it
+    arrives.
     """
     p = argparse.ArgumentParser(description="Trigger a raw voltage dump")
     p.add_argument("--start",
@@ -679,16 +672,16 @@ def voltage_main() -> None:
         if answer.strip().lower() not in ("y", "yes"):
             raise SystemExit("aborted, nothing sent")
 
-    # The prompt may have cost us the ring: a --last window that was inside
-    # the lookback when we printed it can be past it by the time we send.
+    # The prompt can cost the ring: a --last window inside the lookback when
+    # printed may be past it by send time.
     stale = ring_age_refusal(datetime.now(timezone.utc), start)
     if stale and args.last is not None:
         raise SystemExit(f"error: the window went stale while you were deciding: {stale}")
     if stale:
         print(f"WARNING: {stale} — expect the daemons to refuse")
 
-    # Snapshot each stream directory before triggering, so the gather step
-    # can tell this dump's files from everything already there.
+    # Snapshot each stream directory before triggering, so the gather step can
+    # tell this dump's files from what was already there.
     before: dict[int, set[str]] = {}
     if args.gather is not None:
         for stream in streams:

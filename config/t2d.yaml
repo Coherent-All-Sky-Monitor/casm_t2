@@ -1,76 +1,22 @@
-# t2d — the one config for the T2 daemon.
-# Edit, then `systemctl --user restart t2d` (or restart the tmux session).
+# t2d config. Edit, then `systemctl --user restart t2d`.
 
 listen_host: 0.0.0.0
 ports: [12345, 12346, 12347, 12348, 12349, 12350, 12351, 12352]
-# GULP COALESCING (2026-09-09). The eight hella jobs finish seconds apart, so
-# a fixed hold after the FIRST batch split gulps into fragments (gulp 1218 of
-# obs 2026-09-09-21:12:15 arrived as 3+2+1+1+1 jobs) and every per-gulp veto —
-# the occupancy footprint, the dm_floor coincidence spread, the one-dump-per-
-# gulp rule — only ever saw its own fragment. A key now flushes when all
-# `coalesce_jobs` jobs have reported and `coalesce_s` of quiet has passed, or
-# at `coalesce_max_s`, whichever comes first. Both are recorded per gulp
-# (gulp_stats.n_jobs, gulp_stats.coalesce_wait_ms).
-coalesce_s: 0.25        # quiet hold after the LAST batch, not the first
+
+# Gulp coalescing: flush when all coalesce_jobs jobs have reported and
+# coalesce_s of quiet has passed, or at coalesce_max_s.
+coalesce_s: 0.25        # s of quiet after the last batch
 coalesce_jobs: 8        # jobs expected per gulp; defaults to len(ports)
-# 8.0 = one gulp length. A job that has not reported within a whole gulp of
-# the first one is stuck, not slow, and the dump ring cannot absorb the wait:
-# the observed successful event-to-request lag is 36.5-50.8 s (207 dumps since
-# 2026-09-01, mean 43.7 s; the one failure was at 206 s), and hella's own
-# 13-25 s reporting delay already spends most of that budget. Retention behind
-# the read pointer beyond that 51 s is not known, so do not raise this on the
-# assumption that there is slack.
-coalesce_max_s: 8.0
-# A gulp that hits coalesce_max_s with fewer than coalesce_jobs jobs is DROPPED
-# WHOLE: not clustered, not triggered, recorded with skipped=1 in gulp_stats.
-# Every per-gulp veto reasons about the whole sky; half a sky is not worth a
-# dump decision. Watch the skipped count in the heartbeat — a rising one means
-# a hella job is dying, not that T2 is being cautious.
+coalesce_max_s: 8.0     # s, one gulp; short gulps are dropped whole (skipped=1)
 db: /mnt/nvme5/casm_pipeline/db/t2.sqlite
 
-# Set true (or run with --shadow) for a full dry-run: clusters, names, DB
-# rows and trigger decisions, but no dump commands and no trigger cards.
-shadow: false
+shadow: false           # dry run: cluster and record, no dumps, no cards
+dumps_enabled: true     # false: decide and record as suppressed_commissioning,
+                        # send no dump command, write no card
 
-# COMMISSIONING KILL-SWITCH (2026-07-31: the telescope is commissioning, so
-# this ships FALSE). false = run the whole chain and record every trigger
-# decision in the triggers table with action 'suppressed_commissioning', but
-# send no dump command and write no trigger card. Same suppression as
-# `shadow`, kept as a separate key so the dry-run flag stays available and
-# the audit rows say WHY the dump did not happen. Flip to true to arm.
-dumps_enabled: true   # armed 2026-08-13 per Vishnu (IB-sub-off restart); voltage below stays false
-
-# STORM DEFENCES (2026-07-31, after t2d wedged three times). A candidate
-# storm delivered up to 80,000 trials in one coalesced gulp (8 jobs x 10k
-# cap); DBSCAN then took 83-137 s against the 8.7 s real-time budget and
-# ingest stalled, back-pressuring the DAQ. Both knobs shed load before
-# clustering and are counted per gulp in gulp_stats (n_vetoed, n_shed).
-
-# Boxcar width indices dropped at PARSE time, before the fast path and the
-# trigger-card context see them. Index 6 (the 67 ms boxcar) is 97-98.6% of
-# everything stored on a quiet day: red-noise junk at DM >= 200 that
-# clusters into nothing and triggers nothing. Empty list = disabled.
-# Widening this throws away real data — check n_vetoed before and after.
-veto_widths: [6]
-
-# Hard bound on what reaches DBSCAN, applied when a coalesced gulp exceeds
-# this many candidates (after the width veto). Two stages:
-#   1. each global beam keeps its top ceil(cap/64) by S/N — handles RFI
-#      concentrated in a few beams, and keeps the shed fair across the sky;
-#   2. if that still exceeds the cap, keep the global top `cap` by S/N plus
-#      every populated beam's top 4, so a bright storm elsewhere can never
-#      evict a real single-beam FRB.
-# Stage 2 exists because stage 1 alone allows quota x populated beams
-# (313 x 512 = 160k here) and so did nothing for the 2026-07-31 storm, which
-# was width-0 spikes spread across every beam. Worst case kept is
-# cap + 4 x 512 ~ 22k. 0 disables the cap entirely.
-max_cands_per_gulp: 20000
-
-# 2026-08-13 (Vishnu): a gulp over the cap is dropped WHOLE instead of shed
-# to the two-stage bound — during a storm the gulp is junk; skip it and stay
-# real-time. Costs any real FRB that lands inside a storm gulp (the cap's
-# per-beam floor used to preserve those); flip back to false to shed instead.
-storm_skip_gulp: true
+veto_widths: [6]        # boxcar width indices dropped at parse time; [] disables
+max_cands_per_gulp: 20000   # bound on what reaches DBSCAN; 0 disables
+storm_skip_gulp: true   # true: drop a gulp over the cap whole, do not shed
 
 cluster:
   eps: 1.0
@@ -78,104 +24,51 @@ cluster:
   samp_scale: 64.0      # samples (~67 ms)
   dm_idx_scale: 32.0    # DM trials (~12 pc/cc)
   width_scale: 2.0      # log2(width) steps
-  # SKY AXIS (2026-09-09). Beams enter clustering as two tangent-plane degree
-  # axes about the zenith, not as a beam index: the deployed 512-beam grid is
-  # not sky-ordered (consecutive indices are a median 16 deg apart, true sky
-  # neighbours 3.1 deg, and only 11% of a beam's six sky-nearest neighbours lie
-  # within +-4 index).
-  #
-  # The beam FWHM per axis IS the link scale: two trials within one beam width
-  # of each other are one event. The beam is assumed to be a standard ellipse
-  # aligned with alt/az, from compute_beam_fwhm.
-  #
-  # FALLBACK ONLY since 2026-09-09. The ellipse belongs to the weights, not to
-  # this file: t3-weights-watch computes it from each product's own enabled
-  # antennas and stores it on the registry product, and t2d uses the live
-  # product's values whenever it has them (it logs which source is in use, once
-  # per weights id). These two are used only for a product with no ellipse (one
-  # registered before 2026-09-09 that no --backfill-fwhm has reached, or one
-  # whose h5 is gone).
+  # Sky link scales, degrees. Fallback only: t2d prefers the beam ellipse
+  # stored on the live weights product.
   beam_fwhm_x_deg: 18.1   # E-W
   beam_fwhm_y_deg: 3.9    # N-S
-  # FALLBACK ONLY: the old beam-index axis, used when the weights registry
-  # cannot name a pointing table for the gulp. Logs a warning; sky_extent_deg
-  # is then left unmeasured (0) and nothing is tagged on it.
-  beam_scale: 4.0
+  beam_scale: 4.0       # fallback beam-index axis, used with no pointing table
 
 tiers:                  # peak-SNR thresholds
   A: 30.0
-  B: 18.0               # 2026-06-15: raised 13->18 for the 11-antenna array.
-                        # The reduced aperture floods tier B with marginal
-                        # S/N 13-15 noise (uniform across beams + DM, diurnal);
-                        # at this rate B>=15 still ~470 eligible/day (> the 300
-                        # cap), B>=18 ~120/day. (was TEMP-13 since 06-12, itself
-                        # down from 15.) Lower back toward 13-15 as antennas
-                        # are recovered.
-  C: 12.0               # also the DB storage floor (T1 itself reports down to S/N 10)
+  B: 18.0               # below ~18 the 11-antenna array floods B with noise
+  C: 12.0               # also the DB storage floor
 
 filters:
-  beam_veto: [2]        # RFI hotspot. (beam-64 veto removed 2026-06-12
-                        # after the railed N21-E3 input was zeroed from the
-                        # weights — the first-beam artifact died with it)
-  max_nbeam: 32         # more distinct beams than this: rfi_wide, never triggers
-  # Sky-extent cut (2026-09-09): a cluster whose member beams span more than
-  # this on the sky is not one source -- about one E-W FWHM plus a beam
-  # spacing -- so it is tagged rfi_wide too. This is the cut n_beams could
-  # not make on a non-sky-ordered grid. 0 disables.
-  max_sky_extent_deg: 25.0
-  dm_floor: 20.0        # blind (tier) triggers require peak DM >= this
-  # DM-floor veto (2026-09-09, Vishnu): clusters whose lowest member DM sits
-  # at hella's first reported trial (20.5 at DM_MIN 20) with boxcar index
-  # >= min_width are zero-DM impulses leaking up the bowtie; tagged
-  # dm_floor, stored, never trigger. Every storm trigger of 2026-09-09
-  # 23:18-23:45 UTC had dm_lo 20.5 and width 4-5. max_dm_lo: 0 disables.
+  beam_veto: [2]        # RFI hotspot beams
+  max_nbeam: 32         # more distinct beams: rfi_wide, never triggers
+  max_sky_extent_deg: 25.0  # deg of member-beam span: rfi_wide; 0 disables
+  dm_floor: 20.0        # pc/cc, blind triggers require peak DM >= this
+  # Clusters at hella's first DM trial with a wide boxcar are zero-DM
+  # impulses: tagged dm_floor, stored, never trigger. max_dm_lo 0 disables.
   dm_floor_veto:
-    max_dm_lo: 20.6
-    min_width: 4
+    max_dm_lo: 20.6     # pc/cc
+    min_width: 4        # boxcar width index
 
-# Beam-occupancy veto (iteration-2 closure design, casm-wiki hella-sigma.md):
-# a cluster is tagged occupancy:<n> and never triggers when the gulp's RAW
-# candidates span >= min_beams distinct beams within +-window_samp samples of
-# its peak. Multi-beam coincidence: real sources 0-2 beams, broadband zero-DM
-# junk 40-64 (measured on the fixed 807f507 binary at threshold 8; on the
-# production binary capped storm gulps arrive with a 1-beam footprint, so
-# this fires rarely until that binary is redeployed). Counted on raw
-# candidates because DBSCAN fragments the junk into single-beam clusters.
-# min_beams: 0 disables.
+# Multi-beam coincidence on raw candidates: tag occupancy:<n>, never trigger.
 occupancy:
-  min_beams: 8
-  window_samp: 256      # +-0.27 s at 1.048576 ms sampling
+  min_beams: 8          # distinct beams; 0 disables
+  window_samp: 256      # +-0.27 s at 1.048576 ms
 
-# DISK SAFETY: dumps are scarce on purpose. Caps are global across reasons.
 trigger:
-  # cluster-first (strict T2) since 2026-06-11: every dump decision waits
-  # for DBSCAN; ring-window misses are recorded, not dodged.
-  fast_path: false
+  fast_path: false      # false: strict cluster-first, dump only after DBSCAN
   pre_s: 2.0
   post_s: 2.0
-  # 2026-08-13 (Vishnu): blind triggers need 30 s of blind-eligible QUIET.
-  # Every eligible blind event restarts the clock (dumped or not), so an RFI
-  # storm gets one dump then locks out until it ends — min_spacing_s alone
-  # would let a storm take a dump every 60 s for its whole duration.
-  # Known-source triggers (B0329) are exempt. 0 disables.
-  # 2026-09-09 (Vishnu): 30 -> 300. At 30 s a slow storm with events every
-  # 1-7 min cleared the gate every time (six dumps in 25 min, 23:19-23:45 UTC).
-  storm_lockout_s: 300
-  disk_floor_gb: 200    # refuse any dump if target fs has less free
+  storm_lockout_s: 300  # s of blind-eligible quiet a blind trigger needs;
+                        # known sources exempt, 0 disables
+  disk_floor_gb: 200    # refuse any dump if the target fs has less free
   intensity:
-    # No rate gate: every T2-passed candidate is dumped, plotted, and its
-    # .dada deleted (plotter --delete-dumps). The spacing only prevents
-    # overlapping dump writes; daily_max is a runaway-storm backstop.
-    min_spacing_s: 60
-    daily_max: 300
+    min_spacing_s: 60   # prevents overlapping dump writes
+    daily_max: 300      # runaway-storm backstop
   voltage:
-    enabled: false      # flip to true to enable voltage dumps (tier A only)
+    enabled: false      # tier A only
     tier: A
     min_spacing_s: 600
     daily_max: 2
 
-# Known sources trigger below the blind tiers (their own snr_min), matched
-# by transit schedule + DM-RANGE overlap (never peak DM).
+# Known sources trigger on their own snr_min, below the blind tiers, matched by
+# transit schedule plus DM-range overlap.
 known_sources:
   - name: B0329+54
     dm_min: 25.0
@@ -189,155 +82,71 @@ context:                # T1 neighbourhood embedded in trigger cards
   delay_s: 8.0
   max_members: 3000
 
-# t2-inject: scheduled live injections (corr1 streams only for now).
-# Ledger rows are written before the FIFO write; t2d tags matching clusters
-# 'injection' and never dumps them. Gates reconcile ~3 min after each shot.
+# t2-inject: scheduled live injections. Ledger rows are written before the FIFO
+# write; t2d tags matching clusters 'injection' and never dumps them.
 injection:
-  # Vishnu 2026-09-10: hourly for now, with the replay plot on every shot
   cadence_min: 60
   streams: [0, 1, 2, 3]
-  # Shot parameters, one entry per drawn quantity. Each is
-  #   {dist: uniform|loguniform|choice|fixed, ...}
-  # with lo/hi for the two ranges, `values` (and optional `weights`) for
-  # choice, `value` for fixed. Manual CLI flags still override any of them.
-  #
-  # dm         uniform over hella's searched grid, widened to 900 on
-  #            2026-09-10; anything drawn outside [0, 1000] is clamped.
-  # fwhm_ms    LOG-uniform so the powers-of-two search trials are exercised
-  #            evenly: a uniform draw over 2.5-30 ms would put two thirds of
-  #            the shots on the two widest trials. Aim: hella trials ibox 1-5
-  #            (kernel FWHM 1.0, 3.1, 5.2, 11.5, 22.0 ms; casm_t2.hella_kernel).
-  #            ibox 6 (45.1 ms) is dropped by t2d's width veto, so 30 ms is
-  #            the ceiling. The floor is NOT a choice: the generator floors
-  #            the rendered pulse at sigma = 1 sample, so nothing narrower
-  #            than FWHM 2.469 ms exists and a smaller draw is clamped up.
-  # inject_snr the INJECTED (true, analytic) S/N of the pulse: what it really
-  #            is, not how hella reports it. The amplitude is solved straight
-  #            from it and the live beam std, with no table in the loop.
-  #
-  # For a calibration run, express the grid instead of a range, e.g.
-  #   fwhm_ms:    {dist: choice, values: [3.0, 8.0, 20.0]}
-  #   inject_snr: {dist: fixed,  value: 15.0}
+  # One entry per drawn quantity: {dist: uniform|loguniform|choice|fixed, ...},
+  # lo/hi for ranges, values (+ weights) for choice, value for fixed. CLI flags
+  # override. dm: pc/cc, clamped to [0, 1000]. fwhm_ms: ms, log-uniform, keep
+  # <= 30 so hella reports ibox <= 5 (ibox 6 is vetoed); < 2.469 clamps up.
+  # inject_snr: true analytic S/N, not what hella reports.
   sample:
     dm:         {dist: uniform,    lo: 100.0, hi: 900.0}
     fwhm_ms:    {dist: loguniform, lo: 2.5,   hi: 30.0}
     inject_snr: {dist: loguniform, lo: 15.0,  hi: 18.0}
-  # DM bins for the daily summary's per-DM tally.
-  summary_dm_bins: [100.0, 300.0, 500.0, 700.0, 900.0]
-  # Ceiling on the PREDICTED reported S/N (injected * rec_per_true). Over it,
-  # the injected S/N is scaled down to sit on the cap and the clamp is logged.
-  # Above the ceiling the pulse fills hella's 10000-peak per-gulp candidate
-  # buffer and the gulp stops being searched across the whole beam set: the
-  # 2026-09-09 shots reported 78 (id 663, 31/64 beams searched) and 132 (id
-  # 664, 43/64). Reported 43 at FWHM 4.7 ms and 35.5 at 11.8 ms were fine.
-  # A candidate's footprint grows with width, so a wide pulse saturates
-  # sooner: flat to 15 ms, then wide_base*sqrt(wide_ref_ms/FWHM), i.e. 25 at
-  # FWHM 30 ms. The old flat `target_rec_snr_max` still works as an alias.
+  summary_dm_bins: [100.0, 300.0, 500.0, 700.0, 900.0]   # daily summary tally
+  # Cap on the predicted hella-reported S/N; above it the injected S/N is
+  # scaled down. Flat to mid_max_ms, then wide_base*sqrt(wide_ref_ms/FWHM).
   reported_snr_cap:
     narrow: 50.0            # FWHM below narrow_max_ms
     narrow_max_ms: 6.0
-    mid: 40.0               # FWHM from narrow_max_ms to mid_max_ms
+    mid: 40.0               # FWHM narrow_max_ms to mid_max_ms
     mid_max_ms: 15.0
     wide_base: 40.0
     wide_ref_ms: 12.0
-  # hella-reported S/N / the ANALYTICAL matched-filter S/N the solver computes.
-  # Not a constant: hella's matched trial is a smoothing kernel of FWHM about
-  # 0.67 * 2**ibox samples over unit-variance rows, so the ratio falls as the
-  # pulse widens.
-  #
-  # Seeded 2026-09-10 for IB subtraction ON, which is the standing state.
-  # MEASURED at FWHM 11.8 ms only, from the four clean sub-ON shots:
-  #   657 60.2/41.7 = 1.44   659 25.8/19.8 = 1.30
-  #   665 22.8/15.2 = 1.50   667 24.6/24.8 = 0.99   -> mean 1.31
-  # (666 excluded: fired 2.5 min after a bfcorr restart on a stale Redis std.)
-  # The 4.7 and 23.5 ms points are NOT measured with subtraction on. They are
-  # the mid value SCALED by the shape of the sub-OFF sweep, which had
-  # 2.24 @4.7, 2.08 @11.8, 1.22 @23.5, i.e. narrow/mid 1.08 and wide/mid 0.59.
-  # Treat them as a starting guess until a sub-ON width sweep exists; the
-  # spread of the four mid-width points alone is 0.99-1.50.
+  # hella-reported S/N over the analytic matched-filter S/N, [fwhm_ms, ratio],
+  # for IB subtraction on.
   rec_per_true_table:
-    - [4.7, 1.40]             # scaled, not measured with subtraction on
+    - [4.7, 1.40]             # scaled from the sub-OFF sweep, not measured
     - [11.8, 1.30]            # measured, 4 shots
-    - [23.5, 0.77]            # scaled, not measured with subtraction on
-  # Fallback when rec_per_true_table is absent; the pre-table scalar.
-  rec_per_true: 1.30
-  # Live-std staleness guard. A beamformer restart leaves whatever std was
-  # last published sitting in Redis, and Redis carries no timestamp for these
-  # keys (the age query_live_noise_std returns is the LOCAL cache age, always
-  # 0 on the force_refresh path). So: a restart within max_std_age_s means
-  # poll every std_poll_s until the value changes, which is proof the
-  # publisher is back, and give up after std_wait_s - skipping the shot as
-  # fire_failed rather than firing on a std we cannot trust. Injection 666
-  # was fired 2.5 min after a restart on a stale std and came out a factor
-  # low; it is excluded from the rec_per_true seed for that reason.
-  max_std_age_s: 30.0           # about 3 gulps
-  std_wait_s: 120.0
-  std_poll_s: 5.0
-  nchan_usable: 2600            # 3072 minus the 472-channel 470-484 MHz mask
-  amp_range: [25.0, 45.0]
-  # How long to wait after the FIFO write before reconciling. T1 reports
-  # 20-30 s late and the sidecar joins a gulp already seconds old, so 90 s is
-  # comfortably past both; it was 180 s.
-  reconcile_wait_s: 90
-  # Automated replay: dump the injected stream around each shot, render the
-  # dump with the injected pulse added, and thread the PNG under the shot's
-  # Slack message. `post` says when to post it:
-  #   daily    once per UTC day, plus every miss   (default)
-  #   on_miss  only when the shot was not recovered
-  #   always   every shot
-  #   never    no dump requested at all
-  # The dump window is [inject_utc - dump_pre_s, inject_utc - dump_post_s]:
-  # the pulse lands BEFORE inject_utc (the sidecar joins a gulp already
-  # seconds old), so both offsets are negative-going. The daemon replies only
-  # after writing, and a 14 s window took ~20 s on 2026-09-09, hence the
-  # timeout. Dumps are deleted after the plot unless keep_dump.
+    - [23.5, 0.77]            # scaled from the sub-OFF sweep, not measured
+  rec_per_true: 1.30          # fallback when rec_per_true_table is absent
+  # Live-std guard after a beamformer restart: Redis keeps the last published
+  # value, so wait for it to change or skip the shot as fire_failed.
+  max_std_age_s: 30.0         # s since restart below which the guard applies
+  std_wait_s: 120.0           # s to wait for a new value before giving up
+  std_poll_s: 5.0             # s between reads
+  nchan_usable: 2600          # 3072 minus the 472-channel 470-484 MHz mask
+  amp_range: [25.0, 45.0]     # stream counts
+  reconcile_wait_s: 90        # s after the FIFO write before reconciling
+  # Replay: dump the injected stream, render it with the pulse, thread the PNG
+  # under the shot's Slack message. Window is [inject_utc - dump_pre_s,
+  # inject_utc - dump_post_s]: the pulse lands before inject_utc.
   replay:
-    post: always
-    dump_pre_s: 24
-    dump_post_s: 10
+    post: always              # always | daily | on_miss | never
+    dump_pre_s: 24            # s before inject_utc, window start
+    dump_post_s: 10           # s before inject_utc, window end
     dump_timeout_s: 60
-    keep_dump: false
-    # A shot the search missed: `none` renders nothing (the card carries the
-    # red bar and the reason, which is the whole story), `expected` renders it
-    # anyway with the pulse where it should have been, archiving only the card
-    # JSON. Either way the raw dump is KEPT when the shot was missed - it is
-    # the only copy of what hella actually saw.
-    on_miss: none
+    keep_dump: false          # keep the .dada after plotting
+    on_miss: none             # none: render nothing | expected: pulse where due
     keep_dump_on_miss: true
     events_root: /mnt/nvme3/T3/EVENTS
     command: /home/casm/software/dev/casm_venvs/casm_offline_env/bin/t3-replay-injection
   scratch_dir: /mnt/nvme5/casm_pipeline/injections
-  # Slack posting for injections. SHIPS DISABLED: with enabled false the
-  # daemon posts nothing and behaves exactly as it did before. Set
-  # dry_run_dir to a path to write every would-be message to a .txt there
-  # and never open a socket. Token and channel come from ~/.config/slack_api
-  # and ~/.config/slack_channel, with ~/.config/slack_channel_injections
-  # overriding the channel when it exists. `channel` here overrides both.
-  # streak_every: post one attention message at each multiple of that many
-  # consecutive missed shots. Preview it first: t2-inject-slack-preview.
+  # Slack. Token and channel come from ~/.config/slack_api and
+  # ~/.config/slack_channel, with ~/.config/slack_channel_injections overriding
+  # the channel. Preview offline with t2-inject-slack-preview.
   slack:
     enabled: true
-    # sent_then_update  the sent line posts the moment the pulse goes in, so
-    #                   the channel shows a shot in flight; that same message
-    #                   is COMPLETED ~100 s later with a bar coloured by
-    #                   outcome, carrying the result line and the replay plot
-    #                   inline. One message per shot.
-    # single            nothing at fire time; one finished card once the
-    #                   outcome and the plot both exist.
-    # sent_then_edit    the original two-step shape: a "sent" message, edited
-    #                   with a coloured outcome bar, replay threaded under it.
-    mode: sent_then_update
-    # The daily summary is text only. The injected-vs-recovered S/N figure
-    # is still built if this is true, and threaded under the summary.
-    summary_figures: false
-    dry_run_dir: null
-    channel: null
-    streak_every: 5
-    # Base URL of the t3 web app, for the link in the recovered line. Same
-    # default as t3-collect's --web-base.
-    web_base: http://127.0.0.1:8050
+    mode: sent_then_update    # sent_then_update | single | sent_then_edit
+    summary_figures: false    # build the injected-vs-recovered S/N figure
+    dry_run_dir: null         # path: write .txt per message, open no socket
+    channel: null             # overrides the dotfiles
+    streak_every: 5           # attention message per N consecutive misses
+    web_base: http://127.0.0.1:8050   # t3 web app, for the recovered link
 
-# Beam pointings for cluster rows and trigger cards come from the weights live
-# at the event time (casm_t2.weights_registry), maintained by deploy_bf_weights
-# and t3-weights-watch. Default path shown.
+# Beam pointings for cluster rows and trigger cards, maintained by
+# deploy_bf_weights and t3-weights-watch.
 weights_registry: /mnt/nvme5/casm_pipeline/weights/registry

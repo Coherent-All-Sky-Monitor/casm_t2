@@ -1,10 +1,9 @@
-"""Render every injection Slack message offline, for review before go-live.
+"""Render every injection Slack message offline, for review.
 
-Nothing here touches Slack. It reads the ledger, builds the same text the
-poster would send through the same pure functions, and writes it out as
-.txt plus a PNG "card" per message (the colour bar down the left is the
-attachment colour Slack would show), then the daily summary text and the
-three summary figures.
+Nothing here touches Slack. It reads the ledger, builds the poster's text
+through the same pure functions, and writes .txt plus a PNG card per message
+(the left colour bar is the attachment colour Slack would show), then the daily
+summary text and the summary figures.
 
     t2-inject-slack-preview --db /path/t2.sqlite --out /tmp/preview \\
         --ids 657,658,659 --day 2026-09-09
@@ -45,9 +44,8 @@ def preview(conn, ids: list[int] | None, day: str, out_dir: Path,
     rows = [r if r.get("outcome") else dict(r, outcome=_backfill_outcome(r))
             for r in _rows(conn, ids, day)]
     written: list[Path] = []
-    # The poster runs too, in dry-run mode, so the preview exercises the same
-    # code path the daemon would take. Its own copies land in a subdirectory
-    # to keep the reviewable files at the top level.
+    # The poster runs in dry-run mode too, so the preview exercises the
+    # daemon's code path. Its copies go in a subdirectory.
     poster = inject_slack.SlackPoster(enabled=True,
                                       dry_run_dir=out_dir / "dry_run",
                                       web_base=web_base, icfg=icfg)
