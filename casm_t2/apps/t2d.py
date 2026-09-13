@@ -70,6 +70,14 @@ BEAM_QUOTA_DIVISOR = 64
 # rank, so a bright storm elsewhere cannot evict a single-beam FRB.
 BEAM_FLOOR = 4
 
+# Injection match half-window, s. The ledger row is written at FIFO write time
+# and the pulse enters the stream up to ~24 s earlier, so event_utc sits well
+# before inject_utc; 60 s covers that lead plus clock slop on both sides.
+INJECTION_MATCH_WINDOW_S = 60
+
+# Injection ledger cache lifetime, s, for the per-gulp refresh.
+INJECTION_CACHE_TTL_S = 30
+
 
 def apply_width_veto(cands: list[wire.Candidate],
                      veto_widths: set[int] | list[int]) -> tuple[list[wire.Candidate], int]:
@@ -578,7 +586,7 @@ class T2Daemon:
     def _cand_injection_match(self, epoch: float, beam: int, dm: float,
                               sky: cluster.SkyTable | None = None) -> bool:
         for inj_epoch, inj_beam, inj_dm in self._inj_cache:
-            if (abs(epoch - inj_epoch) <= 60
+            if (abs(epoch - inj_epoch) <= INJECTION_MATCH_WINDOW_S
                     and beam in self._inj_beams(inj_beam, sky)
                     and abs(dm - inj_dm) <= max(0.1 * inj_dm, 5)):
                 return True
@@ -621,20 +629,27 @@ class T2Daemon:
                 best = (c, event_utc, reason)
         if best is None:
             return
+        c, event_utc, reason = best
+        pseudo = cluster.Cluster(peak=c, n_members=1, n_beams=1,
+                                 beam_lo=c.beam, beam_hi=c.beam, dm_lo=c.dm,
+                                 dm_hi=c.dm, samp_lo=c.samp, samp_hi=c.samp)
+        # Blind tier trigger: same ledger race as the slow path, and here the
+        # cache is at most one batch old, which is not enough.
+        if (reason.startswith("tier_")
+                and self._recheck_injection(pseudo, event_utc.timestamp(), sky)):
+            logger.info("injection tag applied on forced ledger re-read: %s",
+                        f"beam {c.beam} dm {c.dm:.1f}")
+            return
         if time.monotonic() - self._last_fast_mono < 60:
             return  # one fast attempt per minute; budgets do the real limiting
         self._last_fast_mono = time.monotonic()
 
-        c, event_utc, reason = best
         # Names of fast triggers still awaiting their cluster. Each has a
         # triggers row already, but this batch's row is written only when
         # _trigger runs below, so exclude the in-flight ones.
         exclude = set(self.pending_fast)
         name = events.new_event_name(self.conn, event_utc, exclude=exclude)
         self.pending_fast[name] = (event_utc.timestamp(), c.beam, c.dm)
-        pseudo = cluster.Cluster(peak=c, n_members=1, n_beams=1,
-                                 beam_lo=c.beam, beam_hi=c.beam, dm_lo=c.dm,
-                                 dm_hi=c.dm, samp_lo=c.samp, samp_hi=c.samp)
         tier = ("A" if c.snr >= self.tier_a else
                 "B" if c.snr >= self.tier_b else "C")
         await self._trigger(pseudo, name, event_utc, tier, f"fast:{reason}", None)
@@ -650,8 +665,14 @@ class T2Daemon:
 
     # ----------------------------------------------------------- decisions
 
-    def _refresh_injections(self) -> None:
-        if time.monotonic() - self._inj_cache_ts < 30:
+    def _refresh_injections(self, force: bool = False) -> None:
+        """Reload the injection ledger cache; force skips the TTL.
+
+        force is for the blind-trigger path only: the bot writes the row at
+        fire time, after the pulse is already in the stream, so a cached read
+        can predate the row of the very injection about to be dumped.
+        """
+        if not force and time.monotonic() - self._inj_cache_ts < INJECTION_CACHE_TTL_S:
             return
         self._inj_cache_ts = time.monotonic()
         since = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat(
@@ -665,12 +686,24 @@ class T2Daemon:
     def _injection_match(self, cl: cluster.Cluster, event_epoch: float,
                          sky: cluster.SkyTable | None = None) -> bool:
         for inj_epoch, inj_beam, inj_dm in self._inj_cache:
-            if (abs(event_epoch - inj_epoch) <= 60
+            if (abs(event_epoch - inj_epoch) <= INJECTION_MATCH_WINDOW_S
                     and cl.peak.beam in self._inj_beams(inj_beam, sky)
                     and cl.dm_lo - max(0.1 * inj_dm, 5) <= inj_dm
                     and inj_dm <= cl.dm_hi + max(0.1 * inj_dm, 5)):
                 return True
         return False
+
+    def _recheck_injection(self, cl: cluster.Cluster, event_epoch: float,
+                           sky: cluster.SkyTable | None = None) -> bool:
+        """Force a ledger re-read and re-match, for blind trigger candidates.
+
+        The bot inserts the row at fire time, 16-24 s after the pulse entered
+        the stream, and t2d classifies ~47 s after the pulse, so a cache up to
+        INJECTION_CACHE_TTL_S old can miss the row and the cluster gets dumped
+        as a candidate. One extra query, only on the path that would dump.
+        """
+        self._refresh_injections(force=True)
+        return self._injection_match(cl, event_epoch, sky)
 
     def _is_dm_floor_leak(self, cl: cluster.Cluster) -> bool:
         """Wide cluster whose lowest DM sits at hella's first trial."""
@@ -755,6 +788,15 @@ class T2Daemon:
                 if n_occ >= self.occ_min_beams:
                     tags.append(f"occupancy:{n_occ}")
             reason = self._wants_trigger(cl, tier, tags)
+            # Blind tier trigger: no known source, nothing but S/N and DM
+            # behind it. Re-read the ledger before dumping.
+            forced_inj = (reason is not None and reason.startswith("tier_")
+                          and event_utc is not None
+                          and self._recheck_injection(
+                              cl, event_utc.timestamp(), sky))
+            if forced_inj:
+                tags.append("injection")
+                reason = None
             fast_name = (self._match_fast(cl, event_utc.timestamp())
                          if event_utc else None)
             store = (tier != "-" or reason is not None or "injection" in tags
@@ -772,6 +814,9 @@ class T2Daemon:
                     self.conn, event_utc or datetime.now(timezone.utc),
                     exclude=minted)
                 minted.add(name)
+            if forced_inj:
+                logger.info("injection tag applied on forced ledger re-read: %s",
+                            name)
             ev_iso = event_utc.isoformat(timespec="milliseconds") if event_utc else ""
             sky_row = self._sky(event_utc, cl.peak.beam, radec=False)
             rows.append((cl, utc_start_s or "", gulp, ev_iso, tier, ",".join(tags), name, sky_row))
