@@ -37,8 +37,12 @@ def test_the_shipped_config_is_valid():
     with open("config/t2d.yaml") as fh:
         icfg = yaml.safe_load(fh)["injection"]
     cfg = ir.replay_cfg(icfg)
+    # post is a deployment choice (currently 'never', cards are text only);
+    # the test only guards that it parses into a known mode.
     assert cfg["post"] in ir.POST_MODES
-    assert cfg["post"] != "never"          # shipped enabled at daily
+    assert cfg["dump_pre_s"] > cfg["dump_post_s"] > 0
+    assert isinstance(cfg["keep_dump"], bool)
+    assert cfg["command"]
     assert icfg["reconcile_wait_s"] == 90
 
 
