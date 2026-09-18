@@ -60,12 +60,11 @@ above `min_width`, which is a zero-DM impulse leaking up the bowtie. The tag
 spreads to every cluster in the same gulp within the occupancy window of such a
 cluster, DBSCAN splitting one impulse into fragments of which the higher-DM ones
 would otherwise trigger. Tagged clusters are stored and never dumped.
-`trigger.storm_lockout_s` is the quiet time a blind trigger needs after the
-previous blind-eligible event. `trigger` also holds `fast_path` (strict
-cluster-first when false), the per-kind budgets, `disk_floor_gb`, and the voltage
-block, which ships `enabled: false`. `known_sources` is per-source DM, transit
-schedule CSV and `snr_min`. `injection` sets cadence, parameter ranges, FIFO
-paths and the scratch quota.
+`trigger.storm_lockout_s` is the quiet time a trigger needs after the previous
+trigger-eligible event. `trigger` also holds `fast_path` (strict cluster-first
+when false), the per-kind budgets, `disk_floor_gb`, and the voltage block, which
+ships `enabled: false`. `injection` sets cadence, parameter ranges, FIFO paths
+and the scratch quota.
 
 `dumps_enabled` false evaluates every trigger decision and writes it to
 `triggers` with action `suppressed_commissioning`, but sends no dump command and

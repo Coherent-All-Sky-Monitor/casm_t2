@@ -5,8 +5,7 @@ gulp, clusters each gulp with DBSCAN, and runs every cluster through the
 decision chain:
 
     injection match -> beam veto -> wide-beam RFI cut -> beam-occupancy
-    veto -> known-source match -> SNR tier -> trigger budgets + disk guard
-    -> dump + trigger card
+    veto -> SNR tier -> trigger budgets + disk guard -> dump + trigger card
 
 The dump ring reaches only ~20 s back and T1 reports 20-24 s after the pulse.
 With ``trigger.fast_path`` on, trigger-worthy candidates are evaluated per batch
@@ -54,7 +53,7 @@ from pathlib import Path
 
 import yaml
 
-from casm_t2 import (beams, cluster, db, events, known_source, logsetup, policy, weights_registry,
+from casm_t2 import (beams, cluster, db, events, logsetup, policy, weights_registry,
                      sdnotify, timing, wire)
 from casm_t2.dump_client import request_dump_async, request_voltage_dump_async
 
@@ -283,11 +282,9 @@ class T2Daemon:
         self.voltage_tier = vcfg.get("tier", "A")
         self.pre_s = trig.get("pre_s", 2.0)
         self.post_s = trig.get("post_s", 2.0)
-        # Storm lockout, seconds: a blind (tier) trigger also needs this much
-        # blind-eligible quiet. Every eligible blind event restarts the clock
-        # whether or not it dumped, so a storm gets one dump. Known-source
-        # triggers are exempt, a pulsar train must not lock itself out.
-        # 0 disables.
+        # Storm lockout, seconds: a trigger also needs this much eligible
+        # quiet. Every eligible event restarts the clock whether or not it
+        # dumped, so a storm gets one dump. 0 disables.
         self.storm_lockout_s = float(trig.get("storm_lockout_s", 0.0))
         self._last_blind_eligible: datetime | None = None
         # Strict mode (fast_path: false) waits for clustering before any dump.
@@ -296,12 +293,6 @@ class T2Daemon:
         self.disk = DiskMonitor(trig.get("disk_floor_gb", 200.0),
                                 set(beams.STREAM_HOSTS.values()) - {LOCAL_HOSTNAME},
                                 beams.CAND_BEAM_DUMP_DIR)
-
-        self.sources = known_source.load_sources(cfg.get("known_sources", []))
-        # Known-source triggers may sit below tier C; each block carries its
-        # own snr_min (default 11).
-        self.source_snr_min = {b["name"]: b.get("snr_min", 11.0)
-                               for b in cfg.get("known_sources", [])}
 
         ctx = cfg.get("context", {})
         self.ctx_window_s = ctx.get("window_s", 4.0)
@@ -609,13 +600,7 @@ class T2Daemon:
                 continue
             event_utc = timing.samp_to_utc(c.samp, utc_start, tsamp)
             reason = None
-            for src in self.sources:
-                if (src.dm_min <= c.dm <= src.dm_max
-                        and c.snr >= self.source_snr_min.get(src.name, 11.0)
-                        and src.active(c.beam, event_utc)):
-                    reason = f"known_source:{src.name}"
-                    break
-            if reason is None and c.snr >= self.tier_b and c.dm >= self.dm_floor:
+            if c.snr >= self.tier_b and c.dm >= self.dm_floor:
                 reason = "tier_A" if c.snr >= self.tier_a else "tier_B"
             if reason is None:
                 continue
@@ -725,11 +710,6 @@ class T2Daemon:
             tags.append("rfi_wide")
         if self._is_dm_floor_leak(cl):
             tags.append("dm_floor")
-        if event_utc is not None:
-            for src in self.sources:
-                if src.matches(cl, event_utc):
-                    tags.append(f"src:{src.name}")
-                    break
         snr = cl.peak.snr
         tier = ("A" if snr >= self.tier_a else
                 "B" if snr >= self.tier_b else
@@ -741,9 +721,6 @@ class T2Daemon:
         if any(t in ("injection", "veto", "rfi_wide", "dm_floor")
                or t.startswith("occupancy:") for t in tags):
             return None
-        src = next((t[4:] for t in tags if t.startswith("src:")), None)
-        if src is not None and cl.peak.snr >= self.source_snr_min.get(src, 11.0):
-            return f"known_source:{src}"
         if tier in ("A", "B") and cl.peak.dm >= self.dm_floor:
             return f"tier_{tier}"
         return None
@@ -886,8 +863,9 @@ class T2Daemon:
                               dump_utc_start=start_s, dump_utc_stop=stop_s)
             return
 
-        # Storm lockout, blind triggers only: any eligible blind event restarts
-        # the clock whether or not it dumped, so a storm costs one dump.
+        # Storm lockout: any eligible event restarts the clock whether or not
+        # it dumped, so a storm costs one dump. Fast-path reasons carry a
+        # "fast:" prefix and are not locked out, as before.
         if self.storm_lockout_s > 0 and reason.startswith("tier"):
             prev, self._last_blind_eligible = self._last_blind_eligible, now
             if prev is not None and (now - prev).total_seconds() < self.storm_lockout_s:
@@ -1041,7 +1019,7 @@ class T2Daemon:
             row if row else (cl.n_members, cl.n_beams, cl.sky_extent_deg))
         card = {
             "candname": name,
-            "source": reason.split(":", 1)[1] if reason.startswith("known_source") else "blind",
+            "source": "blind",
             "event_utc": event_utc.isoformat(timespec="milliseconds"),
             "beam": c.beam,
             "local_beam": beams.local_beam(c.beam),

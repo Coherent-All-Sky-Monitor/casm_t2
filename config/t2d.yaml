@@ -55,8 +55,8 @@ trigger:
   fast_path: false      # false: strict cluster-first, dump only after DBSCAN
   pre_s: 2.0
   post_s: 2.0
-  storm_lockout_s: 300  # s of blind-eligible quiet a blind trigger needs;
-                        # known sources exempt, 0 disables
+  storm_lockout_s: 300  # s of trigger-eligible quiet a trigger needs;
+                        # 0 disables
   disk_floor_gb: 200    # refuse any dump if the target fs has less free
   intensity:
     min_spacing_s: 60   # prevents overlapping dump writes
@@ -66,16 +66,6 @@ trigger:
     tier: A
     min_spacing_s: 600
     daily_max: 2
-
-# Known sources trigger on their own snr_min, below the blind tiers, matched by
-# transit schedule plus DM-range overlap.
-known_sources:
-  - name: B0329+54
-    dm_min: 25.0
-    dm_max: 29.0
-    snr_min: 11.0
-    schedule_csv: /mnt/nvme5/casm_pipeline/schedules/b0329_schedule.csv
-    schedule_pad_s: 120
 
 context:                # T1 neighbourhood embedded in trigger cards
   window_s: 4.0

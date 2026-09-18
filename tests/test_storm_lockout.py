@@ -1,8 +1,8 @@
 """Storm lockout and storm_skip_gulp.
 
-Lockout: a blind trigger needs `storm_lockout_s` of blind-eligible quiet;
-every eligible blind event restarts the clock whether or not it dumped, so
-a sustained storm costs one dump total. Known-source triggers are exempt.
+Lockout: a trigger needs `storm_lockout_s` of trigger-eligible quiet;
+every eligible event restarts the clock whether or not it dumped, so
+a sustained storm costs one dump total.
 
 storm_skip_gulp: a gulp over max_cands_per_gulp is dropped whole instead of
 shed to the two-stage cap.
@@ -61,16 +61,6 @@ def test_locked_out_events_extend_the_lockout(daemon, make_cluster, monkeypatch)
     d._last_blind_eligible = datetime.now(timezone.utc) - timedelta(seconds=31)
     _fire(d, make_cluster(snr=25.0), "260814ffffff", "tier_B")
     assert _actions(d)[-1] == ("triggered", "tier_B;OK")
-
-
-def test_known_source_is_exempt_from_lockout(daemon, make_cluster, monkeypatch):
-    d = daemon(trigger=LOCKOUT_TRIG)
-    _arm(d, monkeypatch)
-    _fire(d, make_cluster(snr=25.0), "260814gggggg", "tier_B")
-    _fire(d, make_cluster(snr=12.0), "260814hhhhhh", "known_source:B0329+54")
-
-    assert _actions(d) == [("triggered", "tier_B;OK"),
-                           ("triggered", "known_source:B0329+54;OK")]
 
 
 def test_lockout_disabled_by_default(daemon, make_cluster, monkeypatch):

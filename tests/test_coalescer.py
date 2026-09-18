@@ -148,7 +148,7 @@ def test_coalesce_jobs_defaults_to_port_count(tmp_path):
     from casm_t2.apps import t2d
 
     base = {"db": str(tmp_path / "d.sqlite"), "dumps_enabled": False,
-            "known_sources": [], "weights_registry": str(tmp_path / "reg")}
+            "weights_registry": str(tmp_path / "reg")}
     d = t2d.T2Daemon(dict(base, ports=[1, 2, 3, 4]), shadow=False)
     assert d.coalesce_jobs == 4
     assert (d.coalesce_s, d.coalesce_max_s) == (0.25, 8.0)

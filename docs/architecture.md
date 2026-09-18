@@ -122,13 +122,8 @@ more than `max_nbeam` distinct beams or more than `max_sky_extent_deg` on the
 sky. Both tag `rfi_wide`. The sky test catches a burst in a dozen beams
 scattered across the sky, which the count alone cannot.
 
-known-source match: beam inside a scheduled transit window and the cluster's DM
-range overlapping the source DM. Range, not peak: a storm produces clusters
-whose peak DM lands anywhere, and matching on peak puts a pulsar tag on RFI.
-
-tier: S/N bands A >= 30, B >= 18, C >= 12. Blind triggers need tier A or B and
-peak DM above the floor (20 pc/cc); known sources carry their own S/N minimum
-and may sit below tier C. Tier C is stored and never triggers.
+tier: S/N bands A >= 30, B >= 18, C >= 12. A trigger needs tier A or B and
+peak DM above the floor (20 pc/cc). Tier C is stored and never triggers.
 
 budgets: per dump kind, a minimum spacing plus a hard daily cap, one dump per
 gulp, a storm lockout, and a free-disk floor checked on the node that would

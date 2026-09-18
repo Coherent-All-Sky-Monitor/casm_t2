@@ -27,9 +27,8 @@ weights-registry product, and t2d takes it from there per weights id. The
 fallback for a product with no ellipse.
 
 Clusters then run a filter chain: injection match (stored, never dumped), beam
-veto, wide-beam RFI cut (too many beams, or too wide on the sky), known-source
-DM-range match, and S/N tiers (A >= 30, B >= 18, C >= 12; blind triggers need
-A/B plus DM >= 20). Survivors hit the trigger budgets, minimum spacing, daily
+veto, wide-beam RFI cut (too many beams, or too wide on the sky), and S/N
+tiers (A >= 30, B >= 18, C >= 12; triggers need A/B plus DM >= 20). Survivors hit the trigger budgets, minimum spacing, daily
 caps, one dump per gulp, a storm lockout and a free-disk floor, before a dump
 command goes to the owning backend node.
 
@@ -54,8 +53,7 @@ Python >= 3.10; numpy, scikit-learn, pyyaml.
 
 Also ships `t2-dump` (manual smoke dump), `t2-replay` (offline replay of
 a UTC slice), `t2-inject` / `t2-inject-report` (live injections and the
-daily recovery report), `t2-inject-slack-preview`, and
-`t2-transit-schedule`.
+daily recovery report), and `t2-inject-slack-preview`.
 
 Injected widths are FWHM, drawn log-uniformly so hella's power-of-two boxcar
 trials are exercised evenly, and the amplitude is solved per shot from a

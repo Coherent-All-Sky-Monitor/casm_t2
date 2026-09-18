@@ -121,7 +121,7 @@ def daemon(tmp_path):
                # tests that want pointings monkeypatch registry.pointings_for
                "weights_registry": str(tmp_path / "registry"),
                "tiers": {"A": 30.0, "B": 18.0, "C": 12.0},
-               "trigger": {"fast_path": False}, "known_sources": []}
+               "trigger": {"fast_path": False}}
         cfg.update(overrides)
         d = t2d.T2Daemon(cfg, shadow=False)
         made.append(d)
