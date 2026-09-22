@@ -53,8 +53,8 @@ from pathlib import Path
 
 import yaml
 
-from casm_t2 import (beams, cluster, db, events, logsetup, policy, weights_registry,
-                     sdnotify, timing, wire)
+from casm_t2 import (beams, cluster, db, events, gulp_card, logsetup, policy,
+                     weights_registry, sdnotify, timing, wire)
 from casm_t2.dump_client import request_dump_async, request_voltage_dump_async
 
 logger = logging.getLogger("t2d")
@@ -347,6 +347,32 @@ class T2Daemon:
         # Injection ledger cache, refreshed per gulp from the DB.
         self._inj_cache: list[tuple[float, int, float]] = []  # (epoch, beam, dm)
         self._inj_cache_ts = 0.0
+        # Trigger-card reporting only, read by no decision: post-width-veto
+        # candidate counts of the last few flushed gulps, and the thresholds
+        # the card's gulp block quotes.
+        self._recent_counts: deque[int] = deque(maxlen=gulp_card.STORM_RECENT_GULPS)
+        self.card_rules = {
+            # the v2 card schema's names, where t2d has the same rule
+            "snr": float(self.tier_b),
+            "dm_floor": float(self.dm_floor),
+            "max_beams": int(self.max_nbeam),
+            "max_extent_deg": float(self.max_sky_extent_deg),
+            "storm_skip": (self.max_cands_per_gulp if self.storm_skip_gulp else 0),
+            "injections_dump": False,
+            # t2d's own
+            "tiers": {"A": float(self.tier_a), "B": float(self.tier_b),
+                      "C": float(self.tier_c)},
+            "beam_veto": sorted(self.veto),
+            "veto_widths": sorted(self.veto_widths),
+            "dm_floor_veto": {"max_dm_lo": self.dm_floor_veto_max_dm_lo,
+                              "min_width": self.dm_floor_veto_min_width},
+            "occupancy": {"min_beams": self.occ_min_beams,
+                          "window_samp": self.occ_window_samp},
+            "max_cands_per_gulp": self.max_cands_per_gulp,
+            "storm_skip_gulp": self.storm_skip_gulp,
+            "storm_lockout_s": self.storm_lockout_s,
+            "min_spacing_s": float(icfg.get("min_spacing_s", 120)),
+        }
 
     # ------------------------------------------------------------- ingest
 
@@ -486,6 +512,9 @@ class T2Daemon:
         # Already applied per batch in _handle; this is the gulp total.
         n_vetoed = self.pending_vetoed.pop(key, 0)
         utc_start_s, gulp = key
+        # Card reporting: this gulp's post-width-veto count, skipped or not.
+        self._recent_counts.append(len(cands))
+        recent = tuple(self._recent_counts)
         if not complete:
             # An incomplete gulp is dropped rather than clustered on partial
             # sky. Every per-gulp veto reasons about the whole sky, and the
@@ -543,13 +572,22 @@ class T2Daemon:
         sky = self._sky_table(key)
         params = self._params_for(sky)
         t0 = time.monotonic()
-        clusters = await asyncio.to_thread(cluster.cluster_candidates, cands,
-                                           params, sky)
+        clusters, labels = await asyncio.to_thread(
+            cluster.cluster_candidates_labelled, cands, params, sky)
         dt = time.monotonic() - t0
+        # Everything the trigger card's gulp block reports, none of it read by
+        # a decision.
+        report = gulp_card.GulpReport(
+            gulp=gulp, utc_start=utc_start_s,
+            weights_id=sky.weights_id if sky is not None else None,
+            n_raw=n_cands, n_width_dropped=n_vetoed, n_shed=n_shed,
+            cands=cands, labels=labels, clusters=clusters, outcomes=[],
+            rules=self.card_rules, raw_recent=recent, stormy=n_shed > 0)
         try:
             await self._process(key, clusters, n_jobs, n_cands, dt * 1e3,
                                 n_vetoed, n_shed, footprint=footprint,
-                                coalesce_wait_ms=coalesce_wait_ms)
+                                coalesce_wait_ms=coalesce_wait_ms,
+                                report=report)
         except Exception:
             logger.exception("processing gulp %s failed", key)
 
@@ -725,11 +763,48 @@ class T2Daemon:
             return f"tier_{tier}"
         return None
 
+    def _outcome(self, cl: cluster.Cluster, tier: str, tags: list[str],
+                 reason: str | None) -> tuple[str, str]:
+        """(outcome, detail) of one cluster for the trigger card's gulp block.
+
+        Reporting only: a restatement of what _classify, the tag loop in
+        _process and _wants_trigger already decided, in _wants_trigger's order.
+        """
+        p = cl.peak
+        what = f"tier {tier}, peak S/N {p.snr:.1f} at DM {p.dm:.1f}"
+        if "fast_triggered" in tags:
+            return "fast_triggered", f"{what}; dumped by the fast path"
+        if "injection" in tags:
+            return "injection", f"{what}; ledger match, not dumped"
+        if "veto" in tags:
+            return "veto", f"{what}; peak beam {p.beam} is on the beam veto list"
+        if "rfi_wide" in tags:
+            if cl.n_beams > self.max_nbeam:
+                return "too_many_beams", (f"{what}; {cl.n_beams} distinct beams"
+                                          f" > {self.max_nbeam}")
+            return "too_wide", (f"{what}; member beams span "
+                                f"{cl.sky_extent_deg:.1f} deg > "
+                                f"{self.max_sky_extent_deg:g} deg")
+        if "dm_floor" in tags:
+            return "dm_floor_leak", (f"{what}; zero-DM leak at hella's lowest "
+                                     "DM trials")
+        occ = [t for t in tags if t.startswith("occupancy:")]
+        if occ:
+            return "occupancy", (f"{what}; {occ[0].split(':', 1)[1]} beams within "
+                                 f"+-{self.occ_window_samp} samples >= "
+                                 f"{self.occ_min_beams}")
+        if tier not in ("A", "B"):
+            return "snr_below", f"{what}; S/N < tier B {self.tier_b:g}"
+        if reason is None:
+            return "dm_below", f"{what}; DM < floor {self.dm_floor:g}"
+        return "triggered", f"{what}; {reason}"
+
     async def _process(self, key: tuple, clusters: list[cluster.Cluster],
                        n_jobs: int, n_cands: int, clustering_ms: float,
                        n_vetoed: int = 0, n_shed: int = 0,
                        footprint: tuple[list[int], list[int]] | None = None,
-                       coalesce_wait_ms: float = 0.0) -> None:
+                       coalesce_wait_ms: float = 0.0,
+                       report: gulp_card.GulpReport | None = None) -> None:
         utc_start_s, gulp = key
         utc_start = timing.parse_dada_utc(utc_start_s) if utc_start_s else None
         self._refresh_injections()
@@ -751,7 +826,10 @@ class T2Daemon:
         # next fragment up cannot trigger.
         sky = self._sky_table(key)
         floor_samps = [cl.peak.samp for cl in clusters if self._is_dm_floor_leak(cl)]
-        for cl in clusters:
+        # Card reporting: each cluster's outcome, and to_trigger's cluster index.
+        outcomes: list[tuple[str, str]] = []
+        trigger_idx: list[int] = []
+        for k, cl in enumerate(clusters):
             event_utc = (timing.samp_to_utc(cl.peak.samp, utc_start)
                          if utc_start else None)
             tier, tags = self._classify(cl, event_utc, sky)
@@ -779,6 +857,7 @@ class T2Daemon:
             store = (tier != "-" or reason is not None or "injection" in tags
                      or fast_name is not None)
             if not store:
+                outcomes.append(self._outcome(cl, tier, tags, reason))
                 continue
             if fast_name is not None:
                 # The fast path already triggered and named this event.
@@ -797,8 +876,10 @@ class T2Daemon:
             ev_iso = event_utc.isoformat(timespec="milliseconds") if event_utc else ""
             sky_row = self._sky(event_utc, cl.peak.beam, radec=False)
             rows.append((cl, utc_start_s or "", gulp, ev_iso, tier, ",".join(tags), name, sky_row))
+            outcomes.append(self._outcome(cl, tier, tags, reason))
             if reason is not None and event_utc is not None:
                 to_trigger.append((cl, name, event_utc, tier, reason))
+                trigger_idx.append(k)
 
         if rows:
             # One vectorised RA/Dec transform per gulp, not one per cluster.
@@ -826,11 +907,22 @@ class T2Daemon:
 
         # One dump per gulp: one physical event can fragment into several
         # clusters. Fire the strongest and audit the rest.
-        to_trigger.sort(key=lambda t: -t[0].peak.snr)
+        order = sorted(range(len(to_trigger)),
+                       key=lambda j: -to_trigger[j][0].peak.snr)
+        to_trigger = [to_trigger[j] for j in order]
+        trigger_idx = [trigger_idx[j] for j in order]
+        card_gulp = None
+        if report is not None and to_trigger:
+            for k in trigger_idx[1:]:
+                outcomes[k] = ("also_triggerable",
+                               outcomes[k][1] + ";gulp_dup, a brighter cluster"
+                               " in this gulp went first")
+            report.outcomes = outcomes
+            card_gulp = (report, trigger_idx[0])
         for i, (cl, name, event_utc, tier, reason) in enumerate(to_trigger):
             if i == 0:
                 await self._trigger(cl, name, event_utc, tier, reason,
-                                    id_by_name.get(name))
+                                    id_by_name.get(name), card_gulp=card_gulp)
             else:
                 db.insert_trigger(self.conn, id_by_name.get(name), name,
                                   beams.stream_for_beam(cl.peak.beam),
@@ -839,7 +931,14 @@ class T2Daemon:
     # ----------------------------------------------------------- triggering
 
     async def _trigger(self, cl: cluster.Cluster, name: str, event_utc: datetime,
-                       tier: str, reason: str, cluster_id: int | None) -> None:
+                       tier: str, reason: str, cluster_id: int | None,
+                       card_gulp: tuple[gulp_card.GulpReport, int] | None = None
+                       ) -> None:
+        """Dump for one cluster, recording the decision.
+
+        ``card_gulp`` is (the gulp's report, this cluster's index in it) for
+        the trigger card's gulp block; it plays no part in the decision.
+        """
         c = cl.peak
         stream = beams.stream_for_beam(c.beam)
         loc = beams.stream_location(stream)
@@ -897,7 +996,8 @@ class T2Daemon:
                 if reply == "OK":
                     budget.record(now)
                     self._spawn(self._delayed_card(cl, name, event_utc,
-                                                   start_s, stop_s, loc, reason))
+                                                   start_s, stop_s, loc, reason,
+                                                   card_gulp=card_gulp))
 
         if self.voltage_enabled and tier <= self.voltage_tier:
             v_refusal = self.budget_vol.check(now)
@@ -1007,7 +1107,9 @@ class T2Daemon:
 
     async def _delayed_card(self, cl: cluster.Cluster, name: str, event_utc: datetime,
                             start_s: str, stop_s: str, loc: beams.StreamLocation,
-                            reason: str) -> None:
+                            reason: str,
+                            card_gulp: tuple[gulp_card.GulpReport, int] | None = None
+                            ) -> None:
         # Hold the card back so context candidates from lagging jobs arrive.
         await asyncio.sleep(self.ctx_delay_s)
         c = cl.peak
@@ -1046,7 +1148,15 @@ class T2Daemon:
                 "members": self._collect_context(event_utc.timestamp()),
             },
         }
-        body = json.dumps(card, indent=2)
+        if card_gulp is not None:
+            # Every trial of the gulp and what t2d decided about each cluster,
+            # for T3's bottom row. Fail soft: a card without it still plots.
+            try:
+                card["gulp"] = gulp_card.gulp_block(*card_gulp)
+            except Exception:
+                logger.exception("gulp block for card %s failed; card written "
+                                 "without it", name)
+        body = gulp_card.card_json(card)
         fname = f"{name}.json"
         try:
             if loc.host == LOCAL_HOSTNAME:

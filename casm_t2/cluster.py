@@ -239,9 +239,18 @@ def _dedup_grid(cands: list[Candidate], p: ClusterParams,
     alone would merge distinct beams (a half-scale x cell is far wider than the
     3.1 deg beam spacing) and understate n_beams and sky_extent_deg.
     """
+    reps, counts, _ = _dedup_grid_indexed(cands, p, sky)
+    return reps, counts
+
+
+def _dedup_grid_indexed(cands: list[Candidate], p: ClusterParams,
+                        sky: SkyTable | None
+                        ) -> tuple[list[Candidate], list[int], list[int]]:
+    """:func:`_dedup_grid` plus the cell index of every input candidate."""
     half_x = max(p.beam_fwhm_x_deg / 2, 1e-6)
     half_y = max(p.beam_fwhm_y_deg / 2, 1e-6)
     cells: dict[tuple, list] = {}
+    cell_of: list[int] = []
     for c in cands:
         if sky is not None:
             bx, by = (sky.xy(c.beam) if sky.has(c.beam) else (0.0, 0.0))
@@ -253,14 +262,15 @@ def _dedup_grid(cands: list[Candidate], p: ClusterParams,
                int(c.width)) + spatial
         cur = cells.get(key)
         if cur is None:
-            cells[key] = [c, 1]
+            cur = cells[key] = [c, 1, len(cells)]
         else:
             cur[1] += 1
             if c.snr > cur[0].snr:
                 cur[0] = c
+        cell_of.append(cur[2])
     reps = [v[0] for v in cells.values()]
     counts = [v[1] for v in cells.values()]
-    return reps, counts
+    return reps, counts, cell_of
 
 
 def _envelope(members: list[Candidate], n_raw: int,
@@ -300,6 +310,21 @@ def cluster_candidates(cands: list[Candidate],
     still reaches the trigger logic; the downstream filters decide.
     ``Cluster.n_members`` counts raw T1 trials, not deduplicated cells.
     """
+    return cluster_candidates_labelled(cands, params, sky)[0]
+
+
+def cluster_candidates_labelled(
+        cands: list[Candidate], params: ClusterParams = ClusterParams(),
+        sky: SkyTable | None = None) -> tuple[list[Cluster], list[int]]:
+    """:func:`cluster_candidates` plus the cluster of every input candidate.
+
+    Returns ``(clusters, labels)``: the same clusters in the same order as
+    :func:`cluster_candidates`, and ``labels[i]`` the index into ``clusters``
+    of the cluster holding ``cands[i]``. A trial collapsed onto a dedup cell
+    takes its cell representative's cluster, so each cluster's label count
+    equals its ``n_members``. The labels are for reporting (the trigger card's
+    gulp block); no decision reads them.
+    """
     global _warned_no_pointings
     if sky is None and not _warned_no_pointings:
         _warned_no_pointings = True
@@ -310,13 +335,13 @@ def cluster_candidates(cands: list[Candidate],
             "weights registry.", params.beam_scale)
 
     if not cands:
-        return []
+        return [], []
     if len(cands) == 1:
-        return [_envelope(cands, 1, sky)]
+        return [_envelope(cands, 1, sky)], [0]
 
-    reps, counts = _dedup_grid(cands, params, sky)
+    reps, counts, cell_of = _dedup_grid_indexed(cands, params, sky)
     if len(reps) == 1:
-        return [_envelope(reps, sum(counts), sky)]
+        return [_envelope(reps, sum(counts), sky)], [0] * len(cands)
 
     labels = DBSCAN(eps=params.eps, min_samples=params.min_samples,
                     metric="euclidean").fit_predict(_features(reps, params, sky))
@@ -329,8 +354,14 @@ def cluster_candidates(cands: list[Candidate],
         else:
             groups.setdefault(int(lab), []).append(i)
 
+    members = list(groups.values()) + [[i] for i in noise]
     out = [_envelope([reps[i] for i in g], sum(counts[i] for i in g), sky)
-           for g in groups.values()]
-    out.extend(_envelope([reps[i]], counts[i], sky) for i in noise)
-    out.sort(key=lambda cl: -cl.peak.snr)
-    return out
+           for g in members]
+    # Stable sort, as before, carrying each cluster's cells along.
+    order = sorted(range(len(out)), key=lambda k: -out[k].peak.snr)
+    rank = {k: r for r, k in enumerate(order)}
+    cluster_of_cell = [0] * len(reps)
+    for k, g in enumerate(members):
+        for i in g:
+            cluster_of_cell[i] = rank[k]
+    return [out[k] for k in order], [cluster_of_cell[c] for c in cell_of]
