@@ -148,7 +148,7 @@ render it. On a miss it shows what hella should have found.
     injection:
       reconcile_wait_s: 90
       replay:
-        post: always            # always | daily | on_miss | never
+        post: never             # always | daily | on_miss | never
         dump_pre_s: 24
         dump_post_s: 10
         dump_timeout_s: 60
