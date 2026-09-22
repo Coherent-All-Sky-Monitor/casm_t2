@@ -144,7 +144,7 @@ settings. Values from `config/t2d.yaml` as shipped 2026-09-22:
           "storm_skip": 20000,      # max_cands_per_gulp when storm_skip_gulp, else 0
           "injections_dump": false,
           "tiers": {"A": 30.0, "B": 18.0, "C": 12.0},
-          "beam_veto": [2], "veto_widths": [6],
+          "beam_veto": [], "veto_widths": [6],
           "dm_floor_veto": {"max_dm_lo": 20.6, "min_width": 4},
           "occupancy": {"min_beams": 8, "window_samp": 256},
           "max_cands_per_gulp": 20000, "storm_skip_gulp": true,

@@ -36,7 +36,7 @@ tiers:                  # peak-SNR thresholds
   C: 12.0               # also the DB storage floor
 
 filters:
-  beam_veto: [2]        # RFI hotspot beams
+  beam_veto: []         # peak beams that never trigger (beam 2 removed 2026-09-22)
   max_nbeam: 32         # more distinct beams: rfi_wide, never triggers
   max_sky_extent_deg: 25.0  # deg of member-beam span: rfi_wide; 0 disables
   dm_floor: 20.0        # pc/cc, blind triggers require peak DM >= this
