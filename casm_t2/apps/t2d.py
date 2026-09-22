@@ -282,11 +282,17 @@ class T2Daemon:
         self.voltage_tier = vcfg.get("tier", "A")
         self.pre_s = trig.get("pre_s", 2.0)
         self.post_s = trig.get("post_s", 2.0)
-        # Storm lockout, seconds: a trigger also needs this much eligible
-        # quiet. Every eligible event restarts the clock whether or not it
-        # dumped, so a storm gets one dump. 0 disables.
+        # Storm lockout, seconds: a blind trigger is refused within this long
+        # of the last clock restart. 0 disables. storm_lockout_reset says what
+        # restarts the clock: "eligible" (every trigger-eligible event, dumped
+        # or not, so a storm gets one dump) or "triggered" (only a dump that
+        # went out, so at most one blind dump per storm_lockout_s).
         self.storm_lockout_s = float(trig.get("storm_lockout_s", 0.0))
-        self._last_blind_eligible: datetime | None = None
+        self.storm_lockout_reset = str(trig.get("storm_lockout_reset", "eligible"))
+        if self.storm_lockout_reset not in ("eligible", "triggered"):
+            raise ValueError("trigger.storm_lockout_reset must be 'eligible' or "
+                             f"'triggered', not {self.storm_lockout_reset!r}")
+        self._lockout_clock: datetime | None = None
         # Strict mode (fast_path: false) waits for clustering before any dump.
         # Ring-window misses are then recorded rather than dodged.
         self.fast_path = bool(trig.get("fast_path", True))
@@ -376,6 +382,7 @@ class T2Daemon:
             "max_cands_per_gulp": self.max_cands_per_gulp,
             "storm_skip_gulp": self.storm_skip_gulp,
             "storm_lockout_s": self.storm_lockout_s,
+            "storm_lockout_reset": self.storm_lockout_reset,
             "min_spacing_s": float(icfg.get("min_spacing_s", 120)),
         }
 
@@ -1011,16 +1018,20 @@ class T2Daemon:
                               dump_utc_start=start_s, dump_utc_stop=stop_s)
             return
 
-        # Storm lockout: any eligible event restarts the clock whether or not
-        # it dumped, so a storm costs one dump. Fast-path reasons carry a
-        # "fast:" prefix and are not locked out, as before.
-        if self.storm_lockout_s > 0 and reason.startswith("tier"):
-            prev, self._last_blind_eligible = self._last_blind_eligible, now
+        # Storm lockout. With storm_lockout_reset "eligible" any eligible event
+        # restarts the clock whether or not it dumped, so a storm costs one
+        # dump; with "triggered" only a dump that went out restarts it (below).
+        # Fast-path reasons carry a "fast:" prefix and are not locked out.
+        lockout = self.storm_lockout_s > 0 and reason.startswith("tier")
+        if lockout:
+            prev = self._lockout_clock
+            if self.storm_lockout_reset == "eligible":
+                self._lockout_clock = now
             if prev is not None and (now - prev).total_seconds() < self.storm_lockout_s:
-                logger.warning("blind trigger %s locked out: previous eligible "
-                               "event %.1f s ago (< %.0f s quiet required)",
+                logger.warning("blind trigger %s locked out: lockout clock "
+                               "restarted %.1f s ago (< %.0f s, reset on %s)",
                                name, (now - prev).total_seconds(),
-                               self.storm_lockout_s)
+                               self.storm_lockout_s, self.storm_lockout_reset)
                 db.insert_trigger(self.conn, cluster_id, name, stream, "refused",
                                   f"{reason};storm_lockout")
                 return
@@ -1044,6 +1055,8 @@ class T2Daemon:
                                   dump_utc_stop=stop_s)
                 if reply == "OK":
                     budget.record(now)
+                    if lockout and self.storm_lockout_reset == "triggered":
+                        self._lockout_clock = now
                     self._spawn(self._delayed_card(cl, name, event_utc,
                                                    start_s, stop_s, loc, reason,
                                                    card_gulp=card_gulp))

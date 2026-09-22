@@ -55,8 +55,12 @@ trigger:
   fast_path: false      # false: strict cluster-first, dump only after DBSCAN
   pre_s: 2.0
   post_s: 2.0
-  storm_lockout_s: 300  # s of trigger-eligible quiet a trigger needs;
-                        # 0 disables
+  storm_lockout_s: 300  # s after the last lockout-clock restart in which a
+                        # blind trigger is refused; 0 disables
+  storm_lockout_reset: triggered  # triggered: only a dump that went out (a
+                        # Slack post) restarts the clock, at most one blind
+                        # dump per 300 s. eligible: every eligible event does,
+                        # one dump per storm (the rule before 2026-09-22).
   disk_floor_gb: 200    # refuse any dump if the target fs has less free
   intensity:
     min_spacing_s: 60   # prevents overlapping dump writes

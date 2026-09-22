@@ -60,8 +60,12 @@ above `min_width`, which is a zero-DM impulse leaking up the bowtie. The tag
 spreads to every cluster in the same gulp within the occupancy window of such a
 cluster, DBSCAN splitting one impulse into fragments of which the higher-DM ones
 would otherwise trigger. Tagged clusters are stored and never dumped.
-`trigger.storm_lockout_s` is the quiet time a trigger needs after the previous
-trigger-eligible event. `trigger` also holds `fast_path` (strict cluster-first
+`trigger.storm_lockout_s` is how long after the last lockout-clock restart a
+blind trigger is refused. `trigger.storm_lockout_reset` says what restarts it:
+`triggered` (shipped since 2026-09-22) restarts it only on a dump that went out,
+so at most one blind dump per `storm_lockout_s`; `eligible` (the code default
+and the rule before) restarts it on every trigger-eligible event, dumped or not,
+so a storm costs one dump. `trigger` also holds `fast_path` (strict cluster-first
 when false), the per-kind budgets, `disk_floor_gb`, and the voltage block, which
 ships `enabled: false`. `injection` sets cadence, parameter ranges, FIFO paths
 and the scratch quota.

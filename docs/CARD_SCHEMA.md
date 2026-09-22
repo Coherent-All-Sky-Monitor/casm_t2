@@ -148,7 +148,8 @@ settings. Values from `config/t2d.yaml` as shipped 2026-09-22:
           "dm_floor_veto": {"max_dm_lo": 20.6, "min_width": 4},
           "occupancy": {"min_beams": 8, "window_samp": 256},
           "max_cands_per_gulp": 20000, "storm_skip_gulp": true,
-          "storm_lockout_s": 300.0, "min_spacing_s": 60.0}
+          "storm_lockout_s": 300.0,
+          "storm_lockout_reset": "triggered", "min_spacing_s": 60.0}
 ```
 
 ## The v2 chain (backtest only)

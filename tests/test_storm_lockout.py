@@ -58,9 +58,74 @@ def test_locked_out_events_extend_the_lockout(daemon, make_cluster, monkeypatch)
     assert acts == ["triggered", "refused", "refused"]
 
     # 31 s of quiet clears it.
-    d._last_blind_eligible = datetime.now(timezone.utc) - timedelta(seconds=31)
+    d._lockout_clock = datetime.now(timezone.utc) - timedelta(seconds=31)
     _fire(d, make_cluster(snr=25.0), "260814ffffff", "tier_B")
     assert _actions(d)[-1] == ("triggered", "tier_B;OK")
+
+
+TRIGGERED_TRIG = dict(LOCKOUT_TRIG, storm_lockout_reset="triggered")
+
+
+def _fake_clock(monkeypatch):
+    """t2d's datetime.now under test control: set `clock.t` before each call."""
+    class Clock:
+        t = datetime(2026, 9, 22, 12, 0, 0, tzinfo=timezone.utc)
+    clock = Clock()
+
+    class FakeDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock.t
+    monkeypatch.setattr(t2d, "datetime", FakeDatetime)
+    return clock
+
+
+def test_triggered_reset_refused_events_do_not_extend(daemon, make_cluster, monkeypatch):
+    """storm_lockout_reset: triggered. Locked-out events leave the clock alone,
+    so 31 s after the dump the next one goes out even though refused events
+    came in between."""
+    d = daemon(trigger=TRIGGERED_TRIG)
+    _arm(d, monkeypatch)
+    clock = _fake_clock(monkeypatch)
+    t0 = clock.t
+    for dt, name in [(0, "260922aaaaaa"), (10, "260922bbbbbb"), (25, "260922cccccc"),
+                     (31, "260922dddddd"), (40, "260922eeeeee")]:
+        clock.t = t0 + timedelta(seconds=dt)
+        asyncio.run(d._trigger(make_cluster(snr=25.0), name, clock.t,
+                               "B", "tier_B", None))
+    assert [a for a, _ in _actions(d)] == [
+        "triggered", "refused", "refused", "triggered", "refused"]
+    assert _actions(d)[1] == ("refused", "tier_B;storm_lockout")
+
+
+def test_triggered_reset_ignores_a_refused_dump(daemon, make_cluster, monkeypatch):
+    """A dump the daemon refuses is no Slack post and does not restart the clock."""
+    d = daemon(trigger=TRIGGERED_TRIG)
+    _arm(d, monkeypatch)
+    replies = iter(["BUSY", "OK"])
+
+    async def fake_dump(host, port, start, stop):
+        return next(replies)
+    monkeypatch.setattr(t2d, "request_dump_async", fake_dump)
+    t0 = datetime.now(timezone.utc)
+    for dt, name in [(0, "260922ffffff"), (5, "260922gggggg")]:
+        asyncio.run(d._trigger(make_cluster(snr=25.0), name, t0 + timedelta(seconds=dt),
+                               "B", "tier_B", None))
+    assert [a for a, _ in _actions(d)] == ["refused_daemon", "triggered"]
+
+
+def test_shipped_config_resets_on_trigger():
+    import yaml
+    from pathlib import Path
+    cfg = yaml.safe_load((Path(__file__).parents[1] / "config" / "t2d.yaml").read_text())
+    assert cfg["trigger"]["storm_lockout_reset"] == "triggered"
+    assert cfg["trigger"]["storm_lockout_s"] == 300
+
+
+def test_bad_reset_value_is_rejected(daemon):
+    import pytest
+    with pytest.raises(ValueError):
+        daemon(trigger=dict(LOCKOUT_TRIG, storm_lockout_reset="sometimes"))
 
 
 def test_lockout_disabled_by_default(daemon, make_cluster, monkeypatch):
