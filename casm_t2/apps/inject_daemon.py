@@ -798,7 +798,10 @@ async def run(cfg: dict, once: bool, force: dict | None = None) -> None:  # noqa
                                "predicts a reported S/N of %.1f, over the %.1f "
                                "cap", amp, fwhm_ms, target_rec, cap)
             if std_age:
-                logger.info("live std age %.0f s (max_std_age_s %.0f)",
+                # std_age is the time since the last beamformer start, not the
+                # age of the value: the std itself was just read from Redis.
+                logger.info("std read live; beamformer up %.0f s "
+                            "(re-publish wait only within max_std_age_s %.0f)",
                             std_age, float(icfg.get("max_std_age_s", 30.0)))
         else:
             amp = random.uniform(*icfg.get("amp_range", [25.0, 45.0]))
