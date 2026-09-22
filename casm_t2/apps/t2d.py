@@ -1153,10 +1153,14 @@ class T2Daemon:
             # for T3's bottom row. Fail soft: a card without it still plots.
             try:
                 card["gulp"] = gulp_card.gulp_block(*card_gulp)
+                body = gulp_card.card_json(card)
             except Exception:
                 logger.exception("gulp block for card %s failed; card written "
                                  "without it", name)
-        body = gulp_card.card_json(card)
+                card.pop("gulp", None)
+                body = gulp_card.card_json(card)
+        else:
+            body = gulp_card.card_json(card)
         fname = f"{name}.json"
         try:
             if loc.host == LOCAL_HOSTNAME:
