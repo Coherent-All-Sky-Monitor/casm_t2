@@ -6,13 +6,20 @@ its own clustering of the coalesced gulp window, the same clusters and the same
 per-cluster decisions it recorded in the DB, so it is a report of data t2d
 already had and changes no trigger decision.
 
-Everything here is a pure function of its arguments.
+The same block, built around an injection cluster instead of a triggered
+one, is written per injection gulp for t3-replay-injection
+(``write_injection_blocks``). Everything else here is a pure function of its
+arguments.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import tempfile
+import time
 from dataclasses import dataclass
+from pathlib import Path
 
 from casm_t2 import timing
 from casm_t2.cluster import Cluster
@@ -99,12 +106,18 @@ def _cluster_entry(k: int, cl: Cluster, members: list[Candidate],
     }
 
 
-def gulp_block(report: GulpReport, triggered: int) -> dict:
+def gulp_block(report: GulpReport, triggered: int,
+               ref_outcome: str = "triggered") -> dict:
     """The card's ``gulp`` block, with ``clusters[triggered]`` the dumped one.
 
     Every ``dt_s`` is relative to the triggered cluster's peak sample, which is
     the card's ``samp``, in seconds to 4 decimals. The triggered cluster is the
     only one with outcome ``triggered``, whatever the report said about it.
+
+    ``ref_outcome`` other than "triggered" builds the block around a cluster
+    that was not dumped (an injection, for the replay figure): dt_s is still
+    relative to ``clusters[triggered]``, which keeps its own outcome, and every
+    other cluster keeps the outcome t2d gave it.
     """
     event_samp = report.clusters[triggered].peak.samp
     tsamp = float(report.tsamp_s)
@@ -131,10 +144,12 @@ def gulp_block(report: GulpReport, triggered: int) -> dict:
 
     entries = []
     for k in keep:
-        outcome = (report.outcomes[k] if k != triggered else
-                   ("triggered", report.outcomes[k][1]))
-        if k != triggered and outcome[0] == "triggered":
-            outcome = ("also_triggerable", outcome[1])
+        outcome = report.outcomes[k]
+        if ref_outcome == "triggered":
+            if k == triggered:
+                outcome = ("triggered", outcome[1])
+            elif outcome[0] == "triggered":
+                outcome = ("also_triggerable", outcome[1])
         entries.append(_cluster_entry(k, report.clusters[k], members[k],
                                       outcome, event_samp, tsamp))
 
@@ -162,6 +177,82 @@ def gulp_block(report: GulpReport, triggered: int) -> dict:
         "storm": {"raw_recent": [int(n) for n in report.raw_recent],
                   "stormy": bool(report.stormy)},
     }
+
+
+def injection_block(report: GulpReport, k: int, cluster_id: int | None,
+                    candname: str | None, event_utc: str | None) -> dict:
+    """A gulp block around injection cluster ``clusters[k]``, for the replay.
+
+    The same block a trigger card carries, with dt_s relative to the injection
+    cluster's peak, that cluster's outcome left at "injection", and a
+    ``reference`` naming it: its index in ``clusters``, its DB cluster id and
+    name, and the peak sample, beam and event_utc exactly as the clusters row
+    has them, so t3-replay-injection finds the block from the matched cluster.
+    """
+    block = gulp_block(report, k, ref_outcome="injection")
+    peak = report.clusters[k].peak
+    block["reference"] = {
+        "id": int(k),
+        "outcome": "injection",
+        "cluster_id": None if cluster_id is None else int(cluster_id),
+        "candname": candname,
+        "samp": int(peak.samp),
+        "beam": int(peak.beam),
+        "event_utc": event_utc,
+    }
+    return block
+
+
+def injection_block_name(block: dict) -> str:
+    """``<utc_start>_g<gulp>_c<cluster_id>.json``; ``_s<samp>_b<beam>`` stands
+    in for the cluster id when the row was not stored."""
+    ref = block["reference"]
+    tail = (f"c{ref['cluster_id']}" if ref.get("cluster_id") is not None
+            else f"s{ref['samp']}_b{ref['beam']}")
+    return f"{block.get('utc_start') or 'unknown'}_g{block.get('gulp')}_{tail}.json"
+
+
+def write_injection_blocks(gulp_dir, report: GulpReport,
+                           refs: list[tuple[int, int | None, str | None, str | None]],
+                           keep_days: float = 14.0) -> list[Path]:
+    """Write one injection gulp block per ``(k, cluster_id, candname,
+    event_utc)`` into ``gulp_dir``, each atomically, then prune files there
+    older than ``keep_days``. Returns the paths written. Blocking file I/O:
+    t2d calls it off the event loop.
+    """
+    out = Path(gulp_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    written = []
+    for k, cluster_id, candname, event_utc in refs:
+        block = injection_block(report, k, cluster_id, candname, event_utc)
+        dest = out / injection_block_name(block)
+        fd, tmp = tempfile.mkstemp(dir=out, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(card_json(block))
+            os.rename(tmp, dest)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
+        written.append(dest)
+    prune_injection_blocks(out, keep_days)
+    return written
+
+
+def prune_injection_blocks(gulp_dir, keep_days: float = 14.0,
+                           now: float | None = None) -> int:
+    """Delete ``*.json`` and stale ``*.tmp`` in ``gulp_dir`` older than
+    ``keep_days`` by mtime. Returns how many went."""
+    cutoff = (time.time() if now is None else now) - keep_days * 86400.0
+    n = 0
+    for p in list(Path(gulp_dir).glob("*.json")) + list(Path(gulp_dir).glob("*.tmp")):
+        try:
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+                n += 1
+        except FileNotFoundError:
+            pass
+    return n
 
 
 def card_json(obj, indent: int = 2) -> str:

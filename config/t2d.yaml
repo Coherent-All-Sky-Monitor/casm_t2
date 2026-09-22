@@ -128,6 +128,12 @@ injection:
     events_root: /mnt/nvme3/T3/EVENTS
     command: /home/casm/software/dev/casm_venvs/casm_offline_env/bin/t3-replay-injection
   scratch_dir: /mnt/nvme5/casm_pipeline/injections
+  # t2d writes the gulp block of every gulp with an injection cluster here,
+  # <utc_start>_g<gulp>_c<cluster_id>.json, for t3-replay-injection's v3
+  # bottom row (must be readable where replay.command runs: corr1). Files
+  # older than gulp_keep_days are pruned on each write. Unset disables.
+  gulp_dir: /mnt/nvme5/casm_pipeline/injection_gulps
+  gulp_keep_days: 14
   # Slack. Token and channel come from ~/.config/slack_api and
   # ~/.config/slack_channel, with ~/.config/slack_channel_injections overriding
   # the channel. Preview offline with t2-inject-slack-preview.

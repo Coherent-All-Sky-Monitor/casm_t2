@@ -82,7 +82,8 @@ a trial's `cluster_id` can name a cluster that is not listed. A capped
 
 ## Outcomes
 
-One outcome per cluster, exactly one `triggered` per card. t2d's chain order:
+One outcome per cluster, exactly one `triggered` per card (an injection gulp
+block can have none; see below). t2d's chain order:
 
 | outcome | meaning |
 |---|---|
@@ -99,6 +100,36 @@ One outcome per cluster, exactly one `triggered` per card. t2d's chain order:
 | dm_below | tier A or B but peak DM under `dm_floor` |
 
 `detail` is free text naming the tier, peak S/N and DM and the failing rule.
+
+## Injection gulp blocks
+
+An injection is never dumped, so it never gets a card. For the replay figure
+(`t3-replay-injection`) t2d writes the same block for every gulp with an
+`injection` cluster, one file per injection cluster, to `injection.gulp_dir`
+(`/mnt/nvme5/casm_pipeline/injection_gulps` on corr1), named
+`<utc_start>_g<gulp>_c<cluster_id>.json` (`_s<samp>_b<beam>` instead of
+`_c<cluster_id>` if the clusters row was not stored). The file is the bare block,
+not a card. It differs from a card's block in three ways:
+
+- `dt_s` is relative to the injection cluster's peak sample.
+- The injection cluster keeps outcome `injection`, and every other cluster keeps
+  the outcome t2d gave it, so a real event dumped in the same gulp reads
+  `triggered` here too.
+- A `reference` names the injection cluster:
+
+```
+"reference": {"id": 0,                 # index in clusters / trial cluster_id
+              "outcome": "injection",
+              "cluster_id": 51234,     # clusters.id, = injections.matched_cluster
+              "candname": "2609221234",
+              "samp": 57010, "beam": 100,              # clusters.samp / .beam
+              "event_utc": "2026-09-22T20:31:04.117+00:00"}   # clusters.event_utc, verbatim
+```
+
+t2d writes after the gulp's decisions are recorded, in a thread, atomically
+(temp file and rename), and prunes files older than `injection.gulp_keep_days`
+(14) in the same directory on each write. A failure is logged and changes
+nothing else. Unset `gulp_dir` turns it off.
 
 ## Rules as t2d writes them
 

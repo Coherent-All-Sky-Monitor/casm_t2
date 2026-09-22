@@ -187,6 +187,16 @@ Archive layout, one directory per shot under `events_root`:
     inj_20260910_0002/inj_20260910_0002.json    the synthetic card
     inj_20260910_0002/inj_20260910_0002.fil     the beam with the pulse added
 
+The replay figure's bottom row (gulp candidate histogram, beam against time,
+sky) needs the gulp block t2d writes for injection gulps to
+`injection.gulp_dir` (default `/mnt/nvme5/casm_pipeline/injection_gulps`,
+14-day retention via `injection.gulp_keep_days`). t2d creates the directory on
+its first write; the replay runs on corr1, the same host, and reads it by the
+matched cluster's id. A shot without a block (not recovered, or older than the
+feature) is drawn with the legacy bottom row. `ls -t` of the directory after a
+recovered shot should show `<utc_start>_g<gulp>_c<matched_cluster>.json`; a
+failed write is logged by t2d as `injection gulp block for gulp ... failed`.
+
 Cleanup deletes only this shot's own `.dada` files, selected by the window each
 file covers (from its name and size) against the recorded
 `dump_utc_start..dump_utc_stop`, and never the directory: `dump_dir` is the

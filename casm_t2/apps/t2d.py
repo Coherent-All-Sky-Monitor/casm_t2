@@ -351,6 +351,11 @@ class T2Daemon:
         # candidate counts of the last few flushed gulps, and the thresholds
         # the card's gulp block quotes.
         self._recent_counts: deque[int] = deque(maxlen=gulp_card.STORM_RECENT_GULPS)
+        # Injection gulp blocks for t3-replay-injection's bottom row, one JSON
+        # per injection cluster; unset disables. Reporting only, like the card.
+        inj_cfg = cfg.get("injection") or {}
+        self.injection_gulp_dir = inj_cfg.get("gulp_dir") or None
+        self.injection_gulp_keep_days = float(inj_cfg.get("gulp_keep_days", 14.0))
         self.card_rules = {
             # the v2 card schema's names, where t2d has the same rule
             "snr": float(self.tier_b),
@@ -829,6 +834,8 @@ class T2Daemon:
         # Card reporting: each cluster's outcome, and to_trigger's cluster index.
         outcomes: list[tuple[str, str]] = []
         trigger_idx: list[int] = []
+        # Injection gulp blocks: cluster index -> (name, event_utc) as stored.
+        stored_as: dict[int, tuple[str, str]] = {}
         for k, cl in enumerate(clusters):
             event_utc = (timing.samp_to_utc(cl.peak.samp, utc_start)
                          if utc_start else None)
@@ -877,6 +884,7 @@ class T2Daemon:
             sky_row = self._sky(event_utc, cl.peak.beam, radec=False)
             rows.append((cl, utc_start_s or "", gulp, ev_iso, tier, ",".join(tags), name, sky_row))
             outcomes.append(self._outcome(cl, tier, tags, reason))
+            stored_as[k] = (name, ev_iso)
             if reason is not None and event_utc is not None:
                 to_trigger.append((cl, name, event_utc, tier, reason))
                 trigger_idx.append(k)
@@ -927,6 +935,47 @@ class T2Daemon:
                 db.insert_trigger(self.conn, id_by_name.get(name), name,
                                   beams.stream_for_beam(cl.peak.beam),
                                   "suppressed", f"{reason};gulp_dup")
+
+        if report is not None and self.injection_gulp_dir:
+            self._queue_injection_gulps(report, outcomes, stored_as, id_by_name)
+
+    def _queue_injection_gulps(self, report: gulp_card.GulpReport,
+                               outcomes: list[tuple[str, str]],
+                               stored_as: dict[int, tuple[str, str]],
+                               id_by_name: dict[str, int]) -> None:
+        """Spawn the write of this gulp's injection blocks, if it has any.
+
+        After every decision of the gulp is made and recorded; the file I/O
+        runs in a thread and no failure leaves this method or the task.
+        """
+        try:
+            refs = []
+            for k, (outcome, _) in enumerate(outcomes):
+                if outcome != "injection":
+                    continue
+                name, ev_iso = stored_as.get(k, (None, None))
+                refs.append((k, id_by_name.get(name), name, ev_iso or None))
+            if not refs:
+                return
+            report.outcomes = list(outcomes)
+            self._spawn(self._write_injection_gulps(report, refs))
+        except Exception:
+            logger.exception("injection gulp block for gulp %s not queued",
+                             report.gulp)
+
+    async def _write_injection_gulps(self, report: gulp_card.GulpReport,
+                                     refs: list) -> None:
+        try:
+            paths = await asyncio.to_thread(
+                gulp_card.write_injection_blocks, self.injection_gulp_dir,
+                report, refs, self.injection_gulp_keep_days)
+        except Exception:
+            logger.exception("injection gulp block for gulp %s failed; the "
+                             "replay figure falls back to the legacy bottom row",
+                             report.gulp)
+            return
+        for p in paths:
+            logger.info("injection gulp block -> %s", p)
 
     # ----------------------------------------------------------- triggering
 

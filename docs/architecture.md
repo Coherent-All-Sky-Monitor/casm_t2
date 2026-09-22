@@ -144,7 +144,10 @@ event's gulp with its cluster id, every cluster with its outcome, the rules
 applied and recent candidate counts, which T3 draws as its bottom row. The
 `gulp` block is built from the same clustering and decisions the DB records and
 changes no decision; its layout, units and size caps are in
-`docs/CARD_SCHEMA.md` (casm_t2/gulp_card.py).
+`docs/CARD_SCHEMA.md` (casm_t2/gulp_card.py). A gulp with an `injection`
+cluster gets the same block, built around the injection cluster and written to
+`injection.gulp_dir` after the gulp's decisions, in a thread and fail-soft, for
+t3-replay-injection's bottom row (CARD_SCHEMA.md, "Injection gulp blocks").
 
 `trigger.fast_path` picks between two trigger styles. Strict cluster-first
 (`false`) waits for DBSCAN and the full chain before any dump; ring-window
