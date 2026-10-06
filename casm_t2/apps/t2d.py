@@ -1137,6 +1137,15 @@ class T2Daemon:
             self._sky_params[wid] = self._params_for_pointings(wid, pointings)
             logger.info("beam pointing table loaded for weights %s (%d beams)",
                         wid or "<unnamed>", table.n)
+        else:
+            # The registry watcher can add widths after this product's first
+            # gulp. Reuse immutable pointings, but refresh derived link scales.
+            params = self._sky_params.get(wid, self.params)
+            fx, fy = pointings.get('beam_fwhm_x_deg'), pointings.get('beam_fwhm_y_deg')
+            expected = (float(fx), float(fy)) if fx and fy and fx > 0 and fy > 0 else (
+                self.params.beam_fwhm_x_deg, self.params.beam_fwhm_y_deg)
+            if (params.beam_fwhm_x_deg, params.beam_fwhm_y_deg) != expected:
+                self._sky_params[wid] = self._params_for_pointings(wid, pointings)
         return table
 
     def _params_for_pointings(self, wid: str, pointings: dict) -> cluster.ClusterParams:

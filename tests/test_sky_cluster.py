@@ -404,3 +404,19 @@ def test_daemon_fwhm_falls_back_to_config(daemon, pointings, monkeypatch, caplog
     assert sum("no beam ellipse" in r.message for r in caplog.records) == 1
     # no pointing table at all: config too
     assert d._params_for(None) is d.params
+
+
+def test_daemon_refreshes_late_beam_widths_without_rebuilding_pointings(daemon, pointings, monkeypatch):
+    d = daemon(cluster={'beam_fwhm_x_deg': 18.1, 'beam_fwhm_y_deg': 3.9})
+    p = dict(pointings)
+    monkeypatch.setattr(d.registry, 'pointings_for', lambda utc: p)
+    table = d._sky_table(('2026-09-09-21:12:15', 5))
+    assert d._params_for(table) is d.params
+    p.update(beam_fwhm_x_deg=24., beam_fwhm_y_deg=5.)
+    assert d._sky_table(('2026-09-09-21:12:15', 6)) is table
+    params = d._params_for(table)
+    assert (params.beam_fwhm_x_deg, params.beam_fwhm_y_deg) == (24., 5.)
+    assert params.samp_scale == d.params.samp_scale
+    p.update(beam_fwhm_x_deg=None, beam_fwhm_y_deg=None)
+    d._sky_table(('2026-09-09-21:12:15', 7))
+    assert d._params_for(table) is d.params

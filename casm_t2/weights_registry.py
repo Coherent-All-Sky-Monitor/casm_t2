@@ -81,6 +81,7 @@ class Registry:
         self.alerts_path = self.root / "alerts.jsonl"
         self._events_cache: tuple[float, list[dict]] | None = None
         self._product_cache: dict[str, dict] = {}
+        self._product_identities: dict[str, tuple[int, int, int]] = {}
 
     # -- writing ---------------------------------------------------------
     def _ensure(self) -> None:
@@ -204,15 +205,32 @@ class Registry:
         return self._load_index().get(payload_md5)
 
     def product(self, product_id: str | None) -> dict | None:
+        """Read a product, refreshing metadata replaced by another process.
+
+        The watcher may supply beam widths after registration. Caching only by
+        product ID would keep the first, incomplete record for the daemon's life.
+        """
         if not product_id:
             return None
-        if product_id in self._product_cache:
-            return self._product_cache[product_id]
+        path = self.products_dir / f"{product_id}.json"
         try:
-            rec = json.loads((self.products_dir / f"{product_id}.json").read_text())
+            stat = path.stat()
+            identity = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+            if product_id in self._product_cache and self._product_identities.get(product_id) == identity:
+                return self._product_cache[product_id]
+            with path.open() as fh:
+                rec = json.load(fh)
+                stat = os.fstat(fh.fileno())
+                identity = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+            if not isinstance(rec, dict) or ('product_id' in rec and rec['product_id'] != product_id):
+                raise ValueError('Registry product identity mismatch')
+            rec.setdefault('product_id', product_id)  # legacy hand-written records
         except (OSError, ValueError):
+            self._product_cache.pop(product_id, None)
+            self._product_identities.pop(product_id, None)
             return None
         self._product_cache[product_id] = rec
+        self._product_identities[product_id] = identity
         return rec
 
     def events(self) -> list[dict]:
@@ -246,12 +264,14 @@ class Registry:
         return state
 
     def product_at(self, utc: datetime | str) -> tuple[dict | None, str]:
-        """(product record, status). status: 'ok' when every known stream carries the
+        """(product record, status). status: 'ok' when all six streams carry the
         same identified product; 'partial' when streams disagree; 'unknown' when the
         live payload is not a registered product; 'none' when no event exists."""
         state = self.live_at(utc)
         if not state:
             return None, "none"
+        if set(state) != set(range(NSTREAM)):
+            return None, "partial"
         pids = {ev.get("product_id") for ev in state.values()}
         if None in pids:
             return None, "unknown"

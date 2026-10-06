@@ -20,9 +20,13 @@ about the zenith, from the weights live at that moment: the beam index is not
 sky-ordered, consecutive indices being a median 16 deg apart against 3.1 deg for
 true sky neighbours. The two sky axes carry the beam's own FWHM, which is far
 wider East-West than North-South, so one source lights a row of beams rather
-than a circle. That ellipse follows the deployed weights: `t3-weights-watch`
-computes it from the antennas actually beamformed and stores it on the
-weights-registry product, and t2d takes it from there per weights id. The
+than a circle. That ellipse follows the deployed weights: the uploader records
+it before live events; `t3-weights-watch` can fill older missing metadata using
+the same generator helper. It uses the nonzero CB slot union over all channels,
+polarizations and beams, at the saved mean frequency (the lambda/D model, not an
+exact per-beam response). Registry readers reload changed product JSON; t2d also
+refreshes cached clustering widths when they change. A consistent association
+requires all six streams, not just whichever streams have reported so far. The
 `cluster.beam_fwhm_x_deg` / `beam_fwhm_y_deg` in `config/t2d.yaml` are the
 fallback for a product with no ellipse.
 

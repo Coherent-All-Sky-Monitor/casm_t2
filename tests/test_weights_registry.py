@@ -1,5 +1,6 @@
 """Registry: products, live events, time lookup, partial/unknown states."""
 from datetime import datetime, timezone, timedelta
+import json
 
 from casm_t2 import weights_registry as wr
 
@@ -54,6 +55,41 @@ def test_payload_md5_skips_header(tmp_path):
     p = tmp_path / "direct.dada.0"
     p.write_bytes(b"H" * wr.HDR_SIZE + b"payload-bytes")
     assert wr.payload_md5_of_file(p) == wr.payload_md5_of_bytes(b"payload-bytes")
+
+
+def test_product_cache_refreshes_external_replacements(tmp_path):
+    writer, reader = wr.Registry(tmp_path), wr.Registry(tmp_path)
+    alt, az = _alt_az()
+    pid = writer.record_product(h5_path='/a.h5', stream_md5={s: f'a{s}' for s in range(6)},
+                                alt_deg=alt, az_deg=az)
+    assert reader.product(pid)['beam_fwhm_x_deg'] is None
+    writer.set_product_fwhm(pid, 10., 3.)
+    updated = reader.product(pid)
+    assert updated['beam_fwhm_x_deg'] == 10.
+    assert reader.product(pid) is updated  # unchanged records still use cache
+    (writer.products_dir / f'{pid}.json').unlink()
+    assert reader.product(pid) is None
+
+
+def test_legacy_product_without_embedded_id_remains_readable(tmp_path):
+    registry = wr.Registry(tmp_path)
+    registry.products_dir.mkdir(parents=True)
+    path = registry.products_dir/'legacy.json'
+    path.write_text(json.dumps(dict(h5_path='/historic.h5', alt_deg=[60.]*512, az_deg=[180.]*512)))
+    assert registry.product('legacy')['product_id'] == 'legacy'
+    path.write_text(json.dumps(dict(product_id='somewhere-else')))
+    assert registry.product('legacy') is None
+
+
+def test_missing_streams_are_not_an_all_band_product(tmp_path):
+    reg = wr.Registry(tmp_path)
+    alt, az = _alt_az()
+    reg.record_product(h5_path='/a.h5', stream_md5={s: f'a{s}' for s in range(6)},
+                       alt_deg=alt, az_deg=az)
+    for s in range(5):
+        reg.record_live_event(utc=_t(0), stream=s, payload_md5=f'a{s}', source='upload')
+    assert reg.product_at(_t(1)) == (None, 'partial')
+    assert reg.pointings_for(_t(1)) is None
 
 
 def test_radec_roundtrip_is_sane():
