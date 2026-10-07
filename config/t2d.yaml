@@ -117,13 +117,14 @@ injection:
   std_bandpass_factor: 1.4    # Redis std over per-channel std in band (1.33-1.47 measured)
   amp_range: [25.0, 45.0]     # stream counts
   reconcile_wait_s: 90        # s after the FIFO write before reconciling
-  # Replay: dump the injected stream, render it with the pulse, thread the PNG
-  # under the shot's Slack message. Window is [inject_utc - dump_pre_s,
-  # inject_utc - dump_post_s]: the pulse lands before inject_utc.
+  # Replay: recorded background with the synthetic pulse re-added, posted to
+  # the injection channel. Start/end are relative to inject_utc; the end also
+  # includes the DM sweep and margin. Oct 7 recovered pulses lead the FIFO
+  # timestamp by about 22-33 s, so capture earlier than the old 24 s start.
   replay:
-    post: never               # always | daily | on_miss | never
-    dump_pre_s: 24            # s before inject_utc, window start
-    dump_post_s: 10           # s before inject_utc, window end before the sweep
+    post: always              # always | daily | on_miss | never
+    dump_pre_s: 38            # s before inject_utc, window start
+    dump_post_s: 20           # s before inject_utc, window end before the sweep
     dump_sweep_margin_s: 2    # s added after the DM sweep, for the pulse width
     dump_timeout_s: 60        # s floor; the wait scales as 2 x window_s
     keep_dump: false          # keep the .dada after plotting
@@ -140,7 +141,8 @@ injection:
   gulp_keep_days: 14
   # Slack. Token and channel come from ~/.config/slack_api and
   # ~/.config/slack_channel, with ~/.config/slack_channel_injections overriding
-  # the channel. Preview offline with t2-inject-slack-preview.
+  # the channel (#injections on corr1). Keep slack_channel for real candidates.
+  # Preview offline with t2-inject-slack-preview.
   slack:
     enabled: true
     mode: sent_then_update    # sent_then_update | single | sent_then_edit

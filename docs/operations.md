@@ -12,8 +12,9 @@ per node or they die at logout.
 | t2-inject-report.timer | corr1 | daily recovery report |
 
 The second backend node runs no casm_t2 services; t2d commands its dump daemons
-over TCP. Config changes need `systemctl --user restart t2d`, which costs the
-in-flight gulp and nothing else, budgets rebuilding from the DB.
+over TCP. Trigger/clustering config changes need `systemctl --user restart t2d`,
+which costs the in-flight gulp, budgets rebuilding from the DB. Injection-only
+YAML changes need only a `t2-inject` restart, after the current shot finishes.
 
 ### Outbound network from the correlator nodes
 
@@ -143,30 +144,38 @@ The daemon's truth plot comes from the .fil pushed into the FIFO, so it shows
 the pulse as generated. Intensity dumps tap upstream of the injection merge, so
 they cannot show the pulse in the live stream. The replay closes that: dump the
 injected stream around the shot, add the pulse where it should have arrived, and
-render it. On a miss it shows what hella should have found.
+render it. The replay is a reconstruction, not evidence that the live search
+recovered the shot. The ledger's matched search cluster establishes recovery.
 
     injection:
       reconcile_wait_s: 90
       replay:
-        post: never             # always | daily | on_miss | never
-        dump_pre_s: 24
-        dump_post_s: 10
+        post: always            # always | daily | on_miss | never
+        dump_pre_s: 38
+        dump_post_s: 20
+        dump_sweep_margin_s: 2
         dump_timeout_s: 60
         keep_dump: false
+        on_miss: none           # status only for misses
+        keep_dump_on_miss: true
         events_root: /mnt/nvme3/T3/EVENTS
         command: t3-replay-injection
 
 `post` decides when the plot is rendered and posted: `always` (the shipped
-setting) every shot, `on_miss` only misses, `daily` every miss plus the first
+setting) every eligible shot, `on_miss` only misses, `daily` every miss plus the first
 shot of each UTC day, `never` nothing (and then no dump is requested at all).
 The dump is taken on every shot whenever posting is possible, because it
 cannot be taken retrospectively. In `single` mode a shot with no plot still
-gets its message, as text.
+gets its message, as text. `on_miss: none` skips rendering misses even with
+`post: always`; their outcome is posted and raw dumps are retained. Replay
+products accumulate under `events_root`; monitor that storage separately.
 
-The window is `[inject_utc - dump_pre_s, inject_utc - dump_post_s]`. Both
-offsets go backwards, the pulse landing before the FIFO write: the sidecar joins
-a gulp whose samples are already 5-20 s old. The dump daemon replies only after
-writing, and a 14 s window takes about 20 s, hence the timeout.
+The window starts at `inject_utc - dump_pre_s` and ends at
+`inject_utc - dump_post_s + dispersion_sweep_s(DM) + dump_sweep_margin_s`,
+clamped to the request time. October 7 ledger measurements put recent recovered
+pulses about 22-33 s before `inject_utc`; the 38/20 s offsets cover that range
+with margin. Live dump availability must still be checked. The dump daemon
+replies after writing; its timeout scales with the requested window length.
 
 Timeline per shot, from the FIFO write:
 
@@ -272,6 +281,26 @@ Token and channel come from the same dotfiles casm_t3 uses,
 exists, so injection chatter can be kept out of the candidate channel.
 Every Slack failure is logged and swallowed.
 
+#### Separate injection channel
+
+The October 7 deployment uses `#injections`. Invite the existing bot there and
+put its channel ID in `~/.config/slack_channel_injections`. Keep
+`injection.slack.channel: null` so this file is used, and leave
+`~/.config/slack_channel` unchanged for on-sky candidates. No new token is needed.
+
+Wait for the current shot's final Slack update/replay to finish before changing
+the override: the ledger stores a message timestamp without a channel ID.
+The override is read on each API request; channel-only changes need no restart.
+For replay YAML changes, restart only `t2-inject.service` between shots. Startup
+waits out the remaining configured cadence; it does not force an immediate shot.
+Verify the next scheduled shot, replay and unchanged T2/T3/monitor service PIDs.
+Old Slack messages remain in their original channel; ledger IDs, event paths
+and the monitor's SQLite-based recovery history are unchanged.
+
+To roll back, finish any current shot first, restore the previous override
+(or remove the injection-only override to use the shared channel), restore the
+previous replay settings, and restart only the injection scheduler.
+
 Render the messages offline, with no token and no network:
 
     t2-inject-slack-preview --db /mnt/nvme5/casm_pipeline/db/t2.sqlite \
@@ -302,8 +331,10 @@ pointing table live at the injection time, neighbouring indices not being a fixe
 angle apart. With no pointing table it reads `beam 152 (offset n/a)`. The width
 is the kernel FWHM for that trial, not `2**ibox` samples.
 
-The daily summary is one top-level message with the figure as a reply in its
-thread. The outcome counts are in the text, not a chart.
+`SlackPoster.post_summary` can post a top-level summary with optional figures
+in its thread, using the same injection channel. The shipped
+`t2-inject-report.timer` instead writes a local text report at 16:00 UTC; it does
+not call this Slack helper. Enabling per-shot replay does not add daily Slack posts.
 
 The injected S/N is the value the solver aimed at (`inject_snr`), falling back
 to the generator's own matched-filter estimate (`est_snr`). Slack never quotes a

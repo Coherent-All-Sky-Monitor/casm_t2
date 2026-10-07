@@ -46,6 +46,25 @@ def test_the_shipped_config_is_valid():
     assert icfg["reconcile_wait_s"] == 90
 
 
+def test_deployed_replay_window_covers_october_recovered_leads():
+    """Oct 7 audit: the pulse leads the ledger timestamp by 22-33 seconds.
+
+    Check coverage and width margin over the configured DM range. This tests
+    window arithmetic; live dump availability still needs an on-stream check.
+    """
+    import yaml
+    with open("config/t2d.yaml") as fh:
+        icfg = yaml.safe_load(fh)["injection"]
+    cfg = ir.replay_cfg(icfg)
+    for lead_s in (-33.0, -22.0):
+        for dm in (icfg["sample"]["dm"]["lo"], icfg["sample"]["dm"]["hi"]):
+            start, stop = ir.dump_window(NOW, cfg, dm, now=NOW)
+            peak = NOW + timedelta(seconds=lead_s)
+            tail = peak + timedelta(seconds=ir.timing.dispersion_sweep_s(dm))
+            assert start <= peak - timedelta(seconds=1)
+            assert stop >= tail + timedelta(seconds=1)
+
+
 # --- the dump window --------------------------------------------------------
 
 def test_the_dump_window_is_before_inject_utc():

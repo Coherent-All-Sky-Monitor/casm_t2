@@ -867,3 +867,32 @@ def test_the_solver_value_wins_in_the_sent_line_and_the_ratio_together():
     assert "(ratio 2.96)" in inject_slack.outcome_text(RECOVERED_ROW)
     assert "median 2.96" in inject_slack.summary_text([RECOVERED_ROW],
                                                       "2026-09-10")
+
+
+def test_injection_channel_override_is_reloaded_without_changing_shared_channel(
+        tmp_path, monkeypatch):
+    shared = tmp_path / "slack_channel"
+    override = tmp_path / "slack_channel_injections"
+    token = tmp_path / "slack_api"
+    shared.write_text("C_CANDIDATES\n")
+    token.write_text("test-only-token\n")
+    monkeypatch.setattr(inject_slack, "CHANNEL_PATH", shared)
+    monkeypatch.setattr(inject_slack, "CHANNEL_OVERRIDE_PATH", override)
+    monkeypatch.setattr(inject_slack, "TOKEN_PATH", token)
+    poster = inject_slack.poster_from_cfg({"slack": {"enabled": True}})
+    assert poster._auth()[1] == "C_CANDIDATES"
+    override.write_text("C_INJECTIONS\n")
+    assert poster._auth()[1] == "C_INJECTIONS"
+    assert shared.read_text() == "C_CANDIDATES\n"
+    override.write_text("C_INJECTIONS_NEXT\n")
+    assert poster._auth()[1] == "C_INJECTIONS_NEXT"
+
+
+def test_explicit_injection_channel_has_priority_over_dotfiles(tmp_path, monkeypatch):
+    token = tmp_path / "slack_api"
+    token.write_text("test-only-token\n")
+    monkeypatch.setattr(inject_slack, "TOKEN_PATH", token)
+    monkeypatch.setattr(inject_slack, "load_channel", lambda: "C_DOTFILE")
+    poster = inject_slack.poster_from_cfg(
+        {"slack": {"enabled": True, "channel": "C_EXPLICIT"}})
+    assert poster._auth()[1] == "C_EXPLICIT"
