@@ -90,7 +90,7 @@ injection:
   sample:
     dm:         {dist: uniform,    lo: 100.0, hi: 900.0}
     fwhm_ms:    {dist: loguniform, lo: 2.5,   hi: 30.0}
-    inject_snr: {dist: loguniform, lo: 15.0,  hi: 18.0}
+    inject_snr: {dist: powerlaw,   lo: 10.0,  hi: 100.0, alpha: 1.5}   # Euclidean, 2026-10-12
   summary_dm_bins: [100.0, 300.0, 500.0, 700.0, 900.0]   # daily summary tally
   # Cap on the predicted hella-reported S/N; above it the injected S/N is
   # scaled down. Flat to mid_max_ms, then wide_base*sqrt(wide_ref_ms/FWHM).
