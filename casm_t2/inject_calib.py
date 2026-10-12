@@ -115,9 +115,13 @@ def draw(spec, rng) -> float:
         {dist: loguniform, lo: 2.5, hi: 30.0}
         {dist: choice,     values: [3, 8, 20], weights: [1, 2, 1]}
         {dist: fixed,      value: 15}
+        {dist: powerlaw,   lo: 10, hi: 100, alpha: 1.5}
 
     `loguniform` suits anything spanning a decade against powers-of-two search
-    trials; `choice` and `fixed` express a calibration grid. Raises SpecError on
+    trials; `choice` and `fixed` express a calibration grid; `powerlaw` draws
+    from N(> x) proportional to x**-alpha between lo and hi (alpha 1.5 is the
+    Euclidean source count, so most shots sit just above lo and a few are
+    bright, as a real population would). Raises SpecError on
     a malformed spec, which stops the daemon at startup rather than injecting at
     the wrong brightness.
     """
@@ -154,6 +158,19 @@ def draw(spec, rng) -> float:
         if lo <= 0:
             raise SpecError(f"loguniform needs lo > 0, got lo={lo}")
         return float(math.exp(rng.uniform(math.log(lo), math.log(hi))))
+
+    if dist == "powerlaw":
+        if "lo" not in spec or "hi" not in spec:
+            raise SpecError("powerlaw needs `lo` and `hi`")
+        lo, hi = float(spec["lo"]), float(spec["hi"])
+        alpha = float(spec.get("alpha", 1.5))
+        if not 0 < lo < hi:
+            raise SpecError(f"powerlaw needs 0 < lo < hi, got lo={lo} hi={hi}")
+        if alpha <= 0:
+            raise SpecError(f"powerlaw needs alpha > 0, got {alpha}")
+        # inverse CDF of the truncated Pareto: N(> x) ~ x**-alpha on [lo, hi]
+        u = rng.random()
+        return float(lo * (1.0 - u * (1.0 - (lo / hi) ** alpha)) ** (-1.0 / alpha))
 
     raise SpecError(f"unknown dist {spec.get('dist')!r}")
 

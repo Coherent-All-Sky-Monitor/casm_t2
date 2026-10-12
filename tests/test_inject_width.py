@@ -1051,3 +1051,21 @@ def test_config_carries_the_floor_and_the_bandpass_factor():
     assert icfg["amp_floor"] == 4
     assert 1.3 <= icfg["std_bandpass_factor"] <= 1.5
     assert icfg["nchan_usable"] == 2600
+
+
+def test_draw_powerlaw_is_euclidean():
+    """N(> x) ~ x**-1.5 between lo and hi: the median sits near lo * 2**(2/3)
+    and the fraction above 2 lo is about 2**-1.5 = 0.35; nothing leaves [lo, hi]."""
+    import random
+    rng = random.Random(3)
+    vals = [d.draw({"dist": "powerlaw", "lo": 10.0, "hi": 100.0, "alpha": 1.5}, rng)
+            for _ in range(20000)]
+    assert min(vals) >= 10.0 and max(vals) <= 100.0
+    frac_above_20 = sum(v > 20.0 for v in vals) / len(vals)
+    expected = (20.0 ** -1.5 - 100.0 ** -1.5) / (10.0 ** -1.5 - 100.0 ** -1.5)
+    assert abs(frac_above_20 - expected) < 0.01
+    from casm_t2.inject_calib import SpecError
+    with pytest.raises(SpecError):
+        d.draw({"dist": "powerlaw", "lo": 0, "hi": 100}, rng)
+    with pytest.raises(SpecError):
+        d.draw({"dist": "powerlaw", "lo": 10, "hi": 100, "alpha": 0}, rng)

@@ -81,8 +81,9 @@ context:                # T1 neighbourhood embedded in trigger cards
 injection:
   cadence_min: 60
   streams: [0, 1, 2, 3]
-  # One entry per drawn quantity: {dist: uniform|loguniform|choice|fixed, ...},
-  # lo/hi for ranges, values (+ weights) for choice, value for fixed. CLI flags
+  # One entry per drawn quantity: {dist: uniform|loguniform|choice|fixed|powerlaw, ...},
+  # lo/hi for ranges (+ alpha for powerlaw: N(>x) ~ x^-alpha, 1.5 = Euclidean),
+  # values (+ weights) for choice, value for fixed. CLI flags
   # override. dm: pc/cc, clamped to [0, 1000]. fwhm_ms: ms, log-uniform, keep
   # <= 30 so hella reports ibox <= 5 (ibox 6 is vetoed); < 2.469 clamps up.
   # inject_snr: true analytic S/N, not what hella reports.

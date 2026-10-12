@@ -311,7 +311,10 @@ sample:
 ```
 
 `dist` is `uniform`, `loguniform`, `choice` (with `values` and optional
-`weights`) or `fixed` (with `value`). `casm_t2.inject_calib.draw` validates the
+`weights`), `fixed` (with `value`) or `powerlaw` (with `lo`, `hi` and
+`alpha`, default 1.5: N(> x) proportional to x**-alpha between the bounds,
+the Euclidean source count, so most shots sit just above `lo` and a few are
+bright). `casm_t2.inject_calib.draw` validates the
 spec and raises on anything malformed, so a bad spec stops the daemon rather
 than injecting at the wrong brightness. The legacy `dm_range` / `fwhm_ms_range`
 / `inject_snr_range` keys still work, with a warning. The manual flags `--dm`,
