@@ -220,6 +220,23 @@ def test_a_miss_passes_event_utc(tmp_path):
     assert cmd[cmd.index("--event-utc") + 1].startswith("2026-09-10T02:29:44")
 
 
+def test_cleaning_is_off_unless_configured(tmp_path):
+    cfg = ir.replay_cfg({"replay": {"events_root": str(tmp_path)}})
+    cmd = ir.build_command(1, "/d", cfg)
+    assert "--clean" not in cmd and "--sumthreshold" not in cmd
+
+
+def test_cleaning_passes_clean_and_sumthreshold(tmp_path):
+    """The shipped setting: the plot shows the beam as the live chain sees it."""
+    cfg = ir.replay_cfg({"replay": {"events_root": str(tmp_path),
+                                    "clean": "hella", "sumthreshold": "default"}})
+    cmd = ir.build_command(1, "/d", cfg)
+    assert cmd[cmd.index("--clean") + 1] == "hella"
+    assert cmd[cmd.index("--sumthreshold") + 1] == "default"
+    bad = ir.replay_cfg({"replay": {"clean": "sometimes"}})
+    assert bad["clean"] == "none"
+
+
 def test_a_multi_word_command_is_split(tmp_path):
     """So `python -m casm_t3.apps.replay_injection` works as a command."""
     cfg = ir.replay_cfg({"replay": {"command": "python -m casm_t3.apps.x",

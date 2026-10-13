@@ -160,6 +160,8 @@ recovered the shot. The ledger's matched search cluster establishes recovery.
         keep_dump_on_miss: true
         events_root: /mnt/nvme3/T3/EVENTS
         command: t3-replay-injection
+        clean: hella            # none: as recorded | hella: like the live chain
+        sumthreshold: default   # with clean hella: the SumThreshold stage too
 
 `post` decides when the plot is rendered and posted: `always` (the shipped
 setting) every eligible shot, `on_miss` only misses, `daily` every miss plus the first
@@ -169,6 +171,11 @@ cannot be taken retrospectively. In `single` mode a shot with no plot still
 gets its message, as text. `on_miss: none` skips rendering misses even with
 `post: always`; their outcome is posted and raw dumps are retained. Replay
 products accumulate under `events_root`; monitor that storage separately.
+`clean: hella` (shipped since 2026-10-12) renders the beam through casm_t3's
+offline replica of hella's flagging chain, with `sumthreshold: default` adding
+the SumThreshold stage that went live the same day, so the Slack figure shows
+roughly what the search saw rather than the beamformer output; `clean: none`
+restores the as-recorded view. The archived `.fil` is always as recorded.
 
 The window starts at `inject_utc - dump_pre_s` and ends at
 `inject_utc - dump_post_s + dispersion_sweep_s(DM) + dump_sweep_margin_s`,

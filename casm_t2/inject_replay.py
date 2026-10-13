@@ -59,6 +59,17 @@ def replay_cfg(icfg: dict | None) -> dict:
     cfg.setdefault("on_miss", "none")
     # On a miss the dump is the only copy of what hella saw, so keep it.
     cfg.setdefault("keep_dump_on_miss", True)
+    # Cleaning applied to the beam before plotting (t3-replay-injection
+    # --clean / --sumthreshold): `none` renders the dump as recorded, `hella`
+    # passes it through the offline replica of the deployed flagging chain;
+    # `sumthreshold` adds the SumThreshold stage live since 2026-10-12
+    # (`default`, or key=val,... overrides).
+    cfg.setdefault("clean", "none")
+    cfg.setdefault("sumthreshold", None)
+    if cfg["clean"] not in ("none", "hella"):
+        logger.warning("injection.replay.clean %r is not none|hella; using none",
+                       cfg["clean"])
+        cfg["clean"] = "none"
     if cfg["on_miss"] not in ("none", "expected"):
         logger.warning("injection.replay.on_miss %r is not none|expected; "
                        "using none", cfg["on_miss"])
@@ -229,6 +240,10 @@ def build_command(inj_id: int, dump_dir, rcfg: dict, db_path: str | None = None,
         cmd += ["--event-utc", event_utc.isoformat(timespec="milliseconds")]
     if label:
         cmd += ["--label", label]
+    if rcfg.get("clean", "none") != "none":
+        cmd += ["--clean", str(rcfg["clean"])]
+        if rcfg.get("sumthreshold"):
+            cmd += ["--sumthreshold", str(rcfg["sumthreshold"])]
     return cmd
 
 
