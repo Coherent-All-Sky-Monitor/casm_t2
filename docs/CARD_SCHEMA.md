@@ -4,8 +4,10 @@ Agreed 2026-09-18 for the T2 v2 backtest (originally
 `/mnt/nvme3/vishnu/t2_backtest/CARD_SCHEMA.md`); written by the live t2d since
 2026-09-22 (`casm_t2/gulp_card.py`). casm_t2 writes it, casm_t3's candidate
 figure reads it for its bottom row. The other card keys (candname, event_utc,
-beam, snr, dm, width, samp, sky, pointings, dump paths) are unchanged. The old
-`context` block stays for older readers; T3 ignores it when `gulp` is present.
+beam, snr, dm, width, samp, sky, pointings, dump paths) are unchanged, and the
+new top-level `t2d_commit` names the casm_t2 commit t2d runs from: `<sha>` (12
+hex digits), `<sha>+dirty` when tracked files differ from it, or `unknown`. The
+old `context` block stays for older readers; T3 ignores it when `gulp` is present.
 Cards without a `gulp` block are pre-v2 and T3 draws the old bottom row.
 
 t2d builds the block from its own clustering of the coalesced gulp window: the

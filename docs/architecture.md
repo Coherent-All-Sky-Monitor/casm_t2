@@ -139,9 +139,10 @@ dumps as well.
 
 The trigger card is JSON, written `context.delay_s` after a successful dump.
 Besides the event (name, UTC, peak beam/S/N/DM/width/sample, cluster envelope,
-sky position, the live pointing table and the dump window) it carries two views
-of the T1 neighbourhood: `context`, raw candidates within `context.window_s` of
-the event, kept for older readers; and `gulp`, every trial t2d clustered in the
+sky position, the live pointing table and the dump window) and the casm_t2
+commit that wrote it (`t2d_commit`), it carries two views of the T1
+neighbourhood: `context`, raw candidates within `context.window_s` of the
+event, kept for older readers; and `gulp`, every trial t2d clustered in the
 event's gulp with its cluster id, every cluster with its outcome, the rules
 applied and recent candidate counts, which T3 draws as its bottom row. The
 `gulp` block is built from the same clustering and decisions the DB records and

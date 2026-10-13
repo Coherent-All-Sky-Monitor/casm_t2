@@ -45,6 +45,7 @@ import logging
 import math
 import os
 import socket
+import subprocess
 import tempfile
 import time
 from collections import defaultdict, deque
@@ -53,6 +54,7 @@ from pathlib import Path
 
 import yaml
 
+import casm_t2
 from casm_t2 import (beams, cluster, db, events, gulp_card, logsetup, policy,
                      weights_registry, sdnotify, timing, wire)
 from casm_t2.dump_client import request_dump_async, request_voltage_dump_async
@@ -76,6 +78,9 @@ INJECTION_MATCH_WINDOW_S = 60
 
 # Injection ledger cache lifetime, s, for the per-gulp refresh.
 INJECTION_CACHE_TTL_S = 30
+
+# Timeout per git call behind the t2d_commit card key, s.
+GIT_TIMEOUT_S = 5.0
 
 
 def apply_width_veto(cands: list[wire.Candidate],
@@ -166,6 +171,30 @@ def occupancy_beams(samps: list[int], beam_by_samp: list[int],
     lo = bisect.bisect_left(samps, peak_samp - window_samp)
     hi = bisect.bisect_right(samps, peak_samp + window_samp)
     return len(set(beam_by_samp[lo:hi]))
+
+
+def source_version() -> str:
+    """Git commit of the casm_t2 checkout this process imports from.
+
+    "<sha>" for a tree with no tracked changes, "<sha>+dirty" when tracked
+    files differ from HEAD, "unknown" when git cannot answer. Never raises.
+    """
+    try:
+        repo = str(Path(casm_t2.__file__).resolve().parent.parent)
+        head = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "--short=12", "HEAD"],
+            capture_output=True, text=True, timeout=GIT_TIMEOUT_S)
+        if head.returncode != 0 or not head.stdout.strip():
+            return "unknown"
+        status = subprocess.run(
+            ["git", "-C", repo, "status", "--porcelain", "--untracked-files=no"],
+            capture_output=True, text=True, timeout=GIT_TIMEOUT_S)
+        if status.returncode != 0:
+            return "unknown"
+    except Exception:  # provenance only: a failed lookup must not stop the daemon
+        return "unknown"
+    sha = head.stdout.strip()
+    return f"{sha}+dirty" if status.stdout.strip() else sha
 
 
 class DiskMonitor:
@@ -362,6 +391,8 @@ class T2Daemon:
         inj_cfg = cfg.get("injection") or {}
         self.injection_gulp_dir = inj_cfg.get("gulp_dir") or None
         self.injection_gulp_keep_days = float(inj_cfg.get("gulp_keep_days", 14.0))
+        # Software revision stamped on every trigger card, read once at startup.
+        self.t2d_commit = source_version()
         self.card_rules = {
             # the v2 card schema's names, where t2d has the same rule
             "snr": float(self.tier_b),
@@ -1193,6 +1224,7 @@ class T2Daemon:
         card = {
             "candname": name,
             "source": "blind",
+            "t2d_commit": self.t2d_commit,
             "event_utc": event_utc.isoformat(timespec="milliseconds"),
             "beam": c.beam,
             "local_beam": beams.local_beam(c.beam),
@@ -1292,9 +1324,10 @@ def main() -> None:
     shadow = args.shadow or cfg.get("shadow", False)
 
     daemon = T2Daemon(cfg, shadow=shadow)
-    logger.info("t2d starting%s: db=%s, dumps=%s, voltage=%s, "
+    logger.info("t2d starting%s: t2d_commit=%s, db=%s, dumps=%s, voltage=%s, "
                 "veto_widths=%s, max_cands_per_gulp=%d",
                 " in SHADOW mode" if shadow else "",
+                daemon.t2d_commit,
                 cfg.get("db", db.DEFAULT_PATH),
                 "enabled" if daemon.dumps_enabled else "DISABLED (commissioning)",
                 "enabled" if daemon.voltage_enabled else "disabled",
