@@ -967,6 +967,31 @@ class SlackPoster:
         return self._post_file(Path(png), f"inj{_g(row, 'id')} replay",
                                thread_ts=ts, comment=caption)
 
+    def post_replay_raw(self, row, png, caption: str = "") -> bool:
+        """Thread the raw replay figure (before hella flagging) under the shot's message.
+
+        Called after the masked plot is up. Fail-soft: any problem is logged and
+        returns False, never an exception, and never loose in the channel.
+        """
+        if not self.enabled:
+            return False
+        try:
+            if self.dry_run:
+                self._dry_write(f"replay_raw_{_g(row, 'id', 'x')}",
+                                f"[thread_ts={_g(row, 'slack_ts')}] {caption}\n{png}")
+                return True
+            ts = _g(row, "slack_ts")
+            if not ts:
+                logger.warning("no slack_ts for injection %s; not posting the raw "
+                               "replay loose in the channel", _g(row, "id"))
+                return False
+            return bool(self._post_file(Path(png), f"inj{_g(row, 'id')} replay, raw",
+                                        thread_ts=ts, comment=caption))
+        except Exception as exc:  # noqa: BLE001 - the raw view is an extra
+            logger.warning("raw replay post for injection %s failed: %s",
+                           _g(row, "id"), exc)
+            return False
+
     def post_streak(self, n: int, ids, why: str | None) -> str | None:
         if not self.enabled:
             return None

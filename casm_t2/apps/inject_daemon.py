@@ -679,6 +679,17 @@ def do_replay(conn, cfg: dict, poster, inj_id: int, dump_dir) -> Path | None:
         with conn:
             conn.execute("UPDATE injections SET replay_posted=? WHERE id=?",
                          (int(posted), inj_id))
+    # The raw twin goes in the same thread after the masked plot, only when the
+    # shot's own message is up; a failure here changes nothing else.
+    raw_png = (inject_replay.raw_png_path(inj_id, rcfg, (row or {}).get("file_id"))
+               if png is not None and posted else None)
+    if raw_png is not None:
+        try:
+            poster.post_replay_raw(
+                ledger_row(conn, inj_id), raw_png,
+                f"{inject_slack.display_id_md(row)} before hella RFI flagging")
+        except Exception:  # noqa: BLE001 - fail-soft
+            logger.exception("injection %d: raw replay post failed", inj_id)
     inject_replay.cleanup_dump(dump_dir, rcfg, d_start, d_stop, outcome,
                                (row or {}).get('file_id'))
     return png

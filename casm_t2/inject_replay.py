@@ -66,6 +66,9 @@ def replay_cfg(icfg: dict | None) -> dict:
     # (`default`, or key=val,... overrides).
     cfg.setdefault("clean", "none")
     cfg.setdefault("sumthreshold", None)
+    # hella's per-gulp flag records (casm_io docs/hella_masks.md), passed to
+    # t3-replay-injection as --mask-records; '' leaves the replay unmasked.
+    cfg.setdefault("mask_records", "")
     if cfg["clean"] not in ("none", "hella"):
         logger.warning("injection.replay.clean %r is not none|hella; using none",
                        cfg["clean"])
@@ -182,6 +185,7 @@ def replay_paths(inj_id, rcfg: dict, label: str | None = None) -> dict:
     root = Path(rcfg.get("events_root", "/mnt/nvme3/T3/EVENTS")) / name
     return {"dir": root,
             "png": root / f"{name}.png",
+            "raw_png": root / f"{name}_raw.png",
             "json": root / f"{name}.json",
             "fil": root / f"{name}.fil"}
 
@@ -231,9 +235,14 @@ def build_command(inj_id: int, dump_dir, rcfg: dict, db_path: str | None = None,
     if card_only:
         # A rendered miss archives the numbers, not the pictures. --out is
         # required by the tool, so its PNG goes to a scratch path.
-        cmd += ["--out", str(paths["dir"] / f"_scratch_{paths['png'].name}")]
+        scratch = paths["dir"] / f"_scratch_{paths['png'].name}"
+        cmd += ["--out", str(scratch),
+                "--raw-out", str(scratch.with_name(f"{scratch.stem}_raw.png"))]
     else:
-        cmd += ["--out", str(paths["png"]), "--fil", str(paths["fil"])]
+        cmd += ["--out", str(paths["png"]), "--raw-out", str(paths["raw_png"]),
+                "--fil", str(paths["fil"])]
+    if rcfg.get("mask_records"):
+        cmd += ["--mask-records", str(rcfg["mask_records"])]
     if db_path:
         cmd += ["--db", str(db_path)]
     if event_utc is not None:
@@ -271,6 +280,12 @@ def run_replay(inj_id: int, dump_dir, rcfg: dict, db_path: str | None = None,
                        inj_id, paths["png"])
         return None
     return paths["png"]
+
+
+def raw_png_path(inj_id, rcfg: dict, label: str | None = None) -> Path | None:
+    """The raw (before hella flagging) replay PNG, or None when it was not written."""
+    path = replay_paths(inj_id, rcfg, label)["raw_png"]
+    return path if path.is_file() else None
 
 
 #: Intensity dump rate per stream, the ring's BYTES_PER_SECOND. A file's

@@ -231,7 +231,7 @@ working from and what the matched cluster looked like:
 | n_t1_trials | raw T1 trials matching the shot, counted only when no cluster did (NULL = not looked at, or the file was unreadable) |
 | sub_incoh | incoherent-beam subtraction on (1) / off (0) at fire time, from the beamformer log; NULL unknown |
 | dump_dir, dump_utc_start, dump_utc_stop | the intensity dump taken for the replay |
-| replay_png, replay_posted | the rendered replay plot, and whether it reached Slack |
+| replay_png, replay_posted | the rendered replay plot, and whether it reached Slack (the raw replay figure is posted after it, fail-soft, and not recorded) |
 | slack_ts | ts of the Slack message for this shot, when posting is on |
 | outcome | closed enum, below |
 

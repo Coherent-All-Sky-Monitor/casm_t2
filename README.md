@@ -69,7 +69,8 @@ of the `2**ibox` trial label.
 
 The injection daemon posts one Slack message per shot: the sent line when the
 pulse goes in, completed in place a couple of minutes later with a coloured bar
-carrying the outcome and the replay plot. `t2-inject-slack-preview` renders the
+carrying the outcome and the replay plot; the same beam before hella flagging
+follows as a reply in that thread. `t2-inject-slack-preview` renders the
 same messages and figures to a directory with no token and no network. Columns,
 the outcome enum and the flags are in `docs/architecture.md` and
 `docs/operations.md`.

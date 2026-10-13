@@ -135,6 +135,7 @@ injection:
     command: /home/casm/software/dev/casm_venvs/casm_offline_env/bin/t3-replay-injection
     clean: hella              # none: as recorded | hella: offline replica of the live flagging chain
     sumthreshold: default     # with clean hella: add the SumThreshold stage (live since 2026-10-12)
+    mask_records: ''          # hella flag-record dir, passed as --mask-records; '' = replay unmasked
   scratch_dir: /mnt/nvme5/casm_pipeline/injections
   # t2d writes the gulp block of every gulp with an injection cluster here,
   # <utc_start>_g<gulp>_c<cluster_id>.json, for t3-replay-injection's v3

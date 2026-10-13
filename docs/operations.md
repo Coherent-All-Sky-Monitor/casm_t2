@@ -162,6 +162,7 @@ recovered the shot. The ledger's matched search cluster establishes recovery.
         command: t3-replay-injection
         clean: hella            # none: as recorded | hella: like the live chain
         sumthreshold: default   # with clean hella: the SumThreshold stage too
+        mask_records: ''        # hella flag-record dir; '' = replay stays unmasked
 
 `post` decides when the plot is rendered and posted: `always` (the shipped
 setting) every eligible shot, `on_miss` only misses, `daily` every miss plus the first
@@ -176,6 +177,21 @@ offline replica of hella's flagging chain, with `sumthreshold: default` adding
 the SumThreshold stage that went live the same day, so the Slack figure shows
 roughly what the search saw rather than the beamformer output; `clean: none`
 restores the as-recorded view. The archived `.fil` is always as recorded.
+
+`mask_records` (default `''`, off) is hella's per-gulp flag-record directory
+(casm_io `docs/hella_masks.md`, `/mnt/nvme4/data/casm/hella_masks` on the node
+that made the dump). When set, the replay command gets `--mask-records <dir>`.
+If records cover the replay window for the injected beam, the Slack figure is
+drawn with hella's recorded flags applied instead of the offline `clean`
+replica, and both titles say "synthetic replay": the pulse is added to the dump
+by `t3-replay-injection`, and the records describe the live stream that carried
+the real injection. Without coverage the figure falls back to the `clean`
+setting. Every replay command also gets `--raw-out <name>_raw.png`, the same
+beam before hella flagging; once the shot's own message is up, that PNG is
+posted as a reply in its thread after the main figure. A failure to find or
+post the raw view is logged and changes nothing else. `t3-replay-injection`
+must be deployed before the injection scheduler restarts with this config,
+because an older tool rejects `--raw-out`.
 
 The window starts at `inject_utc - dump_pre_s` and ends at
 `inject_utc - dump_post_s + dispersion_sweep_s(DM) + dump_sweep_margin_s`,
@@ -203,9 +219,11 @@ sequence.
 
 Archive layout, one directory per shot under `events_root`:
 
-    inj_20260910_0002/inj_20260910_0002.png     the replay plot
-    inj_20260910_0002/inj_20260910_0002.json    the synthetic card
-    inj_20260910_0002/inj_20260910_0002.fil     the beam with the pulse added
+    inj_20260910_0002/inj_20260910_0002.png      the replay plot
+    inj_20260910_0002/inj_20260910_0002_raw.png  the same beam before hella flagging
+    inj_20260910_0002/inj_20260910_0002.json     the synthetic card (kind synthetic_replay)
+    inj_20260910_0002/inj_20260910_0002.fil      the beam with the pulse added
+    inj_20260910_0002/inj_20260910_0002.mask.npz hella's flags, only when records covered it
 
 The replay figure's bottom row (gulp candidate histogram, beam against time,
 sky) needs the gulp block t2d writes for injection gulps to
