@@ -122,8 +122,10 @@ more than `max_nbeam` distinct beams or more than `max_sky_extent_deg` on the
 sky. Both tag `rfi_wide`. The sky test catches a burst in a dozen beams
 scattered across the sky, which the count alone cannot.
 
-tier: S/N bands A >= 30, B >= 18, C >= 12. A trigger needs tier A or B and
-peak DM above the floor (20 pc/cc). Tier C is stored and never triggers.
+tier: S/N bands A >= 30, B >= 12, C >= 12. B is tested before C, so while
+B <= C tier C is unreachable and B is also the storage floor: nothing below B
+is stored at all. A trigger needs tier A or B and peak DM above the floor
+(20 pc/cc). Tier C, when reachable, is stored and never triggers.
 
 budgets: per dump kind, a minimum spacing plus a hard daily cap, one dump per
 gulp, a storm lockout, and a free-disk floor checked on the node that would
@@ -307,7 +309,7 @@ Every drawn parameter is one entry in `injection.sample`:
 sample:
   dm:         {dist: uniform,    lo: 100.0, hi: 900.0}
   fwhm_ms:    {dist: loguniform, lo: 2.5,   hi: 30.0}
-  inject_snr: {dist: loguniform, lo: 12.0,  hi: 18.0}
+  inject_snr: {dist: powerlaw,   lo: 10.0,  hi: 100.0, alpha: 1.5}
 ```
 
 `dist` is `uniform`, `loguniform`, `choice` (with `values` and optional

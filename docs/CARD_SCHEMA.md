@@ -134,16 +134,16 @@ nothing else. Unset `gulp_dir` turns it off.
 ## Rules as t2d writes them
 
 The v2 schema names come first, where t2d has the same rule, then t2d's own
-settings. Values from `config/t2d.yaml` as shipped 2026-09-22:
+settings. Values from `config/t2d.yaml` as shipped 2026-10-13:
 
 ```
-"rules": {"snr": 18.0,              # tier B, the lowest tier that triggers
+"rules": {"snr": 12.0,              # tier B, the lowest tier that triggers
           "dm_floor": 20.0,
           "max_beams": 32,          # filters.max_nbeam
           "max_extent_deg": 25.0,
           "storm_skip": 20000,      # max_cands_per_gulp when storm_skip_gulp, else 0
           "injections_dump": false,
-          "tiers": {"A": 30.0, "B": 18.0, "C": 12.0},
+          "tiers": {"A": 30.0, "B": 12.0, "C": 12.0},
           "beam_veto": [], "veto_widths": [6],
           "dm_floor_veto": {"max_dm_lo": 20.6, "min_width": 4},
           "occupancy": {"min_beams": 8, "window_samp": 256},

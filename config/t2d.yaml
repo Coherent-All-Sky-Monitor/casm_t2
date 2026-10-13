@@ -32,8 +32,8 @@ cluster:
 
 tiers:                  # peak-SNR thresholds
   A: 30.0
-  B: 18.0               # below ~18 the 11-antenna array floods B with noise
-  C: 12.0               # also the DB storage floor
+  B: 12.0               # B is tested before C, so B is also the storage floor
+  C: 12.0               # equal to B: tier C unreachable, nothing below 12 stored
 
 filters:
   beam_veto: []         # peak beams that never trigger (beam 2 removed 2026-09-22)

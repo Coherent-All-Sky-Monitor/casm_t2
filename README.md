@@ -32,7 +32,8 @@ fallback for a product with no ellipse.
 
 Clusters then run a filter chain: injection match (stored, never dumped), beam
 veto, wide-beam RFI cut (too many beams, or too wide on the sky), and S/N
-tiers (A >= 30, B >= 18, C >= 12; triggers need A/B plus DM >= 20). Survivors hit the trigger budgets, minimum spacing, daily
+tiers (A >= 30, B >= 12; B is tested before C, so B is also the storage
+floor and tier C is unreachable while B <= C; triggers need A/B plus DM >= 20). Survivors hit the trigger budgets, minimum spacing, daily
 caps, one dump per gulp, a storm lockout and a free-disk floor, before a dump
 command goes to the owning backend node.
 
