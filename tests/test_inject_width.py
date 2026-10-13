@@ -179,9 +179,10 @@ def test_clamp_leaves_a_normal_shot_alone():
 
 
 def test_the_sampled_range_never_clamps_at_any_width_or_dm():
-    """`inject_snr` is drawn so the cap is a safety net, not a ceiling the
-    scheduled shots keep running into. A clamp during normal running means
-    the sample block and the cap have drifted apart, so it is worth failing.
+    """Since 2026-10-12 `inject_snr` is a Euclidean power law 10-100 and the
+    cap deliberately clips its bright tail; the typical shot must still clear
+    it. The check runs at the draw's median (15.6 for alpha 1.5, 10-100), so
+    a clamp here means the sample block and the cap have drifted apart.
 
     DM is swept too, to pin that nothing in the solver reads it: the
     amplitude and the cap are functions of width and S/N only. DM matters
@@ -190,7 +191,12 @@ def test_the_sampled_range_never_clamps_at_any_width_or_dm():
     import yaml
     with open("config/t2d.yaml") as fh:
         icfg = yaml.safe_load(fh)["injection"]
-    hi = icfg["sample"]["inject_snr"]["hi"]
+    blk = icfg["sample"]["inject_snr"]
+    if blk.get("dist") == "powerlaw":
+        a, lo_s, hi_s = blk["alpha"], blk["lo"], blk["hi"]
+        hi = ((lo_s ** -a + hi_s ** -a) / 2) ** (-1 / a)     # median of the draw
+    else:
+        hi = blk["hi"]
     lo_f, hi_f = icfg["sample"]["fwhm_ms"]["lo"], icfg["sample"]["fwhm_ms"]["hi"]
     lo_dm, hi_dm = icfg["sample"]["dm"]["lo"], icfg["sample"]["dm"]["hi"]
     worst = None
@@ -274,8 +280,8 @@ def test_config_uses_the_new_keys():
     assert icfg["sample"]["dm"] == {"dist": "uniform", "lo": 100.0, "hi": 900.0}
     assert icfg["sample"]["fwhm_ms"] == {"dist": "loguniform", "lo": 2.5,
                                          "hi": 30.0}
-    assert icfg["sample"]["inject_snr"] == {"dist": "loguniform", "lo": 15.0,
-                                            "hi": 18.0}
+    assert icfg["sample"]["inject_snr"] == {"dist": "powerlaw", "lo": 10.0,
+                                            "hi": 100.0, "alpha": 1.5}
     assert icfg["summary_dm_bins"] == [100.0, 300.0, 500.0, 700.0, 900.0]
     assert icfg["reported_snr_cap"]["narrow"] == 50.0
     # seeded for IB subtraction ON: measured 1.30 at the mid width
