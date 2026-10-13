@@ -122,10 +122,10 @@ more than `max_nbeam` distinct beams or more than `max_sky_extent_deg` on the
 sky. Both tag `rfi_wide`. The sky test catches a burst in a dozen beams
 scattered across the sky, which the count alone cannot.
 
-tier: S/N bands A >= 30, B >= 12, C >= 12. B is tested before C, so while
-B <= C tier C is unreachable and B is also the storage floor: nothing below B
-is stored at all. A trigger needs tier A or B and peak DM above the floor
-(20 pc/cc). Tier C, when reachable, is stored and never triggers.
+tier: S/N bands A >= 30, B >= 14, C >= 12. Tiers are tested A, B, C in order,
+so the storage floor is the lower of B and C, here C: nothing below 12 is
+stored. A trigger needs tier A or B and peak DM above the floor (20 pc/cc).
+Tier C is stored and never triggers.
 
 budgets: per dump kind, a minimum spacing plus a hard daily cap, one dump per
 gulp, a storm lockout, and a free-disk floor checked on the node that would

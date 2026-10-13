@@ -32,8 +32,8 @@ cluster:
 
 tiers:                  # peak-SNR thresholds
   A: 30.0
-  B: 12.0               # B is tested before C, so B is also the storage floor
-  C: 12.0               # equal to B: tier C unreachable, nothing below 12 stored
+  B: 14.0               # lowest tier that triggers
+  C: 12.0               # stored, never triggers; also the DB storage floor
 
 filters:
   beam_veto: []         # peak beams that never trigger (beam 2 removed 2026-09-22)
